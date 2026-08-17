@@ -278,23 +278,26 @@ PhononLattice::PhononLattice(const UnitCell& uc, size_t d1, size_t d2, size_t d3
                             // J2/J3 interaction (no phonon coupling)
                             // Use j2 for same-sublattice, j3 for different sublattice
                             size_t partner_sub = bi.partner;
+                            // Each bond appears exactly ONCE in uc.bilinear_interaction
+                            // (set_bilinear_interaction does a single insert and does not
+                            // register a reverse entry), so it is visited once, from its
+                            // source site. Both directions are therefore added here
+                            // unconditionally, exactly as in the NN branch above. Guarding
+                            // this on (partner > site) does not deduplicate — it deletes
+                            // every bond whose partner has a lower flat index, since the
+                            // bond is never revisited from the other end.
                             if (atom == partner_sub) {
                                 // Same sublattice -> J2
-                                // Only add if partner > site to avoid double counting
-                                if (partner > site) {
-                                    j2_interaction[site].push_back(bi.interaction);
-                                    j2_partners[site].push_back(partner);
-                                    j2_interaction[partner].push_back(bi.interaction.transpose());
-                                    j2_partners[partner].push_back(site);
-                                }
+                                j2_interaction[site].push_back(bi.interaction);
+                                j2_partners[site].push_back(partner);
+                                j2_interaction[partner].push_back(bi.interaction.transpose());
+                                j2_partners[partner].push_back(site);
                             } else {
                                 // Different sublattice -> J3
-                                if (partner > site) {
-                                    j3_interaction[site].push_back(bi.interaction);
-                                    j3_partners[site].push_back(partner);
-                                    j3_interaction[partner].push_back(bi.interaction.transpose());
-                                    j3_partners[partner].push_back(site);
-                                }
+                                j3_interaction[site].push_back(bi.interaction);
+                                j3_partners[site].push_back(partner);
+                                j3_interaction[partner].push_back(bi.interaction.transpose());
+                                j3_partners[partner].push_back(site);
                             }
                         }
                     }
