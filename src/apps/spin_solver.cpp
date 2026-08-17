@@ -2,9 +2,9 @@
  * spin_solver.cpp — simulation executable entry point.
  *
  * The heavy lifting (every `run_<simulation>_<lattice>()` function, plus
- * the parameter-sweep driver and the strain/phonon parameter builders)
+ * the parameter-sweep driver and the phonon parameter builders)
  * lives in sibling TUs: `runners_lattice.cpp`, `runners_phonon.cpp`,
- * `runners_strain.cpp`, `runners_mixed.cpp`, `runners_parameter_sweep.cpp`.
+ * `runners_mixed.cpp`, `runners_parameter_sweep.cpp`.
  * All of them are declared in `spin_solver_runners.h`. This file is now
  * just CLI parsing, MPI lifetime management, and the lattice-family
  * dispatch.
@@ -18,7 +18,6 @@
 #include "classical_spin/lattice/lattice.h"
 #include "classical_spin/lattice/mixed_lattice.h"
 #include "classical_spin/lattice/phonon_lattice.h"
-#include "classical_spin/lattice/strain_phonon_lattice.h"
 
 #include <mpi.h>
 #include <iostream>
@@ -187,80 +186,6 @@ int main(int argc, char** argv) {
                     if (rank == 0) {
                         cerr << "Simulation type not supported for PhononLattice. "
                              << "Supported: SA, MD, pump_probe, 2dcs, parameter_sweep" << endl;
-                    }
-                    break;
-            }
-        } else if (config.system == SystemType::NCTO_STRAIN) {
-            // StrainPhononLattice magnetoelastic (spin-strain) coupled system (honeycomb)
-            if (rank == 0) {
-                cout << "\nBuilding StrainPhononLattice magnetoelastic lattice..." << endl;
-            }
-            
-            UnitCell strain_uc = build_strain_honeycomb(config);
-            StrainPhononLattice strain_lattice(strain_uc,
-                                               config.lattice_size[0],
-                                               config.lattice_size[1],
-                                               config.lattice_size[2],
-                                               config.spin_length);
-            
-            // Build parameters from config
-            MagnetoelasticParams me_params;
-            ElasticParams el_params;
-            StrainDriveParams dr_params;
-            build_strain_params(config, me_params, el_params, dr_params);
-            
-            // Set parameters (this builds the interaction matrices)
-            strain_lattice.set_parameters(me_params, el_params, dr_params);
-            
-            // Set static drive force on Eg phonon (for GNEB barrier)
-            strain_lattice.drive_F_Eg1_ = config.drive_F_Eg1;
-            strain_lattice.drive_F_Eg2_ = config.drive_F_Eg2;
-            if (rank == 0 && (std::abs(config.drive_F_Eg1) > 1e-15 || std::abs(config.drive_F_Eg2) > 1e-15)) {
-                cout << "Static drive force: F_Eg1 = " << config.drive_F_Eg1
-                     << ", F_Eg2 = " << config.drive_F_Eg2 << endl;
-            }
-            
-            // Set Gilbert damping if specified
-            strain_lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.0);
-            
-            // Set magnetic field
-            Eigen::Vector3d B;
-            B << config.field_strength * config.field_direction[0],
-                 config.field_strength * config.field_direction[1],
-                 config.field_strength * config.field_direction[2];
-            strain_lattice.set_uniform_field(B);
-            
-            // Initialize spins
-            if (!config.initial_spin_config.empty()) {
-                strain_lattice.load_spin_config(config.initial_spin_config);
-            } else {
-                strain_lattice.init_random();
-            }
-            
-            // Run simulation
-            switch (config.simulation) {
-                case SimulationType::SIMULATED_ANNEALING:
-                    run_simulated_annealing_strain(strain_lattice, config, rank, size);
-                    break;
-                case SimulationType::PARALLEL_TEMPERING:
-                    run_parallel_tempering_strain(strain_lattice, config, rank, size, MPI_COMM_WORLD);
-                    break;
-                case SimulationType::MOLECULAR_DYNAMICS:
-                    run_molecular_dynamics_strain(strain_lattice, config, rank, size);
-                    break;
-                case SimulationType::PUMP_PROBE:
-                    run_pump_probe_strain(strain_lattice, config, rank, size);
-                    break;
-                case SimulationType::KINETIC_BARRIER_ANALYSIS:
-                    run_kinetic_barrier_analysis_strain(strain_lattice, config, rank, size);
-                    break;
-                case SimulationType::PARAMETER_SWEEP:
-                    run_parameter_sweep(config, rank, size);
-                    break;
-                default:
-                    if (rank == 0) {
-                        cerr << "Simulation type not supported for StrainPhononLattice. "
-                             << "Supported: SA, PT, MD, pump_probe, kinetic_barrier, parameter_sweep" << endl;
                     }
                     break;
             }

@@ -20,13 +20,6 @@
  *                              contraction dominates and is the primary target
  *                              of the trilinear-pre-contraction optimization.
  *
- *   StrainPhononLattice (spins coupled to elastic + magnetoelastic strain):
- *     - strain-honeycomb-bilin : bilinear-only Kitaev-honeycomb on the strain
- *                                lattice, with magnetoelastic OFF (lambda=0).
- *                                Isolates the bilinear hot path.
- *     - strain-honeycomb-me    : same plus magnetoelastic Eg coupling ON,
- *                                exposing the 8-call ME-field hot loop.
- *
  * The output is intentionally machine-parseable (one row per measurement)
  * so the numbers can be fed straight into tables or CSV.
  *
@@ -53,7 +46,6 @@
 #include "classical_spin/core/unitcell_builders.h"
 #include "classical_spin/lattice/lattice.h"
 #include "classical_spin/lattice/mixed_lattice.h"
-#include "classical_spin/lattice/strain_phonon_lattice.h"
 
 #include <chrono>
 #include <cstdio>
@@ -163,7 +155,7 @@ void print_help() {
 "bench_mc — Monte-Carlo kernel micro-benchmark\n"
 "\n"
 "Options:\n"
-"  --family={lattice|mixed|strain|all}             default: all\n"
+"  --family={lattice|mixed|all}                    default: all\n"
 "  --model=<model-name|all>                        default: all\n"
 "  --algo={metropolis|over|met_over|wolff|sw|all}  default: all\n"
 "  --L=<int>                lattice linear dimension (default per model)\n"
@@ -183,7 +175,7 @@ void print_help() {
 "Models by family:\n"
 "  lattice : heisenberg-honeycomb, kitaev-honeycomb, pyrochlore\n"
 "  mixed   : tmfeo3-bilinear, tmfeo3-trilinear\n"
-"  strain  : strain-honeycomb-bilin, strain-honeycomb-me\n";
+;
 }
 
 // -----------------------------------------------------------------------------
@@ -305,8 +297,6 @@ bool model_selected(const string& want, const string& m) {
     if (want == "heisenberg" && m == "heisenberg-honeycomb") return true;
     if (want == "kitaev"     && m == "kitaev-honeycomb")     return true;
     if (want == "tmfeo3"     && (m == "tmfeo3-bilinear" || m == "tmfeo3-trilinear"))
-        return true;
-    if (want == "strain"     && (m == "strain-honeycomb-bilin" || m == "strain-honeycomb-me"))
         return true;
     return false;
 }
@@ -469,79 +459,6 @@ void run_mixed_kernel(MixedLattice& lat, Algo algo, double T, long n_sweeps, boo
 }
 
 // =============================================================================
-// Family 3: StrainPhononLattice (spins + strain + magnetoelastic)
-// =============================================================================
-
-unique_ptr<StrainPhononLattice> build_strain_honeycomb_lat(int L, double /*T*/,
-                                                           bool with_me) {
-    SpinConfig cfg;
-    cfg.set_param("J", 0.0);
-    cfg.set_param("K", -1.0);
-    cfg.set_param("Gamma", 0.25);
-    cfg.set_param("Gammap", -0.02);
-    cfg.set_param("J2_A", 0.0);
-    cfg.set_param("J2_B", 0.0);
-    cfg.set_param("J3", 0.0);
-    cfg.field_strength = 0.0;
-
-    UnitCell uc = build_strain_honeycomb(cfg);
-    auto lat = std::make_unique<StrainPhononLattice>(uc, L, L, 1, 1.0f);
-
-    MagnetoelasticParams me{};
-    me.J = 0.0; me.K = -1.0; me.Gamma = 0.25; me.Gammap = -0.02;
-    me.J2_A = 0.0; me.J2_B = 0.0; me.J3 = 0.0; me.J7 = 0.0;
-    me.lambda_A1g = 0.0;
-    me.lambda_Eg  = with_me ? 0.05 : 0.0;
-    me.gamma_J7   = 0.0;
-
-    ElasticParams el{};
-    el.C11 = 1.0; el.C12 = 0.3; el.C44 = 0.5; el.M = 1.0;
-    el.gamma_A1g = 0.0; el.gamma_Eg = 0.0;
-
-    StrainDriveParams dr{};
-    dr.E0_1 = 0.0; dr.E0_2 = 0.0;
-
-    lat->set_parameters(me, el, dr);
-    lat->init_random();
-    return lat;
-}
-
-unique_ptr<StrainPhononLattice> build_strain_honeycomb_bilin_lat(int L, double T) {
-    return build_strain_honeycomb_lat(L, T, /*with_me=*/false);
-}
-
-unique_ptr<StrainPhononLattice> build_strain_honeycomb_me_lat(int L, double T) {
-    return build_strain_honeycomb_lat(L, T, /*with_me=*/true);
-}
-
-void run_strain_kernel(StrainPhononLattice& lat, Algo algo, double T, long n_sweeps, bool parallel) {
-    switch (algo) {
-        case Algo::Metropolis:
-            if (parallel) for (long i = 0; i < n_sweeps; ++i) lat.metropolis_parallel(T, false, 60.0);
-            else          for (long i = 0; i < n_sweeps; ++i) lat.metropolis(T, false, 60.0);
-            break;
-        case Algo::Overrelaxation:
-            if (parallel) for (long i = 0; i < n_sweeps; ++i) lat.overrelaxation_parallel();
-            else          for (long i = 0; i < n_sweeps; ++i) lat.overrelaxation();
-            break;
-        case Algo::MetOverMix:
-            for (long i = 0; i < n_sweeps; ++i) {
-                if (parallel) {
-                    lat.metropolis_parallel(T, false, 60.0);
-                    for (int k = 0; k < 5; ++k) lat.overrelaxation_parallel();
-                } else {
-                    lat.metropolis(T, false, 60.0);
-                    for (int k = 0; k < 5; ++k) lat.overrelaxation();
-                }
-            }
-            break;
-        case Algo::Wolff:
-        case Algo::SwendsenWang:
-            // StrainPhononLattice has no cluster updates. Caller must skip.
-            break;
-    }
-}
-
 // =============================================================================
 // Generic per-family driver
 // =============================================================================
@@ -653,19 +570,6 @@ vector<GenericModelSpec<unique_ptr<MixedLattice>>> default_mixed_models() {
     };
 }
 
-vector<GenericModelSpec<unique_ptr<StrainPhononLattice>>> default_strain_models() {
-    auto sz = [](const StrainPhononLattice& l) { return l.lattice_size; };
-    // Honeycomb at L=24 -> N = 1152 spins, fits in L1.
-    // Sweep budget is modest because the ME path is ~5x more expensive than
-    // pure bilinear honeycomb.
-    return {
-        { "strain", "strain-honeycomb-bilin", 24, 4000, 1, false,
-          build_strain_honeycomb_bilin_lat, sz, run_strain_kernel },
-        { "strain", "strain-honeycomb-me",    24, 1000, 1, false,
-          build_strain_honeycomb_me_lat,    sz, run_strain_kernel },
-    };
-}
-
 }  // anonymous namespace
 
 // -----------------------------------------------------------------------------
@@ -728,7 +632,6 @@ int main(int argc, char** argv) {
 
     run_family(default_lattice_models(), args, algos, parallel);
     run_family(default_mixed_models(),   args, algos, parallel);
-    run_family(default_strain_models(),  args, algos, parallel);
 
     return 0;
 }

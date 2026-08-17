@@ -68,25 +68,6 @@ void run_pump_probe_phonon          (PhononLattice& lattice, const SpinConfig& c
 void run_2dcs_phonon                (PhononLattice& lattice, const SpinConfig& config,
                                      int rank, int size);
 
-// --- StrainPhononLattice (spin + magnetoelastic strain field) -------------
-
-void build_strain_params(const SpinConfig& config,
-                         MagnetoelasticParams& me_params,
-                         ElasticParams& el_params,
-                         StrainDriveParams& dr_params);
-
-void run_simulated_annealing_strain      (StrainPhononLattice& lattice, const SpinConfig& config,
-                                          int rank, int size);
-void run_molecular_dynamics_strain       (StrainPhononLattice& lattice, const SpinConfig& config,
-                                          int rank, int size);
-void run_pump_probe_strain               (StrainPhononLattice& lattice, const SpinConfig& config,
-                                          int rank, int size);
-void run_kinetic_barrier_analysis_strain (StrainPhononLattice& lattice, const SpinConfig& config,
-                                          int rank, int size);
-void run_parallel_tempering_strain       (StrainPhononLattice& lattice, const SpinConfig& config,
-                                          int rank, int size,
-                                          MPI_Comm comm = MPI_COMM_WORLD);
-
 // --- MixedLattice (SU(2) + SU(3), TmFeO3) ---------------------------------
 
 void run_simulated_annealing_mixed  (MixedLattice& lattice, const SpinConfig& config,

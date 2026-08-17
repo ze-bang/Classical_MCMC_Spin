@@ -1,6 +1,6 @@
 /**
  * bench_md.cpp — micro-benchmark harness for the molecular-dynamics
- *                (Landau-Lifshitz / spin-strain ODE) RHS kernels.
+ *                (Landau-Lifshitz ODE) RHS kernels.
  *
  * Reports the throughput of the ODE right-hand-side kernels in
  * RHS-calls per second per core and in equivalent "site updates per second"
@@ -18,16 +18,6 @@
  *     - tmfeo3-driven     : same as bilinear but with a non-zero pulse
  *                           amplitude (tests the drive-envelope hoist)
  *
- *   StrainPhononLattice:
- *     - strain-honeycomb-bilin : ME off, exercises the spin LLG path on the
- *                                strain lattice (no per-RHS heap copy after
- *                                Phase B)
- *     - strain-honeycomb-me    : ME on, exercises the fused magnetoelastic
- *                                field on every RHS call
- *     - strain-honeycomb-local : same as -me but with per-cell local strain
- *                                DOFs (this is the path with the largest
- *                                heap-copy savings from Phase B)
- *
  * The reported throughput is the number of full ode_system() (or
  * landau_lifshitz_flat()) RHS evaluations per second. For RK4 there are 4
  * RHS calls per integrator step, so dividing by 4 gives steps/sec.
@@ -42,7 +32,6 @@
 #include "classical_spin/core/unitcell_builders.h"
 #include "classical_spin/lattice/lattice.h"
 #include "classical_spin/lattice/mixed_lattice.h"
-#include "classical_spin/lattice/strain_phonon_lattice.h"
 
 #include <chrono>
 #include <cstdio>
@@ -114,7 +103,7 @@ void print_help() {
 "bench_md — molecular-dynamics RHS-kernel micro-benchmark\n"
 "\n"
 "Options:\n"
-"  --family={lattice|mixed|strain|all}   default: all\n"
+"  --family={lattice|mixed|all}          default: all\n"
 "  --model=<name|all>                    default: all\n"
 "  --L=<int>                             lattice linear dim\n"
 "  --rhs=<int>                           measured RHS calls\n"
@@ -319,72 +308,6 @@ void bench_mixed_rhs(MixedLattice& lat, long n_rhs, bool driven) {
     volatile double sink = dxdt[0]; (void)sink;
 }
 
-// ---------------------------------------------------------------------------
-// Family 3: StrainPhononLattice
-// ---------------------------------------------------------------------------
-
-unique_ptr<StrainPhononLattice> build_strain_honeycomb_lat(int L,
-                                                           bool with_me,
-                                                           bool local_strain) {
-    SpinConfig cfg;
-    cfg.set_param("J", 0.0);
-    cfg.set_param("K", -1.0);
-    cfg.set_param("Gamma", 0.25);
-    cfg.set_param("Gammap", -0.02);
-    cfg.set_param("J2_A", 0.0);
-    cfg.set_param("J2_B", 0.0);
-    cfg.set_param("J3", 0.0);
-    cfg.field_strength = 0.0;
-
-    UnitCell uc = build_strain_honeycomb(cfg);
-    auto lat = std::make_unique<StrainPhononLattice>(uc, L, L, 1, 1.0f);
-
-    MagnetoelasticParams me{};
-    me.J = 0.0; me.K = -1.0; me.Gamma = 0.25; me.Gammap = -0.02;
-    me.J2_A = 0.0; me.J2_B = 0.0; me.J3 = 0.0; me.J7 = 0.0;
-    me.lambda_A1g = 0.0;
-    me.lambda_Eg  = with_me ? 0.05 : 0.0;
-    me.gamma_J7   = 0.0;
-
-    ElasticParams el{};
-    el.C11 = 1.0; el.C12 = 0.3; el.C44 = 0.5; el.M = 1.0;
-    el.gamma_A1g = 0.0; el.gamma_Eg = 0.0;
-    if (local_strain) {
-        el.K_gradient = 0.5;
-    }
-
-    StrainDriveParams dr{};
-    dr.E0_1 = 0.0; dr.E0_2 = 0.0;
-
-    lat->set_parameters(me, el, dr);
-    if (local_strain) {
-        lat->init_local_strain();
-    }
-    lat->init_random();
-    return lat;
-}
-
-void bench_strain_rhs(StrainPhononLattice& lat, long n_rhs) {
-    const size_t total = lat.state_size;
-    std::vector<double> x(total), dxdt(total);
-    // Pack initial state. Spins go first; strain (or per-cell strain) is
-    // packed via the lattice's PT extra-DOF interface, which matches the
-    // ODE-state layout exactly.
-    for (size_t i = 0; i < lat.lattice_size; ++i) {
-        const size_t idx = i * lat.spin_dim;
-        x[idx]   = lat.spins[i](0);
-        x[idx+1] = lat.spins[i](1);
-        x[idx+2] = lat.spins[i](2);
-    }
-    lat.pack_extra_dof(x.data() + lat.spin_dim * lat.lattice_size);
-    double t = 0.0;
-    for (long i = 0; i < n_rhs; ++i) {
-        lat.ode_system(x, dxdt, t);
-        t += 1e-3;
-    }
-    volatile double sink = dxdt[0]; (void)sink;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -504,45 +427,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- strain family ----
-    struct StrainBench {
-        string name;
-        int    default_L;
-        long   default_rhs;
-        bool   with_me;
-        bool   local_strain;
-    };
-    vector<StrainBench> strain_bench = {
-        { "strain-honeycomb-bilin", 24, 2000, false, false },
-        { "strain-honeycomb-me",    24, 1000, true,  false },
-        { "strain-honeycomb-local", 24,  500, true,  true  },
-    };
-    if (family_selected(args.family, "strain")) {
-        for (auto& m : strain_bench) {
-            if (!model_selected(args.model, m.name)) continue;
-            int L = (args.L > 0) ? args.L : m.default_L;
-            auto lat = build_strain_honeycomb_lat(L, m.with_me, m.local_strain);
-            const long n = (args.rhs > 0) ? args.rhs : m.default_rhs;
-            const long warm = (args.warmup > 0) ? args.warmup : std::max(long(200), n / 4);
-            bench_strain_rhs(*lat, warm);
-            for (int rep = 0; rep < args.repeats; ++rep) {
-                double t0 = now_sec();
-                bench_strain_rhs(*lat, n);
-                double t1 = now_sec();
-                double dt = std::max(1e-9, t1 - t0);
-                BenchRow r;
-                r.family = "strain"; r.model = m.name; r.L = L;
-                r.lattice_size = lat->lattice_size;
-                r.rhs_calls = n; r.repeat = rep;
-                r.wall_sec = dt;
-                r.rhs_per_sec = double(n) / dt;
-                r.site_updates_per_sec = double(n) * double(r.lattice_size) / dt;
-                r.threads = n_threads;
-                print_row(r, args.csv);
-                std::cout.flush();
-            }
-        }
-    }
 
     if (!mpi_already) MPI_Finalize();
     return 0;

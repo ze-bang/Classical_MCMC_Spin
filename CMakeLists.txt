@@ -303,7 +303,6 @@ set(CLASSICAL_SPIN_HEADERS
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/lattice.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/mixed_lattice.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/phonon_lattice.h
-    ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/strain_phonon_lattice.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/kitaev_bonds.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/io/hdf5_io.h
 )
@@ -323,9 +322,7 @@ set(CORE_SOURCES
     src/core/unitcell_builders.cpp
     src/core/spin_config.cpp
     src/core/phonon_lattice.cpp
-    src/core/strain_phonon_lattice.cpp
     src/core/gneb.cpp
-    src/core/gneb_strain.cpp
     # Per-concern TUs split out of the `lattice.h` / `mixed_lattice.h`
     # god-object headers. Each one hosts a topical slice of the class so
     # the header stays slim and the slices build in parallel.
@@ -495,19 +492,9 @@ add_optimized_executable(spin_solver
     src/apps/spin_solver.cpp
     src/apps/runners_lattice.cpp
     src/apps/runners_phonon.cpp
-    src/apps/runners_strain.cpp
     src/apps/runners_mixed.cpp
     src/apps/runners_parameter_sweep.cpp
 )
-
-# Test: zigzag (C3-breaking) → finite strain
-add_optimized_executable(test_zigzag_strain src/apps/test_zigzag_strain.cpp)
-
-# Test: parallel tempering on StrainPhononLattice (NCTO_STRAIN)
-add_optimized_executable(test_pt_strain src/apps/test_pt_strain.cpp)
-
-# Regression tests for strain-phonon Hamiltonian consistency
-add_optimized_executable(test_strain_phonon_regressions src/apps/test_strain_phonon_regressions.cpp)
 
 # Symmetry + finite-difference regression tests for the NCTO E1
 # magnetoelastic Hamiltonian (PhononLattice). Verifies the form-factor
@@ -587,7 +574,6 @@ add_optimized_executable(bench_integrators src/apps/bench_integrators.cpp)
 add_optimized_executable(test_mixed_gpu_cpu_equivalence src/apps/test_mixed_gpu_cpu_equivalence.cpp)
 
 if(BUILD_TESTING)
-    add_test(NAME strain_phonon_regressions COMMAND test_strain_phonon_regressions)
     add_test(NAME e1_phonon_regressions COMMAND test_e1_phonon_regressions)
     add_test(NAME mixed_trilinear_regressions COMMAND test_mixed_trilinear_regressions)
     add_test(NAME global_frame_equivalence COMMAND test_global_frame_equivalence)
@@ -603,21 +589,6 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
 
-    # MPI-based tests: both use MPI_Init internally. Register the single-rank
-    # invocation of zigzag_strain (Part 3's SA sweep is gated behind
-    # TEST_ZIGZAG_FULL so the default run stays fast) and a 2-rank run of
-    # test_pt_strain. Skip these gracefully if mpirun is not available.
-    find_program(MPIEXEC_EXEC NAMES mpirun mpiexec)
-    if(MPIEXEC_EXEC)
-        add_test(NAME zigzag_strain
-                 COMMAND ${MPIEXEC_EXEC} -n 1 $<TARGET_FILE:test_zigzag_strain>)
-        set_tests_properties(zigzag_strain PROPERTIES TIMEOUT 60)
-
-        add_test(NAME pt_strain
-                 COMMAND ${MPIEXEC_EXEC} -n 2 --oversubscribe
-                         $<TARGET_FILE:test_pt_strain>)
-        set_tests_properties(pt_strain PROPERTIES TIMEOUT 120)
-    endif()
 endif()
 
 
