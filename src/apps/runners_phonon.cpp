@@ -445,21 +445,46 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
         lattice.save_spin_config(trial_dir + "/initial_spins.txt");
         lattice.save_positions(trial_dir + "/positions.txt");
         
-        // Run spin-phonon dynamics with THz drive
-        if (rank == 0) {
-            cout << "Starting THz-driven spin-phonon dynamics..." << endl;
+        // Run spin-phonon dynamics with THz drive.  langevin_temperature > 0 selects the
+        // stochastic (thermostatted) integrator; the THz drive enters through
+        // drive_params inside ode_system() in both branches, so the pulse is applied
+        // identically.  (Before this branch existed the key was silently ignored here.)
+        const double langevin_T_pp = config.get_param("langevin_temperature", 0.0);
+        if (langevin_T_pp > 0.0) {
+            lattice.langevin_temperature = langevin_T_pp;
+            if (lattice.alpha_gilbert <= 0.0)
+                lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.01);
+            if (rank == 0) {
+                cout << "Starting THz-driven spin-phonon LANGEVIN dynamics:" << endl;
+                cout << "  T (k_B T) = " << langevin_T_pp
+                     << ", alpha_gilbert = " << lattice.alpha_gilbert << endl;
+                cout << "  Time range: " << config.md_time_start
+                     << " -> " << config.md_time_end
+                     << ", fixed timestep " << config.md_timestep << endl;
+            }
+            lattice.integrate_langevin(
+                config.md_time_start,
+                config.md_time_end,
+                config.md_timestep,
+                trial_dir,
+                config.md_save_interval,
+                static_cast<uint64_t>(config.get_param("langevin_seed", 0.0))
+            );
+        } else {
+            if (rank == 0) {
+                cout << "Starting THz-driven spin-phonon dynamics..." << endl;
+            }
+            lattice.molecular_dynamics(
+                config.md_time_start,
+                config.md_time_end,
+                config.md_timestep,
+                trial_dir,
+                config.md_save_interval,
+                config.md_integrator,
+                config.md_abs_tol,
+                config.md_rel_tol
+            );
         }
-        
-        lattice.molecular_dynamics(
-            config.md_time_start,
-            config.md_time_end,
-            config.md_timestep,
-            trial_dir,
-            config.md_save_interval,
-            config.md_integrator,
-            config.md_abs_tol,
-            config.md_rel_tol
-        );
         
         lattice.print_state();
         cout << "[Rank " << rank << "] Trial " << trial << " completed." << endl;
