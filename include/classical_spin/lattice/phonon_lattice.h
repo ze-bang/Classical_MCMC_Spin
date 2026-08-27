@@ -524,6 +524,22 @@ public:
     // deterministically (E1 phonon thermal noise neglected at this stage).
     double langevin_temperature = 0.0;
 
+    // Two-reservoir ("scenario 1") bath profile for integrate_langevin(): the spin bath
+    // temperature is  T_b(t) = T0 + dT * Θ(t - t_step) (1 - e^{-(t-t_step)/tau_on}) e^{-(t-t_step)/tau_off}
+    // i.e. a hot phonon reservoir filled within tau_on (the E1 ring-down) and, optionally,
+    // cooling with tau_off (0 = no decay).  dT = 0 reproduces the constant-T thermostat.
+    double langevin_dT = 0.0;
+    double langevin_t_step = 0.0;
+    double langevin_tau_on = 5.0;     // code units (5 = 3.3 ps)
+    double langevin_tau_off = 0.0;
+    double langevin_bath_T(double t) const {
+        if (langevin_dT == 0.0 || t < langevin_t_step) return langevin_temperature;
+        const double s = t - langevin_t_step;
+        double f = (langevin_tau_on > 0.0) ? 1.0 - std::exp(-s / langevin_tau_on) : 1.0;
+        if (langevin_tau_off > 0.0) f *= std::exp(-s / langevin_tau_off);
+        return langevin_temperature + langevin_dT * f;
+    }
+
     // External "noise field" used by integrate_langevin(): one 3-vector per
     // site, regenerated at every Langevin time step and added to H_eff in
     // ode_system() when use_langevin_noise == true.

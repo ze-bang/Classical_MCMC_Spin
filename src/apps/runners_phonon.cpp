@@ -452,6 +452,11 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
         const double langevin_T_pp = config.get_param("langevin_temperature", 0.0);
         if (langevin_T_pp > 0.0) {
             lattice.langevin_temperature = langevin_T_pp;
+            // two-reservoir bath profile (scenario 1): optional keys
+            lattice.langevin_dT      = config.get_param("langevin_dT", 0.0);
+            lattice.langevin_t_step  = config.get_param("langevin_t_step", config.pump_time);
+            lattice.langevin_tau_on  = config.get_param("langevin_tau_on", 5.0);
+            lattice.langevin_tau_off = config.get_param("langevin_tau_off", 0.0);
             if (lattice.alpha_gilbert <= 0.0)
                 lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.01);
             if (rank == 0) {

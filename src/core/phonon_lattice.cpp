@@ -1969,8 +1969,11 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
     //     sigma_eff = sqrt(2 α k_B T / (|S| dt))
     // and apply ONE Euler half-step S_i ← S_i - dt · S_i × H_noise per macro
     // step (no double counting across the RK4 sub-stages).
-    const double sigma_eff =
-        std::sqrt(2.0 * alpha_gilbert * langevin_temperature / (spin_length * dt));
+    // (recomputed every step from the bath profile langevin_bath_T(t); constant when dT = 0)
+    auto sigma_of_T = [&](double Tb) {
+        return std::sqrt(2.0 * alpha_gilbert * Tb / (spin_length * dt));
+    };
+    double sigma_eff = sigma_of_T(langevin_temperature);
 
     // RNG setup
     if (seed == 0) {
@@ -1991,6 +1994,11 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
     std::cout << "  T (k_B T)            = " << langevin_temperature << std::endl;
     std::cout << "  Gilbert damping α    = " << alpha_gilbert << std::endl;
     std::cout << "  Noise sigma          = " << sigma_eff << std::endl;
+    if (langevin_dT != 0.0) {
+        std::cout << "  Bath profile         : T0 + dT f(t), dT = " << langevin_dT
+                  << ", t_step = " << langevin_t_step << ", tau_on = " << langevin_tau_on
+                  << ", tau_off = " << langevin_tau_off << " (two-reservoir scenario)" << std::endl;
+    }
     std::cout << "  RNG seed             = " << seed << std::endl;
     std::cout << "  Save every           = " << save_every << " steps" << std::endl;
 
@@ -2019,6 +2027,7 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
         Eigen::Vector3d M, M_stag;
         double E_total;
         double Qx, Qy, Vx, Vy;
+        double T_bath;
         SpinConfig spin_snapshot;
     };
     vector<Frame> traj;
@@ -2048,6 +2057,7 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
             f.Qy = state[spin_offset + 1];
             f.Vx = state[spin_offset + 2];
             f.Vy = state[spin_offset + 3];
+            f.T_bath = langevin_bath_T(t);
             f.spin_snapshot = spins;
             traj.push_back(f);
         }
@@ -2055,6 +2065,7 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
         // ── Step A: deterministic RK4 on H_eff (no noise) ──
         use_langevin_noise = false;
         stepper.do_step(rhs, state, t, dt);
+        if (langevin_dT != 0.0) sigma_eff = sigma_of_T(langevin_bath_T(t));
 
         // ── Step B: stochastic Euler-Maruyama on the noise force ──
         //
@@ -2107,7 +2118,7 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
     if (!output_dir.empty() && !traj.empty()) {
         std::ofstream f(output_dir + "/langevin_trajectory.txt");
         f << "# t  Mx My Mz |M|  Mstag_x Mstag_y Mstag_z |M_stag|  "
-          << "E_total  Qx_E1 Qy_E1 Vx_E1 Vy_E1\n";
+          << "E_total  Qx_E1 Qy_E1 Vx_E1 Vy_E1  T_bath\n";
         f << std::scientific << std::setprecision(10);
         for (const auto& fr : traj) {
             const double Mn = fr.M.norm();
@@ -2117,7 +2128,8 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
               << fr.M_stag(0) << ' ' << fr.M_stag(1) << ' ' << fr.M_stag(2)
               << ' ' << Msn << ' '
               << fr.E_total << ' '
-              << fr.Qx << ' ' << fr.Qy << ' ' << fr.Vx << ' ' << fr.Vy << '\n';
+              << fr.Qx << ' ' << fr.Qy << ' ' << fr.Vx << ' ' << fr.Vy << ' '
+              << fr.T_bath << '\n';
         }
         std::cout << "Langevin trajectory written to " << output_dir
                   << "/langevin_trajectory.txt (" << traj.size() << " snapshots)" << std::endl;
