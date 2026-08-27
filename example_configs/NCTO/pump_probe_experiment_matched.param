@@ -1,0 +1,90 @@
+# NCTO THz pump-probe, parameters matched to NCTO_phonon_v0 (Gedik group)
+# ======================================================================
+# Code units: energy meV, time hbar/meV = 0.658 ps, omega_E1 (code) = h*nu (meV).
+#
+# Experiment (SI Fig. S1b,c; Fig. 2b-d):
+#   pulse    : ~1.5-cycle THz transient, envelope FWHM ~0.6 ps, spectrum 1-5 THz
+#              with most weight at 3-4.2 THz, peak field 300 kV/cm, E in the ab plane.
+#   phonons  : E1 lines at 1.0, 2.3, 3.0-3.7 (cluster), 4.1-4.3 THz, T-independent.
+#   ring-down: amplitude 1/e ~ 5-10 ps (linewidths 0.05-0.1 THz).
+#
+# Model choices:
+#   one effective E1 coordinate at the dominant 4.2 THz line: omega_E1 = 17.4 meV
+#   amplitude damping 2/gamma = 6.6 ps: gamma_E1 = 0.20   (range 0.13-0.26)
+#   impulsive drive: sigma = 0.18 ps = 0.27 code units, carrier 3.0 THz = 12.4 meV
+#   (spectral FWHM ~2 THz centred at 3 THz; NOT the resonant narrow-band pulse of
+#   the earlier runs, sigma=4/15 code units at 0.97 THz).
+#   Z* E0 is the free parameter: the impulsive-limit estimate (Z*~1-3 e, M~20-30 amu,
+#   300 kV/cm) gives a phonon amplitude of ~1-5 pm, i.e. a few-% exchange modulation.
+#   Set E0 to reproduce the measured phonon amplitude or scan it as in Fig. 3f/4f.
+system = NCTO
+simulation_mode = pump_probe
+lattice_size = 36,36,1
+output_dir = NCTO_pump_probe_expmatched
+num_trials = 1
+
+# Kruger (2023) bilinear set; J7 at the corrected near-degeneracy (fixed J2/J3 lists)
+J = 0.68
+K = -7.89
+Gamma = 3.07
+Gammap = -2.94
+J2_A = -0.06
+J2_B = -0.70
+J3 = 0.52
+J7 = -0.4096
+field_strength = 0.0
+field_direction = 0,0,1
+alpha_gilbert = 0.05
+
+# E1 phonon (dominant 4.2 THz mode) and per-site back-action (default 1)
+omega_E1 = 17.4
+gamma_E1 = 0.20
+lambda_E1_quartic = 0.0
+Z_star = 1.0
+phonon_per_site = 1
+
+# Quadratic magnetoelastic couplings (Grueneisen-scaled, lambda_X2 = (X/K) lambda_K2)
+lambda_E1_J_0 = 0.0
+lambda_E1_J_2 = -0.0017
+lambda_E1_K_0 = 0.0
+lambda_E1_K_2 = 0.02
+lambda_E1_Gamma_0 = 0.0
+lambda_E1_Gamma_2 = -0.0078
+lambda_E1_Gammap_0 = 0.0
+lambda_E1_Gammap_2 = 0.0075
+lambda_E1_J7_0 = 1.0e-3
+# D3-allowed linear striction (off; scan e.g. lambda_E1_K_1 = +-0.1 for sensitivity)
+lambda_E1_J_1 = 0.0
+lambda_E1_K_1 = 0.0
+lambda_E1_Gamma_1 = 0.0
+lambda_E1_Gammap_1 = 0.0
+
+# Impulsive THz pulse (code units): sigma 0.27 = 0.18 ps, carrier 12.4 meV = 3.0 THz
+pump_amplitude = 20.0
+pump_frequency = 12.4
+pump_time = 5.0
+pump_width = 0.27
+pump_phase = 0.0
+pump_polarization = 0.0       # measured from the x-bond line (30 deg from a1)
+probe_amplitude = 0.0         # second THz pulse for coherent control: 0.6*pump, probe_time = 5 + tau
+probe_frequency = 12.4
+probe_time = 6.0
+probe_width = 0.27
+
+# Dynamics: resolve the 4.2 THz period (0.36 code units) with >= 40 steps
+md_time_start = 0.0
+md_time_end = 400.0           # 263 ps; the metastable rise is ~70 ps = 106 code units
+md_timestep = 0.005
+md_save_interval = 20
+md_integrator = rk4
+
+# Start from a relaxed 3Q reference (per-site normalisation: relax_phonons is size-independent)
+adiabatic_phonons = false
+relax_phonons = true
+T_start = 20.0
+T_end = 1e-3
+T_zero = true
+annealing_steps = 80000
+cooling_rate = 0.9
+overrelaxation_rate = 0
+n_deterministics = 5000
