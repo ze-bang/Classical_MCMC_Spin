@@ -58,6 +58,20 @@ lambda_E1_J_1 = 0.0
 lambda_E1_K_1 = 0.0
 lambda_E1_Gamma_1 = 0.0
 lambda_E1_Gammap_1 = 0.0
+# ------------------------------------------------------------------
+# ONLY the polar E1 doublet is driven experimentally: no other lattice coordinate is
+# switched on here.  (Extra E1/E2/A1/A2 modes, frozen strains and anharmonic transfers
+# exist in the code, see build_lattice_modes; they stay off.)
+n_extra_modes = 0
+n_anharmonic = 0
+# The other five symmetry-allowed first-order operators of the E1 doublet (mixing, global
+# nematic, DM along Q, bond-projected out-of-plane / parallel DM) and their second-order
+# partners are available as mode0_cE5..9 / mode0_bEsq5..9 and default to zero.
+mode0_cE5 = 0.0
+mode0_cE6 = 0.0
+mode0_cE7 = 0.0
+mode0_cE8 = 0.0
+mode0_cE9 = 0.0
 
 # Impulsive THz pulse (code units): sigma 0.27 = 0.18 ps, carrier 12.4 meV = 3.0 THz
 pump_amplitude = 20.0

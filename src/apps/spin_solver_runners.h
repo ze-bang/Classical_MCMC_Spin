@@ -53,6 +53,7 @@ void run_2dcs_spectroscopy     (Lattice& lattice, const SpinConfig& config,
 
 // --- PhononLattice (spin + discrete phonon modes) -------------------------
 
+void build_lattice_modes(const SpinConfig& config, PhononLattice& lattice);
 void build_phonon_params(const SpinConfig& config,
                          SpinPhononCouplingParams& sp_params,
                          PhononParams& ph_params,

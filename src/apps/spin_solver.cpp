@@ -102,6 +102,7 @@ int main(int argc, char** argv) {
             
             // Set parameters (this builds the interaction matrices)
             phonon_lattice.set_parameters(sp_params, ph_params, dr_params);
+            build_lattice_modes(config, phonon_lattice);
             if (!config.nn_exchange_disorder_config.empty()) {
                 phonon_lattice.apply_nn_exchange_disorder_from_file(
                     config.nn_exchange_disorder_config);

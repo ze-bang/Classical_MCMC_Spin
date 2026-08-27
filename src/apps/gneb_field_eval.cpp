@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
     TimeDependentSpinPhononParams td_sp_params;
     build_phonon_params(config, sp_params, ph_params, dr_params, td_sp_params);
     lattice.set_parameters(sp_params, ph_params, dr_params);
+    build_lattice_modes(config, lattice);
 
     // Apply the same quenched-disorder channels the SA/MD runners use, so the
     // evaluated energy/gradient match the in-model Hamiltonian (e.g. a line

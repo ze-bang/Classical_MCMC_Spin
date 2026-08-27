@@ -108,6 +108,74 @@ void build_phonon_params(const SpinConfig& config,
 }
 
 /**
+ * Complete lattice sector (audit 2026-08): extra zone-centre modes and cubic
+ * anharmonic transfers.  Keys (i = 1..n_extra_modes):
+ *   n_extra_modes
+ *   mode<i>_irrep      0 = E polar/E1 (IR, drives with Zstar), 1 = E2-type (Raman / in-plane
+ *                      strain), 2 = A1 (Raman / breathing strain), 3 = A2 (c-polarised)
+ *   mode<i>_omega, _gamma, _quartic, _Zstar, _frozen, _Q1, _Q2   (initial or frozen values)
+ *   first order : mode<i>_cE<k> (k=1..9), _aA1_<k> (1..5), _dA2_<k> (1..4),
+ *                 _lamJ7, _lamJ2A, _lamJ2B, _lamJ3
+ *   second order: mode<i>_bEsq<k> (1..9), _aA1sq_<k> (1..5), _lamJ7sq, _lamJ2Asq, _lamJ2Bsq, _lamJ3sq
+ * The primary mode (i = 0) accepts the same keys on top of the legacy lambda_E1_* values
+ * (e.g. mode0_cE5 .. mode0_cE9 for the five non-channel linear tensors, mode0_aA1sq_5 for
+ * the DM-parallel term, mode0_lamJ2A for the J2 nematic).
+ * Anharmonic transfers: n_anharmonic, anh<j>_target, anh<j>_lam, anh<j>_lamp, anh<j>_g
+ * (mode indices, 0 = primary), energy −N g Q_target (Q_lam ⊗ Q_lamp).
+ */
+void build_lattice_modes(const SpinConfig& config, PhononLattice& lattice) {
+    auto key = [](int i, const std::string& s) { return "mode" + std::to_string(i) + "_" + s; };
+    auto fill = [&](int i, LatticeMode& md) {
+        for (int k = 0; k < 9; ++k) md.cE[k]     = config.get_param(key(i, "cE" + std::to_string(k + 1)),    md.cE[k]);
+        for (int k = 0; k < 5; ++k) md.aA1[k]    = config.get_param(key(i, "aA1_" + std::to_string(k + 1)),  md.aA1[k]);
+        for (int k = 0; k < 4; ++k) md.dA2[k]    = config.get_param(key(i, "dA2_" + std::to_string(k + 1)),  md.dA2[k]);
+        for (int k = 0; k < 9; ++k) md.bE_sq[k]  = config.get_param(key(i, "bEsq" + std::to_string(k + 1)),  md.bE_sq[k]);
+        for (int k = 0; k < 5; ++k) md.aA1_sq[k] = config.get_param(key(i, "aA1sq_" + std::to_string(k + 1)), md.aA1_sq[k]);
+        md.lamJ7     = config.get_param(key(i, "lamJ7"),    md.lamJ7);
+        md.lamJ2A    = config.get_param(key(i, "lamJ2A"),   md.lamJ2A);
+        md.lamJ2B    = config.get_param(key(i, "lamJ2B"),   md.lamJ2B);
+        md.lamJ3     = config.get_param(key(i, "lamJ3"),    md.lamJ3);
+        md.lamJ7_sq  = config.get_param(key(i, "lamJ7sq"),  md.lamJ7_sq);
+        md.lamJ2A_sq = config.get_param(key(i, "lamJ2Asq"), md.lamJ2A_sq);
+        md.lamJ2B_sq = config.get_param(key(i, "lamJ2Bsq"), md.lamJ2B_sq);
+        md.lamJ3_sq  = config.get_param(key(i, "lamJ3sq"),  md.lamJ3_sq);
+    };
+    std::vector<LatticeMode> extra;
+    const int n = int(config.get_param("n_extra_modes", 0.0));
+    for (int i = 1; i <= n; ++i) {
+        LatticeMode md;
+        const int irr = int(config.get_param(key(i, "irrep"), 0.0));
+        md.irrep = (irr == 2) ? LatticeMode::Irrep::A1 : (irr == 3) ? LatticeMode::Irrep::A2 : LatticeMode::Irrep::E;
+        md.weight = (irr == 1) ? 2 : 1;
+        md.name = (irr == 0) ? "E1 (polar)" : (irr == 1) ? "E2-type" : (irr == 2) ? "A1" : "A2";
+        md.omega   = config.get_param(key(i, "omega"), 1.0);
+        md.gamma   = config.get_param(key(i, "gamma"), 0.0);
+        md.quartic = config.get_param(key(i, "quartic"), 0.0);
+        md.Zstar   = config.get_param(key(i, "Zstar"), (irr == 0) ? 1.0 : 0.0);
+        md.frozen  = config.get_param(key(i, "frozen"), 0.0) > 0.5;
+        md.Q1 = config.get_param(key(i, "Q1"), 0.0);
+        md.Q2 = config.get_param(key(i, "Q2"), 0.0);
+        fill(i, md);
+        extra.push_back(md);
+    }
+    std::vector<AnharmonicTerm> anh;
+    const int na = int(config.get_param("n_anharmonic", 0.0));
+    for (int j = 1; j <= na; ++j) {
+        AnharmonicTerm t;
+        const std::string p = "anh" + std::to_string(j) + "_";
+        t.target = int(config.get_param(p + "target", 0.0));
+        t.lam    = int(config.get_param(p + "lam", 0.0));
+        t.lamp   = int(config.get_param(p + "lamp", 0.0));
+        t.g      = config.get_param(p + "g", 0.0);
+        anh.push_back(t);
+    }
+    lattice.set_modes(extra, anh);
+    // Primary-mode extras on top of the legacy lambda_E1_* couplings.
+    fill(0, lattice.modes[0]);
+    lattice.update_modulation_flags();
+}
+
+/**
  * Run simulated annealing on PhononLattice (spin subsystem only).
  */
 void run_simulated_annealing_phonon(PhononLattice& lattice, const SpinConfig& config, int rank, int size) {

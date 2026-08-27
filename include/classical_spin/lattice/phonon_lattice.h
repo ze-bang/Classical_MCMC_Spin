@@ -62,7 +62,10 @@
 #include "unitcell_builders.h"
 #include "simple_linear_alg.h"
 #include "kitaev_bonds.h"
+#include "classical_spin/lattice/ncto_me_tensors.h"   // D3-covariant magnetoelastic tensors
 #include "classical_spin/lattice/pulse_chunking.h"  // Ingredient XVIII tols + W3 helper
+#include <string>
+#include <stdexcept>
 #include <vector>
 #include <array>
 #include <functional>
@@ -105,6 +108,56 @@ using std::ofstream;
 using std::ifstream;
 using std::function;
 using std::array;
+
+/**
+ * A zone-centre lattice coordinate of the honeycomb layer with its complete
+ * D3-symmetry-allowed magnetoelastic couplings (audit 2026-08, see
+ * ncto_phonon/audit/NCTO_full_model_hamiltonian.tex and ncto_me_tensors.h).
+ *
+ *   irrep E  : in-plane doublet (Q1,Q2). weight = 1: polar / IR-active E1 mode
+ *              (couples to the THz field through Zstar); weight = 2: E2-type
+ *              (Raman mode or in-plane shear strain). The weight fixes the sign
+ *              with which Q2 enters the tensor tables (q2sign()).
+ *   irrep A1 : scalar (Raman A1 mode, eps_xx+eps_yy, eps_zz)
+ *   irrep A2 : scalar, c-polarised optical displacement u_z
+ *
+ * First order:  dM_gamma = Σ_k cE[k] (Q1 T1_k + t2 Q2 T2_k)   (E, 9 tensors)
+ *                        = Q Σ_k aA1[k] TA1_k                  (A1, 5 tensors incl. DM ∥ bond)
+ *                        = Q Σ_k dA2[k] TA2_k                  (A2, 4 tensors)
+ *               J7 += lamJ7 Q (A1);  J2A/J2B/J3 += lamJ2A.. Q (A1) or bond-projected nematic (E)
+ * Second order (E only): |Q|² Σ aA1_sq TA1 + (Q⊗Q)_E · Σ bE_sq (T1,T2);  J7 += lamJ7_sq |Q|²;
+ *               J2/J3 += lam.._sq |Q|².  For the primary E1 mode these are the legacy
+ *               lambda_E1_X_{0,1,2} and lambda_E1_J7_0.
+ * frozen = true turns the coordinate into a static parameter (uniform strain).
+ */
+struct LatticeMode {
+    enum class Irrep { E, A1, A2 };
+    Irrep irrep = Irrep::E;
+    int weight = 1;
+    std::string name;
+    double omega = 1.0, gamma = 0.0, quartic = 0.0, Zstar = 0.0;
+    bool frozen = false;
+    std::array<double, 9> cE{};
+    std::array<double, 5> aA1{};
+    std::array<double, 4> dA2{};
+    double lamJ7 = 0.0, lamJ2A = 0.0, lamJ2B = 0.0, lamJ3 = 0.0;
+    std::array<double, 5> aA1_sq{};
+    std::array<double, 9> bE_sq{};
+    double lamJ7_sq = 0.0, lamJ2A_sq = 0.0, lamJ2B_sq = 0.0, lamJ3_sq = 0.0;
+    // coordinates and velocities (mode 0 = primary E1 keeps its state in PhononState)
+    double Q1 = 0.0, Q2 = 0.0, V1 = 0.0, V2 = 0.0;
+    int ncoord() const { return irrep == Irrep::E ? 2 : 1; }
+    int ndof() const { return frozen ? 0 : 2 * ncoord(); }
+    double q2sign() const { return weight == 2 ? -1.0 : 1.0; }
+};
+
+/// Cubic anharmonic transfer −N g Q_target (Q_lam ⊗ Q_lamp)_{irrep(target)}:
+/// target A1: Q (Q_lam · Q_lamp); target E (weight 2): Q1 P1 + Q2 P2 with
+/// P = (Q_lam1 Q_lamp1 − Q_lam2 Q_lamp2, Q_lam1 Q_lamp2 + Q_lam2 Q_lamp1).
+struct AnharmonicTerm {
+    int target = 0, lam = 0, lamp = 0;
+    double g = 0.0;
+};
 
 /**
  * Zone-center E1 phonon state.
@@ -382,9 +435,25 @@ public:
     SpinConfig spins;
     vector<Eigen::Vector3d> site_positions;
     
-    // Phonon state
+    // Phonon state (primary E1 mode)
     PhononState phonons;
-    
+
+    // Complete lattice sector: modes[0] mirrors the primary E1 mode (its
+    // coordinates live in `phonons`), modes[1..] are extra E/A1/A2 modes or
+    // frozen strains; anharmonic = cubic transfer terms between them.
+    vector<LatticeMode> modes;
+    vector<AnharmonicTerm> anharmonic;
+    bool has_further_modulation = false;
+    // In-plane doublet frame of the layer: e_x = A→B direction of the x bond,
+    // e_y = n × e_x. Further-neighbour bonds are grouped into ≤3 line-angle
+    // classes per sublattice with form factors (cos2θ, sin2θ).
+    Eigen::Vector3d ex_code = Eigen::Vector3d::UnitX();
+    Eigen::Vector3d ey_code = Eigen::Vector3d::UnitY();
+    vector<vector<int>> j2_cls, j3_cls;
+    std::array<std::pair<double, double>, 3> j2_cs{}, j3_cs{};
+    int n_j2_cls = 0, n_j3_cls = 0;
+    struct Coords { std::vector<double> q1, q2; };
+
     // NN interactions (stored per site to avoid double counting)
     vector<vector<SpinMatrix>> nn_interaction;      // J1 matrices
     vector<vector<size_t>> nn_partners;             // NN partner indices
@@ -920,7 +989,7 @@ public:
      * Total energy
      */
     double total_energy() const {
-        return spin_energy() + phonon_energy() + spin_phonon_energy();
+        return spin_energy() + phonon_energy() + spin_phonon_energy() + anharmonic_energy();
     }
 
     /// Extensivity factor of the zone-centre phonon sector: N_sites when the
@@ -944,22 +1013,43 @@ public:
     double dH_dQx_E1() const;
     /// ∂H_sp-ph/∂ε_y for the zone-center E1 coordinate.
     double dH_dQy_E1() const;
-    /// Effective ring exchange under the scalar quadratic E1 distortion.
-    double effective_J7(double qx, double qy) const {
-        return spin_phonon_params.J7 +
-               spin_phonon_params.lambda_E1_J7_0 * (qx * qx + qy * qy);
-    }
-    double effective_J7_for_hexagon(size_t hex_idx, double qx, double qy) const {
+    // ---- complete lattice sector (all modes) ----
+    size_t phonon_dof() const;
+    void recompute_state_size();
+    void pack_lattice(double* arr) const;
+    void unpack_lattice(const double* arr);
+    Coords coords_current() const;
+    Coords coords_from_state(const double* arr) const;
+    void bond_increments_local(const Coords& c, double scale, Eigen::Matrix3d dM[3]) const;
+    void bond_increment_derivs_local(const Coords& c, double scale, size_t m, int comp, Eigen::Matrix3d dD[3]) const;
+    void bond_increments_global(const Coords& c, double scale, Eigen::Matrix3d dM[3]) const;
+    void bond_increment_derivs_global(const Coords& c, double scale, size_t m, int comp, Eigen::Matrix3d dD[3]) const;
+    void bond_correlations(Eigen::Matrix3d C[3]) const;
+    void further_correlations(double Cj2[2][3], double Cj3[3]) const;
+    double further_bond_modulation(const Coords& c, double c2, double s2, int which, int sub) const;
+    double further_bond_modulation_deriv(const Coords& c, double c2, double s2, int which, int sub, size_t m, int comp) const;
+    double further_neighbour_modulation_energy(const Coords& c) const;
+    /// Effective ring exchange J7 + Σ_E λ_J7|Q|² + Σ_A1 λ_J7 Q (+ frozen strains).
+    double effective_J7(const Coords& c) const;
+    double effective_J7() const;
+    double effective_J7_for_hexagon(size_t hex_idx, double J7eff) const {
         const double offset = hex_idx < plaquette_j7_offsets.size()
                                 ? plaquette_j7_offsets[hex_idx] : 0.0;
-        return effective_J7(qx, qy) + offset;
+        return J7eff + offset;
     }
-    double dJ7_dQx_E1(double qx, double /*qy*/) const {
-        return 2.0 * spin_phonon_params.lambda_E1_J7_0 * qx;
-    }
-    double dJ7_dQy_E1(double /*qx*/, double qy) const {
-        return 2.0 * spin_phonon_params.lambda_E1_J7_0 * qy;
-    }
+    double dJ7_dq(const Coords& c, size_t m, int comp) const;
+    double anharmonic_energy(const Coords& c) const;
+    double anharmonic_energy() const;
+    double anharmonic_deriv(const Coords& c, size_t m, int comp) const;
+    /// Raw (extensive) ∂H_ME/∂q for mode m, component comp.
+    double lattice_force_raw(const Coords& c, double scale, const Eigen::Matrix3d C[3],
+                             const double Cj2[2][3], const double Cj3[3], double R7,
+                             size_t m, int comp) const;
+    /// Raw ∂H_ME/∂q for every coordinate, in mode order (q1[,q2] per mode).
+    std::vector<double> lattice_forces_raw() const;
+    void rebuild_primary_mode();
+    void update_modulation_flags();
+    void set_modes(const std::vector<LatticeMode>& extra, const std::vector<AnharmonicTerm>& anh);
     
     /**
      * Compute ring exchange contribution to effective field on spin at given site
@@ -970,7 +1060,7 @@ public:
      * ring exchange term with respect to that spin.
      */
     SpinVector get_ring_exchange_field(size_t site) const;
-    SpinVector get_ring_exchange_field(size_t site, double qx, double qy) const;
+    SpinVector get_ring_exchange_field(size_t site, double J7eff) const;
     
     /**
      * Compute effective field on spin i (for spin EOM)
@@ -1040,7 +1130,7 @@ public:
                 state[idx++] = spins[i](d);
             }
         }
-        phonons.to_array(&state[idx]);
+        pack_lattice(&state[idx]);
         return state;
     }
     
@@ -1056,7 +1146,7 @@ public:
             // Renormalize spins
             spins[i] = spins[i].normalized() * spin_length;
         }
-        phonons.from_array(&state[idx]);
+        unpack_lattice(&state[idx]);
     }
     
     // Legacy aliases for backward compatibility

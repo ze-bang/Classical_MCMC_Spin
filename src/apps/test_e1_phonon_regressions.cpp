@@ -465,6 +465,7 @@ bool test_isotropic_only_invariant_part(std::ostream& out) {
     L.spin_phonon_params.lambda_E1_K_2      = 0.0;
     L.spin_phonon_params.lambda_E1_Gamma_2  = 0.0;
     L.spin_phonon_params.lambda_E1_Gammap_2 = 0.0;
+    L.rebuild_primary_mode();   // mirror the changed legacy parameters into modes[0]
 
     const double r = 0.21;
     const std::array<double, 6> phis = {0.0, kPi/6, kPi/3, kPi/2, 2*kPi/3, kPi};
@@ -810,6 +811,157 @@ bool test_linear_channel_pattern(std::ostream& out) {
     return true;
 }
 
+/// Set coordinate (m, comp) on the lattice (m = 0 → primary PhononState).
+void set_coord(PhononLattice& L, size_t m, int comp, double v) {
+    if (m == 0) { if (comp == 0) L.phonons.Q_x_E1 = v; else L.phonons.Q_y_E1 = v; }
+    else        { if (comp == 0) L.modes[m].Q1 = v;    else L.modes[m].Q2 = v; }
+}
+double get_coord(const PhononLattice& L, size_t m, int comp) {
+    if (m == 0) return comp == 0 ? L.phonons.Q_x_E1 : L.phonons.Q_y_E1;
+    return comp == 0 ? L.modes[m].Q1 : L.modes[m].Q2;
+}
+
+bool test_multimode_lattice_sector(std::ostream& out) {
+    out << "[16] Complete lattice sector: primary E1 (all 9 linear + quadratic tensors), extra E1, A1, A2,\n"
+        << "     E2-type modes, a frozen in-plane strain, J2/J3 nematics, linear J7 (A1) and cubic anharmonic\n"
+        << "     transfers — forces vs finite differences, EOM plumbing, energy conservation\n";
+    PhononLattice L = make_lattice_full(4);
+    L.alpha_gilbert = 0.0;
+    std::vector<LatticeMode> extra;
+    {   // extra polar E1 mode with every coupling on
+        LatticeMode e; e.irrep = LatticeMode::Irrep::E; e.weight = 1; e.name = "E1 #2";
+        e.omega = 3.1; e.gamma = 0.0; e.quartic = 0.1; e.Zstar = 0.7;
+        e.cE = {0.03, -0.05, 0.02, 0.01, 0.04, -0.03, 0.02, 0.015, -0.02};
+        e.bE_sq = {0.004, -0.006, 0.003, 0.002, 0.005, -0.004, 0.003, 0.002, -0.003};
+        e.aA1_sq = {0.002, -0.003, 0.001, 0.0015, 0.002};
+        e.lamJ7_sq = 5e-4; e.lamJ2A = 0.01; e.lamJ2B = -0.02; e.lamJ3 = 0.015; e.lamJ3_sq = 0.002; e.lamJ2A_sq = -0.001;
+        e.Q1 = 0.3; e.Q2 = -0.2; e.V1 = 0.1; e.V2 = -0.05;
+        extra.push_back(e);
+    }
+    {   // A1 Raman mode: linear J7, J2, J3 and the five A1 tensors (incl. DM ∥ bond)
+        LatticeMode a; a.irrep = LatticeMode::Irrep::A1; a.name = "A1"; a.omega = 2.2; a.quartic = 0.05;
+        a.aA1 = {0.02, -0.03, 0.01, 0.015, 0.02}; a.lamJ7 = 0.03; a.lamJ2A = 0.01; a.lamJ2B = 0.02; a.lamJ3 = -0.01;
+        a.Q1 = 0.4; a.V1 = 0.2;
+        extra.push_back(a);
+    }
+    {   // A2 (c-polarised) mode: DM-type tensors
+        LatticeMode a; a.irrep = LatticeMode::Irrep::A2; a.name = "A2"; a.omega = 2.7;
+        a.dA2 = {0.02, -0.01, 0.015, 0.01}; a.Q1 = 0.25; a.V1 = -0.1;
+        extra.push_back(a);
+    }
+    {   // E2-type Raman mode (weight 2)
+        LatticeMode e; e.irrep = LatticeMode::Irrep::E; e.weight = 2; e.name = "E2"; e.omega = 2.5;
+        e.cE = {0.02, -0.03, 0.01, 0.02, -0.01, 0.03, 0.01, -0.02, 0.015}; e.lamJ2B = 0.02;
+        e.Q1 = 0.15; e.Q2 = 0.1; e.V1 = 0.05; e.V2 = 0.02;
+        extra.push_back(e);
+    }
+    {   // frozen in-plane uniaxial strain (E2-type, static)
+        LatticeMode s; s.irrep = LatticeMode::Irrep::E; s.weight = 2; s.name = "strain"; s.frozen = true;
+        s.cE = {0.5, -0.8, 0.3, 0.2, 0.1, 0.2, 0.05, 0.1, 0.05}; s.lamJ2A = 0.05; s.lamJ3 = 0.03;
+        s.Q1 = 0.02; s.Q2 = -0.01;
+        extra.push_back(s);
+    }
+    std::vector<AnharmonicTerm> anh = {{2, 0, 0, 0.3}, {4, 0, 1, 0.2}, {2, 1, 1, 0.1}, {4, 1, 1, -0.15}};
+    L.set_modes(extra, anh);
+    // primary mode: switch on the five non-channel linear tensors and the DM-parallel A1 too
+    for (int k = 4; k < 9; ++k) { L.modes[0].cE[k] = 0.01 * (k - 3); L.modes[0].bE_sq[k] = 0.002 * (k - 3); }
+    L.modes[0].aA1_sq[4] = 0.003; L.modes[0].lamJ2A = 0.02; L.modes[0].lamJ3_sq = 0.001;
+    L.update_modulation_flags();
+    deterministic_spins(L, 0.47);
+    L.phonons.Q_x_E1 = 0.5; L.phonons.Q_y_E1 = -0.3; L.phonons.V_x_E1 = 0.2; L.phonons.V_y_E1 = 0.1;
+
+    const size_t expect_dof = 4 + 4 + 2 + 2 + 4;
+    out << "    lattice DOF = " << L.phonon_dof() << " (expected " << expect_dof << "), modes = " << L.modes.size() << "\n";
+    if (L.phonon_dof() != expect_dof) { out << "[FAIL] DOF bookkeeping\n"; return false; }
+
+    // (a) raw forces vs FD of the ε-dependent energy (all coordinates incl. frozen, as stress)
+    auto E_me = [&]() { return L.spin_phonon_energy() + L.ring_exchange_energy() + L.anharmonic_energy(); };
+    const std::vector<double> F = L.lattice_forces_raw();
+    size_t idx = 0; double max_err = 0.0;
+    for (size_t m = 0; m < L.modes.size(); ++m) {
+        for (int comp = 0; comp < L.modes[m].ncoord(); ++comp, ++idx) {
+            const double q0 = get_coord(L, m, comp);
+            set_coord(L, m, comp, q0 + kFDStep); const double Ep = E_me();
+            set_coord(L, m, comp, q0 - kFDStep); const double Em = E_me();
+            set_coord(L, m, comp, q0);
+            const double fd = (Ep - Em) / (2 * kFDStep);
+            const double err = std::abs(F[idx] - fd) / std::max(1.0, std::abs(fd));
+            max_err = std::max(max_err, err);
+            out << "    mode " << m << "." << comp << " (" << L.modes[m].name << "): ∂H/∂q analytic=" << F[idx] << " FD=" << fd << "\n";
+        }
+    }
+    if (max_err > 1e-6) { out << "[FAIL] lattice forces (max rel err " << max_err << ")\n"; return false; }
+
+    // (b) spin field vs FD
+    double max_h = 0.0;
+    for (size_t site : {0u, 3u, 8u, 13u, 22u}) {
+        const Eigen::Vector3d H_an = L.get_local_field(site);
+        const Eigen::Vector3d S0 = L.spins[site];
+        Eigen::Vector3d H_fd;
+        for (int a = 0; a < 3; ++a) {
+            Eigen::Vector3d dlt = Eigen::Vector3d::Zero(); dlt(a) = kFDStep;
+            L.spins[site] = S0 + dlt; const double Ep = L.total_energy();
+            L.spins[site] = S0 - dlt; const double Em = L.total_energy();
+            L.spins[site] = S0;
+            H_fd(a) = -(Ep - Em) / (2 * kFDStep);
+        }
+        max_h = std::max(max_h, (H_an - H_fd).cwiseAbs().maxCoeff());
+    }
+    out << "    spin field max |analytic − FD| = " << max_h << "\n";
+    if (max_h > 1e-6) { out << "[FAIL] spin field with all modes\n"; return false; }
+    // Metropolis increment
+    {
+        const size_t s = 9; const Eigen::Vector3d old_spin = L.spins[s];
+        const Eigen::Vector3d new_spin = Eigen::Vector3d(0.4, -0.5, 0.3).normalized() * L.spin_length;
+        const double E0 = L.total_energy(); const double dEl = L.site_energy_diff(new_spin, old_spin, s);
+        L.spins[s] = new_spin; const double E1 = L.total_energy(); L.spins[s] = old_spin;
+        if (!nearly_equal(dEl, E1 - E0, 1e-9, 1e-10)) { out << "[FAIL] MC increment with all modes: " << dEl << " vs " << (E1 - E0) << "\n"; return false; }
+    }
+
+    // (c) EOM plumbing for the extra modes: accelerations = −ω²q − λ4|q|²q − γv + Z*E − F/N (no drive here)
+    {
+        PhononLattice::ODEState x = L.spins_to_state(), dxdt(x.size());
+        L.ode_system(x, dxdt, 0.0);
+        const double N = double(L.lattice_size);
+        size_t p = 3 * L.lattice_size + 4, fidx = 2;
+        for (size_t m = 1; m < L.modes.size(); ++m) {
+            const LatticeMode& md = L.modes[m];
+            if (md.frozen) { fidx += md.ncoord(); continue; }
+            const int nc = md.ncoord();
+            const double q1 = get_coord(L, m, 0), q2 = nc == 2 ? get_coord(L, m, 1) : 0.0, Qsq = q1 * q1 + q2 * q2;
+            const double a1 = -md.omega * md.omega * q1 - md.quartic * Qsq * q1 - md.gamma * md.V1 - F[fidx] / N;
+            if (!nearly_equal(dxdt[p + nc], a1, 1e-9, 1e-9) || !nearly_equal(dxdt[p], md.V1, 1e-12)) {
+                out << "[FAIL] EOM of mode " << m << ": ode=" << dxdt[p + nc] << " expected=" << a1 << "\n"; return false;
+            }
+            if (nc == 2) {
+                const double a2 = -md.omega * md.omega * q2 - md.quartic * Qsq * q2 - md.gamma * md.V2 - F[fidx + 1] / N;
+                if (!nearly_equal(dxdt[p + nc + 1], a2, 1e-9, 1e-9)) { out << "[FAIL] EOM (comp 2) of mode " << m << "\n"; return false; }
+            }
+            p += 2 * nc; fidx += nc;
+        }
+        out << "    extra-mode accelerations match −ω²q − λ4|q|²q − (1/N)∂H/∂q\n";
+    }
+
+    // (d) energy conservation of the full undamped system
+    {
+        const double E0 = L.total_energy();
+        PhononLattice::ODEState x = L.spins_to_state();
+        double worst = 0.0;
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            rk4_integrate(L, x, 0.002, 300);
+            for (size_t i = 0; i < L.lattice_size; ++i) L.spins[i] = Eigen::Vector3d(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+            L.unpack_lattice(&x[3 * L.lattice_size]);
+            const double E = L.total_energy();
+            worst = std::max(worst, std::abs(E - E0) / std::abs(E0));
+            out << "    t=" << 0.6 * (chunk + 1) << "  E/N=" << E / L.lattice_size << "  |ΔE/E|=" << std::abs(E - E0) / std::abs(E0)
+                << "  |ε|=" << L.E1_amplitude() << "  Q_A1=" << L.modes[2].Q1 << "  Q_E2=(" << L.modes[4].Q1 << "," << L.modes[4].Q2 << ")\n";
+        }
+        if (worst > 1e-7) { out << "[FAIL] energy drift " << worst << "\n"; return false; }
+    }
+    out << "[PASS] complete lattice sector\n\n";
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -831,6 +983,7 @@ int main() {
     ok = test_size_independence(std::cout)               && ok;
     ok = test_stability_bound(std::cout)                 && ok;
     ok = test_linear_channel_pattern(std::cout)          && ok;
+    ok = test_multimode_lattice_sector(std::cout)        && ok;
 
     if (!ok) {
         std::cout << "E1 phonon Hamiltonian regression FAILURES detected.\n";
