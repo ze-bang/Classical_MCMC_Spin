@@ -43,21 +43,21 @@ lambda_E1_quartic = 0.0
 Z_star = 1.0
 phonon_per_site = 1
 
-# Quadratic magnetoelastic couplings (Grueneisen-scaled, lambda_X2 = (X/K) lambda_K2)
+# Second-order bilinear couplings: OFF (leading term is the linear one below)
 lambda_E1_J_0 = 0.0
-lambda_E1_J_2 = -0.0017
+lambda_E1_J_2 = 0.0
 lambda_E1_K_0 = 0.0
-lambda_E1_K_2 = 0.02
+lambda_E1_K_2 = 0.0
 lambda_E1_Gamma_0 = 0.0
-lambda_E1_Gamma_2 = -0.0078
+lambda_E1_Gamma_2 = 0.0
 lambda_E1_Gammap_0 = 0.0
-lambda_E1_Gammap_2 = 0.0075
-lambda_E1_J7_0 = 1.0e-3
-# D3-allowed linear striction (off; scan e.g. lambda_E1_K_1 = +-0.1 for sensitivity)
-lambda_E1_J_1 = 0.0
-lambda_E1_K_1 = 0.0
-lambda_E1_Gamma_1 = 0.0
-lambda_E1_Gammap_1 = 0.0
+lambda_E1_Gammap_2 = 0.0
+lambda_E1_J7_0 = 0.0           # ring |Q|^2 term: scenario 2 only
+# LEADING (first-order, D3-allowed) striction: lambda_X1 = (X/K) 40 -> 5 % modulation at |Q| ~ 0.01
+lambda_E1_J_1 = -3.447
+lambda_E1_K_1 = 40.0
+lambda_E1_Gamma_1 = -15.56
+lambda_E1_Gammap_1 = 14.91
 # ------------------------------------------------------------------
 # ONLY the polar E1 doublet is driven experimentally: no other lattice coordinate is
 # switched on here.  (Extra E1/E2/A1/A2 modes, frozen strains and anharmonic transfers

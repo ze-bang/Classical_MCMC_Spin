@@ -32,21 +32,26 @@ n_extra_modes = 0                   # no Raman / A2 / strain coordinate is drive
 n_anharmonic = 0
 
 # ---- magnetoelastic couplings (unknown constants; only the FORM is fixed by symmetry)
-# second order (rectifying), Grueneisen-scaled lambda_X2 = (X/K) lambda_K2, lambda_K2 = 0.02:
+# LEADING term for a polar E1 mode of one D3 layer: FIRST order, delta X_gamma = lambda_X1 Q.d_gamma.
+# Stipulated Grueneisen-type scale: common fraction delta X/X, lambda_X1 = (X/K) lambda_K1,
+# lambda_K1 = 40 meV per unit Q  ->  5 % exchange modulation at the physical |Q| ~ 0.01.
+lambda_E1_J_1 = -3.447
+lambda_E1_K_1 = 40.0
+lambda_E1_Gamma_1 = -15.56
+lambda_E1_Gammap_1 = 14.91
+# second-order bilinear terms OFF (the rectified shear physics emerges at O(lambda_1^2/omega^2)
+# from the integrated dynamics; the old lambda_X2 = (X/K) 0.02 came from the D6 analysis error)
 lambda_E1_J_0 = 0.0
-lambda_E1_J_2 = -0.0017
+lambda_E1_J_2 = 0.0
 lambda_E1_K_0 = 0.0
-lambda_E1_K_2 = 0.02
+lambda_E1_K_2 = 0.0
 lambda_E1_Gamma_0 = 0.0
-lambda_E1_Gamma_2 = -0.0078
+lambda_E1_Gamma_2 = 0.0
 lambda_E1_Gammap_0 = 0.0
-lambda_E1_Gammap_2 = 0.0075
-lambda_E1_J7_0 = 1.0e-3             # phonon effect on the ring exchange: J7 -> J7 + 1e-3 |Q|^2
-# first order (odd in Q, D3-allowed): off in the baseline; scan in a separate series
-lambda_E1_J_1 = 0.0
-lambda_E1_K_1 = 0.0
-lambda_E1_Gamma_1 = 0.0
-lambda_E1_Gammap_1 = 0.0
+lambda_E1_Gammap_2 = 0.0
+# ring exchange: A1 operator, couples only through |Q|^2 -> its LEADING term; off in the
+# baseline, switched on (1e-3) in scenario 2
+lambda_E1_J7_0 = 0.0
 mode0_cE5 = 0.0
 mode0_cE6 = 0.0
 mode0_cE7 = 0.0

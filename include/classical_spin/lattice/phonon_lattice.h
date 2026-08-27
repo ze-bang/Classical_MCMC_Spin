@@ -162,6 +162,21 @@ struct AnharmonicTerm {
 /**
  * Zone-center E1 phonon state.
  *
+ * NORMALISATION OF Q (one dictionary, used everywhere — energy, drive, coupling, EOM):
+ *   Q is the mass-normalised amplitude of the zone-centre mode, one coordinate per unit
+ *   cell, intensive.  With ħ = 1, energies in meV and time in ħ/meV,
+ *     phonon energy   E_ph    = N_sites · [ ½|Q̇|² + ½ ω² |Q|² ]          (ω in meV)
+ *     drive energy    E_drive = − N_sites · Z* E(t)·Q
+ *     coupling        δX_γ    = λ_{X,1} Q·d̂_γ + λ_{X,2} (Q⊗Q)_E ...        (meV per unit Q, Q²)
+ *     equation of motion  Q̈ = −ω²Q − γQ̇ + Z*E(t) − (1/N_sites) ∂H_ME/∂Q
+ *   so Q² carries units of 1/meV (= ħ²/(meV) in SI).  Physical dictionary for a mode with
+ *   effective mass M_cell per unit cell and atomic displacement u:
+ *     Q = sqrt(M_cell/2) · u / ħ     (the ½ because N_sites = 2 N_cell)
+ *     e.g. M_cell = 30 amu, u = 2 pm  →  Q ≈ 0.012;  7 µeV per Co of absorbed energy at
+ *     4.2 THz  →  |Q| = sqrt(2·0.007/17.37²) ≈ 0.007.
+ *     Z* E0 = (N_cell/N_sites) Z_e e E0_phys ħ / sqrt(M_cell/2): the impulsive response of the
+ *     matched pulse is |Q|max = 0.0097 per unit Z*E0, hence Z*E0 ≈ 1 ↔ 300 kV/cm.
+ *
  * The E1 optical strain field is a single in-plane two-component coordinate
  * ε = (Q_x, Q_y) with conjugate velocities (V_x, V_y). Total DOF = 4.
  *
@@ -266,34 +281,40 @@ struct SpinPhononCouplingParams {
     double J7 = -0.4096;
     // Scalar quadratic E1 modulation of ring exchange:
     //   J7_eff(ε) = J7 + lambda_E1_J7_0 (ε_x² + ε_y²)   (the phonon effect on J_ring;
-    // λ > 0 drives |J7| down, i.e. towards zigzag, for any polarization).
-    double lambda_E1_J7_0 = 1.0e-3;
+    // λ > 0 drives |J7| down, i.e. towards zigzag, for any polarization).  The ring operator
+    // is A1, so this |Q|² term is its LEADING coupling; off by default (scenario 2 turns it on).
+    double lambda_E1_J7_0 = 0.0;
 
     // Quadratic E1 exchange-modulation coefficients δX_γ(ε):
     //   λ_{X,0} multiplies the rotational invariant ε_x² + ε_y²
     //   λ_{X,2} multiplies the bond-dependent rank-2 piece
-    // Defaults: Grüneisen-scaled anisotropic (E2-part) couplings λ_{X,2} = (X/K) λ_{K,2},
-    // λ_{K,2} = 0.02; isotropic (A1) parts zero.  Values are NOT measured — only the form is.
+    // Second-order (|Q|² and (Q⊗Q)_E) bilinear couplings: OFF by default.  They are not the
+    // leading term for a polar E1 mode of one D3 layer — the linear channel below is — and the
+    // rectified E2-shear physics they were meant to model arises automatically, at O(λ1²/ω²),
+    // from the time-dependent linear modulation once the dynamics is integrated.
     double lambda_E1_J_0      = 0.0;
-    double lambda_E1_J_2      = -0.0017;
+    double lambda_E1_J_2      = 0.0;
     double lambda_E1_K_0      = 0.0;
-    double lambda_E1_K_2      = 0.02;
+    double lambda_E1_K_2      = 0.0;
     double lambda_E1_Gamma_0  = 0.0;
-    double lambda_E1_Gamma_2  = -0.0078;
+    double lambda_E1_Gamma_2  = 0.0;
     double lambda_E1_Gammap_0 = 0.0;
-    double lambda_E1_Gammap_2 = 0.0075;
+    double lambda_E1_Gammap_2 = 0.0;
     // LINEAR E-channel striction, allowed by the D3 symmetry of one SOC
     // honeycomb layer (P6_322 Co site symmetry 32, twofold axes along bonds):
     //   δX_γ^{(1)}(ε) = λ_{X,1} [ε_x cos2θ_γ − ε_y sin2θ_γ] = λ_{X,1}|ε| cos(θ_pol + 2θ_γ).
     // It is the unique D3 invariant Re[ε₊N₊] (rotational weight 1+2 = 3);
-    // it is odd in ε, so it averages out over a drive cycle and does not
-    // rectify, but it is first order in the phonon amplitude.  Forbidden only
-    // by the layer-exchanging C6 of the bilayer (which acts on the layer-summed
-    // response).  Default 0 = the purely quadratic model of the manuscript.
-    double lambda_E1_J_1      = 0.0;
-    double lambda_E1_K_1      = 0.0;
-    double lambda_E1_Gamma_1  = 0.0;
-    double lambda_E1_Gammap_1 = 0.0;
+    // it is odd in ε (no static rectification at first order) but it is FIRST order in the
+    // phonon amplitude: the leading magnetoelastic term of a polar E1 mode of one D3 layer.
+    // Forbidden only by the layer-exchanging C6 of the bilayer (layer-summed response).
+    // Defaults = the experimental operating point with a stipulated Grüneisen-type scale:
+    // δX/X common to all channels, λ_{X,1} = (X/K) λ_{K,1}, λ_{K,1} = 40 meV per unit Q, i.e.
+    // a 5 % modulation of every exchange at the physical amplitude |Q| ≈ 0.01 (γ_G ≈ 10 with a
+    // Co1–Co2 relative displacement of ~1 pm at 300 kV/cm).  Replace by DFT/Raman-anomaly values.
+    double lambda_E1_J_1      = -3.447;
+    double lambda_E1_K_1      = 40.0;
+    double lambda_E1_Gamma_1  = -15.56;
+    double lambda_E1_Gammap_1 = 14.91;
 
     /// Kitaev local-to-global rotation matrix R.
     static SpinMatrix get_kitaev_rotation() {

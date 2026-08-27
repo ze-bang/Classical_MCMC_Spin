@@ -22,6 +22,23 @@ assembled as `cat common_ncto_6K.inc <protocol>.inc > run.param` by the scripts 
 | double pulse (Fig. 4) | second pulse ≈ 0.6 × first, τ ∈ [−5, 5] ps, t ≤ 600 ps, modulation = M₁₂ − M₁ − M₂ | `probe_amplitude = 0.6·E0`, `probe_time = 10 + τ`, three runs per τ, `md_time_end = 920` |
 | repetition rate | 200/500 Hz, decay 0.86 ms | single-shot simulation (each pulse sees a fresh 3Q state) — cannot be reproduced |
 
+## Couplings: first order is the leading term
+
+For a polar E₁ mode of one D₃ layer the leading magnetoelastic term is LINEAR,
+δX_γ = λ_{X,1} Q·d̂_γ (bond projection of the displacement). Defaults: λ_{K,1} = 40 meV/Q with
+Grüneisen ratios λ_{X,1} = (X/K)λ_{K,1} for J, Γ, Γ′ — a 5 % modulation of every exchange at
+the physical amplitude |Q| ≈ 0.01. The second-order bilinear terms λ_{X,0}, λ_{X,2} are OFF:
+the old λ_{X,2} = (X/K)·0.02 came from applying D₆ to a single layer, and the rectified
+E₂-shear physics it modelled arises automatically at O(λ₁²/ω²) once the linear modulation is
+integrated in time. The ring exchange is A₁ and couples only through |Q|² (`lambda_E1_J7_0`);
+it is off in the baseline and on (10⁻³) in scenario 2. The other five linear E doublets
+(`mode0_cE5..9`) have no estimate yet and stay 0.
+
+**Q normalisation (one dictionary, code and estimates):** E_ph = N·½ω²|Q|², E_drive = −N Z*E·Q,
+δX = λ₁ Q·d̂_γ, Q̈ = −ω²Q − γQ̇ + Z*E(t) − (1/N)∂H_ME/∂Q; Q = √(M_cell/2)·u/ħ, so 7 µeV/Co
+of absorbed energy at 4.2 THz ↔ |Q| ≈ 0.007 ↔ Z*E₀ ≈ 1 (impulsive response 0.0097 per unit
+Z*E₀). See the `PhononState` header comment.
+
 ## E0: fixed by the energy budget, not by the switching response
 
 Z*E0 is not known microscopically, but the absorbed fluence fixes the phonon energy:
