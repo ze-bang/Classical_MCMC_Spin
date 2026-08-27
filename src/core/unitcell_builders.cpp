@@ -1112,17 +1112,18 @@ UnitCell build_tmfeo3_tm(const SpinConfig& config) {
 
 UnitCell build_phonon_honeycomb(const SpinConfig& config) {
     // Kitaev-Heisenberg-Γ-Γ' parameters
-    const double K = config.get_param("K", -9.0);
-    const double Gamma = config.get_param("Gamma", 1.8);
-    const double Gammap = config.get_param("Gammap", 0.3);
-    const double J = config.get_param("J", -0.1);
-    
+    // Defaults = Na2Co2TeO6 (Krüger et al. neutron fit, meV); see SpinPhononCouplingParams.
+    const double K = config.get_param("K", -7.89);
+    const double Gamma = config.get_param("Gamma", 3.07);
+    const double Gammap = config.get_param("Gammap", -2.94);
+    const double J = config.get_param("J", 0.68);
+
     // 2nd NN (sublattice-dependent isotropic Heisenberg)
-    const double J2_A = config.get_param("J2_A", 0.3);
-    const double J2_B = config.get_param("J2_B", 0.3);
-    
+    const double J2_A = config.get_param("J2_A", -0.06);
+    const double J2_B = config.get_param("J2_B", -0.70);
+
     // 3rd NN (isotropic Heisenberg)
-    const double J3 = config.get_param("J3", 0.9);
+    const double J3 = config.get_param("J3", 0.52);
     
     // Use HoneyComb class from unitcell.h
     HoneyComb atoms(3);

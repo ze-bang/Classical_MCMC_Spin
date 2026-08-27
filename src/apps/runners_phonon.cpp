@@ -31,39 +31,43 @@ void build_phonon_params(const SpinConfig& config,
                          PhononParams& ph_params,
                          DriveParams& dr_params,
                          TimeDependentSpinPhononParams& td_sp_params) {
-    // Kitaev-Heisenberg-Γ-Γ' spin interaction parameters (Songvilay defaults)
-    sp_params.J = config.get_param("J", -0.1);
-    sp_params.K = config.get_param("K", -9.0);
-    sp_params.Gamma = config.get_param("Gamma", 1.8);
-    sp_params.Gammap = config.get_param("Gammap", 0.3);
-    
+    // Defaults (when a key is absent) = the Na2Co2TeO6 experimental operating point, i.e. the
+    // SpinPhononCouplingParams / PhononParams / DriveParams struct defaults (Krüger fit, J7 at
+    // the 3Q/ZZ near-degeneracy, 4.2 THz E1 mode, measured ring-down, measured pulse shape).
+    const SpinPhononCouplingParams d_sp;
+    const PhononParams d_ph;
+    const DriveParams d_dr;
+    sp_params.J = config.get_param("J", d_sp.J);
+    sp_params.K = config.get_param("K", d_sp.K);
+    sp_params.Gamma = config.get_param("Gamma", d_sp.Gamma);
+    sp_params.Gammap = config.get_param("Gammap", d_sp.Gammap);
+
     // 2nd neighbor (J2) - isotropic Heisenberg, sublattice-dependent
-    sp_params.J2_A = config.get_param("J2_A", 0.3);
-    sp_params.J2_B = config.get_param("J2_B", 0.3);
-    
+    sp_params.J2_A = config.get_param("J2_A", d_sp.J2_A);
+    sp_params.J2_B = config.get_param("J2_B", d_sp.J2_B);
+
     // 3rd neighbor (J3) - isotropic Heisenberg
-    sp_params.J3 = config.get_param("J3", 0.9);
-    
+    sp_params.J3 = config.get_param("J3", d_sp.J3);
+
     // Six-spin ring exchange on hexagonal plaquettes
-    sp_params.J7 = config.get_param("J7", 0.0);
-    // Scalar quadratic E1 modulation of ring exchange:
+    sp_params.J7 = config.get_param("J7", d_sp.J7);
+    // Scalar quadratic E1 modulation of ring exchange (phonon effect on J_ring):
     //   J7_eff = J7 + lambda_E1_J7_0 * |epsilon|^2.
-    // Negative lambda_E1_J7_0 makes J7 decrease under E1 driving.
     sp_params.lambda_E1_J7_0 = config.get_param("lambda_E1_J7_0",
-                                      config.get_param("lambda_J7_0", 0.0));
+                                      config.get_param("lambda_J7_0", d_sp.lambda_E1_J7_0));
     
     // E1 magnetoelastic couplings: one isotropic (λ_X,0) and one
     // anisotropic (λ_X,2) coefficient per exchange channel X ∈ {J, K, Γ, Γ'}.
     // The leading symmetry-allowed E1 coupling is quadratic in ε; see
     // δX_γ(ε) = λ_X,0 (ε_x²+ε_y²) + λ_X,2 [(ε_x²-ε_y²) cos2θ_γ + 2ε_x ε_y sin2θ_γ].
-    sp_params.lambda_E1_J_0      = config.get_param("lambda_E1_J_0",      config.get_param("lambda_J_0",      0.0));
-    sp_params.lambda_E1_J_2      = config.get_param("lambda_E1_J_2",      config.get_param("lambda_J_2",      0.0));
-    sp_params.lambda_E1_K_0      = config.get_param("lambda_E1_K_0",      config.get_param("lambda_K_0",      0.0));
-    sp_params.lambda_E1_K_2      = config.get_param("lambda_E1_K_2",      config.get_param("lambda_K_2",      0.0));
-    sp_params.lambda_E1_Gamma_0  = config.get_param("lambda_E1_Gamma_0",  config.get_param("lambda_Gamma_0",  0.0));
-    sp_params.lambda_E1_Gamma_2  = config.get_param("lambda_E1_Gamma_2",  config.get_param("lambda_Gamma_2",  0.0));
-    sp_params.lambda_E1_Gammap_0 = config.get_param("lambda_E1_Gammap_0", config.get_param("lambda_Gammap_0", 0.0));
-    sp_params.lambda_E1_Gammap_2 = config.get_param("lambda_E1_Gammap_2", config.get_param("lambda_Gammap_2", 0.0));
+    sp_params.lambda_E1_J_0      = config.get_param("lambda_E1_J_0",      config.get_param("lambda_J_0",      d_sp.lambda_E1_J_0));
+    sp_params.lambda_E1_J_2      = config.get_param("lambda_E1_J_2",      config.get_param("lambda_J_2",      d_sp.lambda_E1_J_2));
+    sp_params.lambda_E1_K_0      = config.get_param("lambda_E1_K_0",      config.get_param("lambda_K_0",      d_sp.lambda_E1_K_0));
+    sp_params.lambda_E1_K_2      = config.get_param("lambda_E1_K_2",      config.get_param("lambda_K_2",      d_sp.lambda_E1_K_2));
+    sp_params.lambda_E1_Gamma_0  = config.get_param("lambda_E1_Gamma_0",  config.get_param("lambda_Gamma_0",  d_sp.lambda_E1_Gamma_0));
+    sp_params.lambda_E1_Gamma_2  = config.get_param("lambda_E1_Gamma_2",  config.get_param("lambda_Gamma_2",  d_sp.lambda_E1_Gamma_2));
+    sp_params.lambda_E1_Gammap_0 = config.get_param("lambda_E1_Gammap_0", config.get_param("lambda_Gammap_0", d_sp.lambda_E1_Gammap_0));
+    sp_params.lambda_E1_Gammap_2 = config.get_param("lambda_E1_Gammap_2", config.get_param("lambda_Gammap_2", d_sp.lambda_E1_Gammap_2));
     // D3-allowed linear E-channel striction δX_γ = λ_{X,1}[ε_x cos2θ_γ − ε_y sin2θ_γ]
     // (off by default; see SpinPhononCouplingParams).
     sp_params.lambda_E1_J_1      = config.get_param("lambda_E1_J_1",      0.0);
@@ -82,29 +86,37 @@ void build_phonon_params(const SpinConfig& config,
 
     // Zone-center E1 phonon parameters: ω_E1, γ_E1, optional quartic
     // self-coupling λ (ε²)²/4, and effective charge Z_E1*.
-    ph_params.omega_E1          = config.get_param("omega_E1",          config.get_param("omega_E", 1.0));
-    ph_params.gamma_E1          = config.get_param("gamma_E1",          config.get_param("gamma_E", 0.1));
-    ph_params.lambda_E1_quartic = config.get_param("lambda_E1_quartic", config.get_param("lambda_E", 0.0));
-    ph_params.Z_star            = config.get_param("Z_star", 1.0);
+    ph_params.omega_E1          = config.get_param("omega_E1",          config.get_param("omega_E", d_ph.omega_E1));
+    ph_params.gamma_E1          = config.get_param("gamma_E1",          config.get_param("gamma_E", d_ph.gamma_E1));
+    ph_params.lambda_E1_quartic = config.get_param("lambda_E1_quartic", config.get_param("lambda_E", d_ph.lambda_E1_quartic));
+    ph_params.Z_star            = config.get_param("Z_star", d_ph.Z_star);
     // phonon_per_site = 1 (default): magnetoelastic force per site in the E1
     // equation of motion (size-independent dynamics). 0 = legacy extensive force.
     ph_params.per_site_backaction = config.get_param("phonon_per_site", 1.0) > 0.5;
 
-    // Drive parameters (pulse 1 - pump) - couples linearly to ε via -Z*·E·ε
+    // Drive parameters (pulse 1 - pump) - couples linearly to ε via -Z*·E·ε.
+    // pump_frequency/pump_width/pump_time are SpinConfig members shared with the other
+    // systems, so "absent" cannot be detected there; the NCTO operating point (3.0 THz
+    // carrier, σ = 0.273, centre 10) is used whenever the config leaves them at the generic
+    // SpinConfig defaults (0, 10, 0) or sets them ≤ 0.
+    auto pick = [](double cfg, double generic_default, double ncto_default) {
+        return (cfg <= 0.0 || cfg == generic_default) ? ncto_default : cfg;
+    };
+    const SpinConfig generic;
     dr_params.E0_1    = config.pump_amplitude;
-    dr_params.omega_1 = config.pump_frequency > 0 ? config.pump_frequency : ph_params.omega_E1;
-    dr_params.t_1     = config.pump_time;
-    dr_params.sigma_1 = config.pump_width;
-    dr_params.phi_1   = config.get_param("pump_phase", 0.0);
-    dr_params.theta_1 = config.get_param("pump_polarization", 0.0);
+    dr_params.omega_1 = pick(config.pump_frequency, generic.pump_frequency, d_dr.omega_1);
+    dr_params.t_1     = config.pump_time;   // pulse centre is always taken from the config
+    dr_params.sigma_1 = pick(config.pump_width, generic.pump_width, d_dr.sigma_1);
+    dr_params.phi_1   = config.get_param("pump_phase", d_dr.phi_1);
+    dr_params.theta_1 = config.get_param("pump_polarization", d_dr.theta_1);
 
-    // Drive parameters (pulse 2 - probe)
+    // Drive parameters (pulse 2 - second THz pulse of the coherent-control protocol)
     dr_params.E0_2    = config.probe_amplitude;
-    dr_params.omega_2 = config.probe_frequency > 0 ? config.probe_frequency : ph_params.omega_E1;
+    dr_params.omega_2 = pick(config.probe_frequency, generic.probe_frequency, d_dr.omega_2);
     dr_params.t_2     = config.probe_time;
-    dr_params.sigma_2 = config.probe_width;
-    dr_params.phi_2   = config.get_param("probe_phase", 0.0);
-    dr_params.theta_2 = config.get_param("probe_polarization", 0.0);
+    dr_params.sigma_2 = pick(config.probe_width, generic.probe_width, d_dr.sigma_2);
+    dr_params.phi_2   = config.get_param("probe_phase", d_dr.phi_2);
+    dr_params.theta_2 = config.get_param("probe_polarization", d_dr.theta_2);
 }
 
 /**
@@ -428,9 +440,10 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
         // Set ordering pattern AFTER all equilibration is complete
         // This ensures O_custom = 1 at t=0 (spins match the ordering pattern)
         lattice.set_ordering_pattern();
-        
-        // Save initial configuration
+
+        // Save initial configuration and site positions (for r3 / chirality post-processing)
         lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+        lattice.save_positions(trial_dir + "/positions.txt");
         
         // Run spin-phonon dynamics with THz drive
         if (rank == 0) {

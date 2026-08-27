@@ -205,8 +205,11 @@ struct PhononState {
  * E1 phonon parameters.
  */
 struct PhononParams {
-    double omega_E1 = 1.0;          ///< E1 mode frequency ω_E1
-    double gamma_E1 = 0.1;          ///< E1 mode damping γ_E1
+    // Defaults = the Na2Co2TeO6 experimental operating point (NCTO_phonon_v0, 6 K):
+    // dominant IR-active E1 line at 4.2 THz (h·ν = 17.37 meV), amplitude ring-down
+    // 2/γ = 6.6 ps (measured 5–10 ps).  Time unit ħ/meV = 0.658 ps.
+    double omega_E1 = 17.37;        ///< E1 mode frequency ω_E1 (meV) = 4.2 THz
+    double gamma_E1 = 0.20;         ///< E1 mode damping γ_E1 (1/code time): 2/γ = 6.6 ps
     double lambda_E1_quartic = 0.0; ///< Optional quartic self-coupling λ (ε²)²/4
     double Z_star = 1.0;            ///< Effective charge for E(t) coupling
     /// Normalise the magnetoelastic force in the phonon equation of motion per
@@ -245,37 +248,40 @@ struct PhononParams {
  * not for the single-layer model integrated here.
  */
 struct SpinPhononCouplingParams {
-    // Kitaev-Heisenberg-Γ-Γ' parameters (Songvilay defaults)
-    double J = -0.1;       ///< Heisenberg coupling
-    double K = -9.0;       ///< Kitaev coupling
-    double Gamma = 1.8;    ///< Γ (off-diagonal symmetric)
-    double Gammap = 0.3;   ///< Γ' (off-diagonal asymmetric)
+    // Defaults = Na2Co2TeO6 operating point: Krüger et al. neutron fit (meV) with the ring
+    // exchange J7 at the corrected 3Q/zigzag near-degeneracy (fixed J2/J3 bond lists).
+    double J = 0.68;       ///< Heisenberg coupling
+    double K = -7.89;      ///< Kitaev coupling
+    double Gamma = 3.07;   ///< Γ (off-diagonal symmetric)
+    double Gammap = -2.94; ///< Γ' (off-diagonal asymmetric)
 
-    // 2nd NN exchange (isotropic Heisenberg, sublattice-dependent)
-    double J2_A = 0.3;
-    double J2_B = 0.3;
+    // 2nd NN exchange (isotropic Heisenberg, sublattice-dependent: Co1 (2b) ≠ Co2 (2d))
+    double J2_A = -0.06;
+    double J2_B = -0.70;
 
     // 3rd NN exchange (isotropic Heisenberg)
-    double J3 = 0.9;
+    double J3 = 0.52;
 
-    // Six-spin ring exchange on hexagonal plaquettes
-    double J7 = 0.0;
+    // Six-spin ring exchange on hexagonal plaquettes (3Q ground state for J7 < -0.4096)
+    double J7 = -0.4096;
     // Scalar quadratic E1 modulation of ring exchange:
-    //   J7_eff(ε) = J7 + lambda_E1_J7_0 (ε_x² + ε_y²).
-    // Set lambda_E1_J7_0 < 0 when the E1 distortion should decrease J7.
-    double lambda_E1_J7_0 = 0.0;
+    //   J7_eff(ε) = J7 + lambda_E1_J7_0 (ε_x² + ε_y²)   (the phonon effect on J_ring;
+    // λ > 0 drives |J7| down, i.e. towards zigzag, for any polarization).
+    double lambda_E1_J7_0 = 1.0e-3;
 
     // Quadratic E1 exchange-modulation coefficients δX_γ(ε):
     //   λ_{X,0} multiplies the rotational invariant ε_x² + ε_y²
     //   λ_{X,2} multiplies the bond-dependent rank-2 piece
+    // Defaults: Grüneisen-scaled anisotropic (E2-part) couplings λ_{X,2} = (X/K) λ_{K,2},
+    // λ_{K,2} = 0.02; isotropic (A1) parts zero.  Values are NOT measured — only the form is.
     double lambda_E1_J_0      = 0.0;
-    double lambda_E1_J_2      = 0.0;
+    double lambda_E1_J_2      = -0.0017;
     double lambda_E1_K_0      = 0.0;
-    double lambda_E1_K_2      = 0.0;
+    double lambda_E1_K_2      = 0.02;
     double lambda_E1_Gamma_0  = 0.0;
-    double lambda_E1_Gamma_2  = 0.0;
+    double lambda_E1_Gamma_2  = -0.0078;
     double lambda_E1_Gammap_0 = 0.0;
-    double lambda_E1_Gammap_2 = 0.0;
+    double lambda_E1_Gammap_2 = 0.0075;
     // LINEAR E-channel striction, allowed by the D3 symmetry of one SOC
     // honeycomb layer (P6_322 Co site symmetry 32, twofold axes along bonds):
     //   δX_γ^{(1)}(ε) = λ_{X,1} [ε_x cos2θ_γ − ε_y sin2θ_γ] = λ_{X,1}|ε| cos(θ_pol + 2θ_γ).
@@ -361,19 +367,22 @@ struct TimeDependentSpinPhononParams {
  *   H_drive = -Z* [E_x(t) ε_x + E_y(t) ε_y].
  */
 struct DriveParams {
+    // Defaults = the measured NCTO THz transient (SI Fig. S1b,c): ~1.5-cycle pulse, envelope
+    // FWHM ≈ 0.6 ps, spectrum 1–5 THz peaking at 3–4 THz  →  Gaussian σ = 0.18 ps = 0.273 code
+    // units, carrier 3.0 THz = 12.41 meV, CEP 0, centred 6.6 ps (10 code units) after t = 0.
     // Pulse 1 (pump)
     double E0_1    = 0.0;
-    double omega_1 = 1.0;
-    double t_1     = 0.0;
-    double sigma_1 = 1.0;
+    double omega_1 = 12.41;
+    double t_1     = 10.0;
+    double sigma_1 = 0.273;
     double phi_1   = 0.0;
-    double theta_1 = 0.0;  ///< Polarization angle (0 = x, π/2 = y)
+    double theta_1 = 0.0;  ///< Polarization angle from the x-bond line (0 = x, π/2 = y)
 
-    // Pulse 2 (probe)
+    // Pulse 2 (second THz pulse of the coherent-control protocol; E2 ≈ 0.6 E1 in the experiment)
     double E0_2    = 0.0;
-    double omega_2 = 1.0;
-    double t_2     = 0.0;
-    double sigma_2 = 1.0;
+    double omega_2 = 12.41;
+    double t_2     = 10.0;
+    double sigma_2 = 0.273;
     double phi_2   = 0.0;
     double theta_2 = 0.0;
 

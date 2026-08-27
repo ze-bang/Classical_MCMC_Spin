@@ -143,6 +143,7 @@ PhononLattice make_lattice(size_t L) {
     SpinPhononCouplingParams sp;
     sp.J = -0.10;  sp.K = -9.00;  sp.Gamma = 1.80;  sp.Gammap = 0.30;
     sp.J2_A = 0.30; sp.J2_B = 0.30; sp.J3 = 0.90; sp.J7 = 0.00;
+    sp.lambda_E1_J7_0 = 0.0;   // tests 2-5, 8 probe the bilinear channels only (no ring coupling)
     sp.lambda_E1_J_0      = 0.13;   sp.lambda_E1_J_2      = -0.21;
     sp.lambda_E1_K_0      = -0.42;  sp.lambda_E1_K_2      = 0.55;
     sp.lambda_E1_Gamma_0  = 0.07;   sp.lambda_E1_Gamma_2  = -0.18;

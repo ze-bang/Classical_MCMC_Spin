@@ -120,7 +120,7 @@ int main(int argc, char** argv) {
             phonon_lattice.set_time_dependent_spin_phonon(td_sp_params);
             
             // Set Gilbert damping if specified
-            phonon_lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.0);
+            phonon_lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.05);
             
             // Set magnetic field
             Eigen::Vector3d B;
