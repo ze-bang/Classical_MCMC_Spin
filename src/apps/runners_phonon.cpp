@@ -294,8 +294,9 @@ void run_molecular_dynamics_phonon(PhononLattice& lattice, const SpinConfig& con
             }
         }
         
-        // Save initial spin configuration before time evolution
+        // Save initial spin configuration and site positions before time evolution
         lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+        lattice.save_positions(trial_dir + "/positions.txt");
 
         // Decide between deterministic MD and Langevin based on T.
         const double langevin_T_md = config.get_param("langevin_temperature", 0.0);
