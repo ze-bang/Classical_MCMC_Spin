@@ -65,38 +65,48 @@ std::pair<double, double> e1_bond_form_factor(int bond_type) {
     }
 }
 
-/// δX_γ(ε) for one (lambda0, lambda2) channel on bond γ.
-double e1_delta(double lambda0, double lambda2, double qx, double qy,
+/// δX_γ(ε) for one (lambda0, lambda1, lambda2) channel on bond γ:
+///   δX_γ = scale · [ λ0 |ε|²
+///                  + λ2 ((ε_x²-ε_y²) cos2θ_γ + 2 ε_x ε_y sin2θ_γ)      (E, quadratic)
+///                  + λ1 (ε_x cos2θ_γ − ε_y sin2θ_γ) ]                    (E, LINEAR)
+/// The linear term is the unique D3 invariant Re[ε₊ N₊] of a polar in-plane
+/// vector with the bond-nematic doublet (weight 1 + 2 = 3 ≡ 0 mod 3); it is
+/// allowed by the single-layer symmetry of Na2Co2TeO6 (site symmetry 32) and
+/// only forbidden by the layer-exchanging C6 of the bilayer.  Default λ1 = 0
+/// reproduces the previous purely quadratic model.  Note the relative MINUS
+/// sign: ε_x cos2θ + ε_y sin2θ is not C3-invariant.
+double e1_delta(double lambda0, double lambda1, double lambda2, double qx, double qy,
                 int bond_type, double scale = 1.0) {
     const auto [c2, s2] = e1_bond_form_factor(bond_type);
     const double q0 = qx * qx + qy * qy;
     const double qc = qx * qx - qy * qy;
     const double qs = 2.0 * qx * qy;
-    return scale * (lambda0 * q0 + lambda2 * (qc * c2 + qs * s2));
+    return scale * (lambda0 * q0 + lambda2 * (qc * c2 + qs * s2)
+                    + lambda1 * (qx * c2 - qy * s2));
 }
 
 /// ∂δX_γ/∂ε_x.
-double e1_delta_dqx(double lambda0, double lambda2, double qx, double qy,
+double e1_delta_dqx(double lambda0, double lambda1, double lambda2, double qx, double qy,
                     int bond_type, double scale = 1.0) {
     const auto [c2, s2] = e1_bond_form_factor(bond_type);
-    return scale * (2.0 * lambda0 * qx + 2.0 * lambda2 * (qx * c2 + qy * s2));
+    return scale * (2.0 * lambda0 * qx + 2.0 * lambda2 * (qx * c2 + qy * s2) + lambda1 * c2);
 }
 
 /// ∂δX_γ/∂ε_y.
-double e1_delta_dqy(double lambda0, double lambda2, double qx, double qy,
+double e1_delta_dqy(double lambda0, double lambda1, double lambda2, double qx, double qy,
                     int bond_type, double scale = 1.0) {
     const auto [c2, s2] = e1_bond_form_factor(bond_type);
-    return scale * (2.0 * lambda0 * qy + 2.0 * lambda2 * (-qy * c2 + qx * s2));
+    return scale * (2.0 * lambda0 * qy + 2.0 * lambda2 * (-qy * c2 + qx * s2) - lambda1 * s2);
 }
 
 E1ExchangeCoefficients e1_exchange_coefficients(const SpinPhononCouplingParams& params,
                                                 double qx, double qy,
                                                 int bond_type, double scale = 1.0) {
     return {
-        e1_delta(params.lambda_E1_J_0,      params.lambda_E1_J_2,      qx, qy, bond_type, scale),
-        e1_delta(params.lambda_E1_K_0,      params.lambda_E1_K_2,      qx, qy, bond_type, scale),
-        e1_delta(params.lambda_E1_Gamma_0,  params.lambda_E1_Gamma_2,  qx, qy, bond_type, scale),
-        e1_delta(params.lambda_E1_Gammap_0, params.lambda_E1_Gammap_2, qx, qy, bond_type, scale),
+        e1_delta(params.lambda_E1_J_0,      params.lambda_E1_J_1,      params.lambda_E1_J_2,      qx, qy, bond_type, scale),
+        e1_delta(params.lambda_E1_K_0,      params.lambda_E1_K_1,      params.lambda_E1_K_2,      qx, qy, bond_type, scale),
+        e1_delta(params.lambda_E1_Gamma_0,  params.lambda_E1_Gamma_1,  params.lambda_E1_Gamma_2,  qx, qy, bond_type, scale),
+        e1_delta(params.lambda_E1_Gammap_0, params.lambda_E1_Gammap_1, params.lambda_E1_Gammap_2, qx, qy, bond_type, scale),
     };
 }
 
@@ -104,10 +114,10 @@ E1ExchangeCoefficients e1_exchange_dqx(const SpinPhononCouplingParams& params,
                                        double qx, double qy,
                                        int bond_type, double scale = 1.0) {
     return {
-        e1_delta_dqx(params.lambda_E1_J_0,      params.lambda_E1_J_2,      qx, qy, bond_type, scale),
-        e1_delta_dqx(params.lambda_E1_K_0,      params.lambda_E1_K_2,      qx, qy, bond_type, scale),
-        e1_delta_dqx(params.lambda_E1_Gamma_0,  params.lambda_E1_Gamma_2,  qx, qy, bond_type, scale),
-        e1_delta_dqx(params.lambda_E1_Gammap_0, params.lambda_E1_Gammap_2, qx, qy, bond_type, scale),
+        e1_delta_dqx(params.lambda_E1_J_0,      params.lambda_E1_J_1,      params.lambda_E1_J_2,      qx, qy, bond_type, scale),
+        e1_delta_dqx(params.lambda_E1_K_0,      params.lambda_E1_K_1,      params.lambda_E1_K_2,      qx, qy, bond_type, scale),
+        e1_delta_dqx(params.lambda_E1_Gamma_0,  params.lambda_E1_Gamma_1,  params.lambda_E1_Gamma_2,  qx, qy, bond_type, scale),
+        e1_delta_dqx(params.lambda_E1_Gammap_0, params.lambda_E1_Gammap_1, params.lambda_E1_Gammap_2, qx, qy, bond_type, scale),
     };
 }
 
@@ -115,10 +125,10 @@ E1ExchangeCoefficients e1_exchange_dqy(const SpinPhononCouplingParams& params,
                                        double qx, double qy,
                                        int bond_type, double scale = 1.0) {
     return {
-        e1_delta_dqy(params.lambda_E1_J_0,      params.lambda_E1_J_2,      qx, qy, bond_type, scale),
-        e1_delta_dqy(params.lambda_E1_K_0,      params.lambda_E1_K_2,      qx, qy, bond_type, scale),
-        e1_delta_dqy(params.lambda_E1_Gamma_0,  params.lambda_E1_Gamma_2,  qx, qy, bond_type, scale),
-        e1_delta_dqy(params.lambda_E1_Gammap_0, params.lambda_E1_Gammap_2, qx, qy, bond_type, scale),
+        e1_delta_dqy(params.lambda_E1_J_0,      params.lambda_E1_J_1,      params.lambda_E1_J_2,      qx, qy, bond_type, scale),
+        e1_delta_dqy(params.lambda_E1_K_0,      params.lambda_E1_K_1,      params.lambda_E1_K_2,      qx, qy, bond_type, scale),
+        e1_delta_dqy(params.lambda_E1_Gamma_0,  params.lambda_E1_Gamma_1,  params.lambda_E1_Gamma_2,  qx, qy, bond_type, scale),
+        e1_delta_dqy(params.lambda_E1_Gammap_0, params.lambda_E1_Gammap_1, params.lambda_E1_Gammap_2, qx, qy, bond_type, scale),
     };
 }
 
@@ -381,11 +391,47 @@ void PhononLattice::set_parameters(const SpinPhononCouplingParams& sp_params,
          << ", " << sp_params.lambda_E1_Gammap_2 << ")" << endl;
     cout << "    E1 λ(J7,0)=" << sp_params.lambda_E1_J7_0
          << " so J7_eff=J7+λ(J7,0)|ε|²" << endl;
+    cout << "    E1 λ1(J,K,Γ,Γ') [D3-allowed LINEAR striction ε_x cos2θ − ε_y sin2θ]=("
+         << sp_params.lambda_E1_J_1 << ", " << sp_params.lambda_E1_K_1 << ", "
+         << sp_params.lambda_E1_Gamma_1 << ", " << sp_params.lambda_E1_Gammap_1 << ")" << endl;
+    cout << "    polarization/bond angles are measured from the x-bond LINE "
+            "(geometric x-bond is at 30° from the a1 lattice vector)" << endl;
     cout << "  E1 mode: ω_E1=" << ph_params.omega_E1 << ", γ_E1=" << ph_params.gamma_E1
          << ", λ_E1(quartic)=" << ph_params.lambda_E1_quartic
-         << ", Z*=" << ph_params.Z_star << endl;
+         << ", Z*=" << ph_params.Z_star
+         << ", back-action per site=" << (ph_params.per_site_backaction ? "yes" : "NO (legacy, size-dependent)")
+         << endl;
     cout << "  Drive: E0_1=" << dr_params.E0_1 << ", ω_1=" << dr_params.omega_1
          << ", E0_2=" << dr_params.E0_2 << ", ω_2=" << dr_params.omega_2 << endl;
+
+    // Rigorous a-priori stability bound on the E1 mode.  For unit spins every
+    // bond operator obeys |O^J|,|O^K| ≤ S², |O^Γ| ≤ S², |O^Γ'| ≤ 2S² and the
+    // hexagon ring operator |R_hex| ≤ 15 (sum of |coefficients|), so
+    //   |∂²H_sp-ph/∂ε²| / N ≤ 2·(3/2)·Σ_X (|λ_X0|+|λ_X2|)·O_X^max + 2·|λ_J7,0|·15/2.
+    // The renormalised frequency ω_eff² = ω² + (1/N)∂²H_sp-ph/∂ε² is therefore
+    // positive for EVERY spin configuration whenever ω² exceeds this bound.
+    // In the legacy (extensive) convention the bound is multiplied by N.
+    {
+        const double S2 = double(spin_length) * double(spin_length);
+        auto absl = [](double a, double b) { return std::abs(a) + std::abs(b); };
+        const double bil = 3.0 * (absl(sp_params.lambda_E1_J_0, sp_params.lambda_E1_J_2) * S2
+                                 + absl(sp_params.lambda_E1_K_0, sp_params.lambda_E1_K_2) * S2
+                                 + absl(sp_params.lambda_E1_Gamma_0, sp_params.lambda_E1_Gamma_2) * S2
+                                 + absl(sp_params.lambda_E1_Gammap_0, sp_params.lambda_E1_Gammap_2) * 2.0 * S2);
+        const double ring = 15.0 * std::abs(sp_params.lambda_E1_J7_0) * S2 * S2 * S2;
+        const double bound = (bil + ring) * (ph_params.per_site_backaction ? 1.0 : double(lattice_size));
+        const double w2 = ph_params.omega_E1 * ph_params.omega_E1;
+        cout << "  E1 stability: ω_E1² = " << w2 << ", worst-case |δω²| from spin back-action ≤ "
+             << bound << " (bilinear " << bil << " + ring " << ring << ")";
+        if (bound >= w2) {
+            cout << "\n  WARNING: ω_E1² does not exceed the back-action bound; the E1 mode can go soft"
+                    " (ω_eff² ≤ 0) for some spin configurations — the coupled dynamics is not"
+                    " guaranteed stable." << endl;
+        } else {
+            cout << " → ω_eff/ω_E1 ∈ [" << std::sqrt(1.0 - bound / w2) << ", "
+                 << std::sqrt(1.0 + bound / w2) << "], stable for all configurations." << endl;
+        }
+    }
 }
 
 // ============================================================
@@ -560,11 +606,16 @@ double PhononLattice::ring_exchange_normalized() const {
 double PhononLattice::phonon_energy() const {
     // E1 mode (zone-center, single 2-component coordinate):
     //   E_ph = (1/2)(V_x²+V_y²) + (1/2) ω_E1² (Q_x²+Q_y²) + (λ_E1_quartic/4)(Q_x²+Q_y²)²
+    // Multiplied by phonon_norm(): the zone-centre mode is one coordinate per
+    // unit cell, so its inertia and restoring force are EXTENSIVE (∝ N) while
+    // ε itself is intensive.  Without this factor the energy per site of the
+    // phonon sector would vanish as 1/N and the back-action in the equation of
+    // motion would grow as N (see ode_system).
     const double T = phonons.kinetic_energy();
     const double Q_sq = phonons.Q_x_E1 * phonons.Q_x_E1 + phonons.Q_y_E1 * phonons.Q_y_E1;
     const double V_harm = 0.5 * phonon_params.omega_E1 * phonon_params.omega_E1 * Q_sq;
     const double V_quartic = 0.25 * phonon_params.lambda_E1_quartic * Q_sq * Q_sq;
-    return T + V_harm + V_quartic;
+    return phonon_norm() * (T + V_harm + V_quartic);
 }
 
 double PhononLattice::spin_phonon_energy() const {
@@ -1119,9 +1170,19 @@ void PhononLattice::ode_system(const ODEState& x, ODEState& dxdt, double t) {
         dHsp_dQy += dJ7_dQy_E1(qx, qy) * R7;
     }
 
-    // Phonon equations
+    // Phonon equations.  The magnetoelastic force accumulated above is a sum
+    // over ALL bonds and hexagons (extensive, ∝ N).  The zone-centre mode has
+    // an extensive inertia N·(½ε̇²) and restoring force N·(½ω²ε²) (see
+    // phonon_energy), so the Euler–Lagrange equation for the intensive
+    // coordinate ε carries the force per site:
+    //   ε̈ = −ω²ε − λ4|ε|²ε − γε̇ + Z*E(t) − (1/N) ∂H_sp-ph/∂ε.
+    // This makes ε(t), the phonon frequency renormalisation and the switching
+    // thresholds independent of lattice size.  The legacy behaviour (force
+    // not normalised, ω_eff² = ω² − O(λN), soft mode at N ~ ω²/λ) is kept
+    // behind PhononParams::per_site_backaction = false for reproducibility.
+    const double inv_norm = 1.0 / phonon_norm();
     PhononState dph_dt;
-    phonon_derivatives(ph, t, dHsp_dQx, dHsp_dQy, dph_dt);
+    phonon_derivatives(ph, t, dHsp_dQx * inv_norm, dHsp_dQy * inv_norm, dph_dt);
     dph_dt.to_array(&dxdt[spin_offset]);
 }
 
@@ -2138,8 +2199,11 @@ bool PhononLattice::relax_phonons(double tol, size_t max_iter, double damping) {
             Dx += dJ7_dQx_E1(qx, qy) * R7;
             Dy += dJ7_dQy_E1(qx, qy) * R7;
         }
-        dHdqx = Dx;
-        dHdqy = Dy;
+        // Same per-site normalisation as the equation of motion (ode_system):
+        // the equilibrium condition is ∂/∂ε [N(½ω²|ε|²+¼λ4|ε|⁴) + H_sp-ph] = 0.
+        const double inv_norm = 1.0 / phonon_norm();
+        dHdqx = Dx * inv_norm;
+        dHdqy = Dy * inv_norm;
     };
 
     // Initial guess: linear approximation about ε = 0.

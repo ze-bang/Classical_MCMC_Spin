@@ -64,6 +64,12 @@ void build_phonon_params(const SpinConfig& config,
     sp_params.lambda_E1_Gamma_2  = config.get_param("lambda_E1_Gamma_2",  config.get_param("lambda_Gamma_2",  0.0));
     sp_params.lambda_E1_Gammap_0 = config.get_param("lambda_E1_Gammap_0", config.get_param("lambda_Gammap_0", 0.0));
     sp_params.lambda_E1_Gammap_2 = config.get_param("lambda_E1_Gammap_2", config.get_param("lambda_Gammap_2", 0.0));
+    // D3-allowed linear E-channel striction δX_γ = λ_{X,1}[ε_x cos2θ_γ − ε_y sin2θ_γ]
+    // (off by default; see SpinPhononCouplingParams).
+    sp_params.lambda_E1_J_1      = config.get_param("lambda_E1_J_1",      0.0);
+    sp_params.lambda_E1_K_1      = config.get_param("lambda_E1_K_1",      0.0);
+    sp_params.lambda_E1_Gamma_1  = config.get_param("lambda_E1_Gamma_1",  0.0);
+    sp_params.lambda_E1_Gammap_1 = config.get_param("lambda_E1_Gammap_1", 0.0);
 
     // Time-dependent E1 magnetoelastic scaling (single multiplicative
     // factor on all 8 quadratic coefficients).
@@ -80,6 +86,9 @@ void build_phonon_params(const SpinConfig& config,
     ph_params.gamma_E1          = config.get_param("gamma_E1",          config.get_param("gamma_E", 0.1));
     ph_params.lambda_E1_quartic = config.get_param("lambda_E1_quartic", config.get_param("lambda_E", 0.0));
     ph_params.Z_star            = config.get_param("Z_star", 1.0);
+    // phonon_per_site = 1 (default): magnetoelastic force per site in the E1
+    // equation of motion (size-independent dynamics). 0 = legacy extensive force.
+    ph_params.per_site_backaction = config.get_param("phonon_per_site", 1.0) > 0.5;
 
     // Drive parameters (pulse 1 - pump) - couples linearly to ε via -Z*·E·ε
     dr_params.E0_1    = config.pump_amplitude;

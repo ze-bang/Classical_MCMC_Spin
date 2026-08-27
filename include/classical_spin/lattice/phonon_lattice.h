@@ -156,6 +156,12 @@ struct PhononParams {
     double gamma_E1 = 0.1;          ///< E1 mode damping γ_E1
     double lambda_E1_quartic = 0.0; ///< Optional quartic self-coupling λ (ε²)²/4
     double Z_star = 1.0;            ///< Effective charge for E(t) coupling
+    /// Normalise the magnetoelastic force in the phonon equation of motion per
+    /// site (true, physical: zone-centre mode has extensive inertia N, so
+    /// ε̈ = ... − (1/N)∂H_sp-ph/∂ε and E_phonon = N(½ε̇²+½ω²ε²)).  false
+    /// reproduces the legacy extensive back-action, whose effective phonon
+    /// frequency depends on lattice size and goes soft at N ~ ω²/λ.
+    bool per_site_backaction = true;
 };
 
 /**
@@ -173,9 +179,17 @@ struct PhononParams {
  * with bond-axis angles θ_x = 0, θ_y = 2π/3, θ_z = 4π/3 (i.e.
  * cos(2θ_γ) = (1, -1/2, -1/2) and sin(2θ_γ) = (0, -√3/2, +√3/2)).
  *
- * Linear-in-ε exchange-striction terms are FORBIDDEN by the full C6 symmetry
- * of the ideal honeycomb layer, so the leading symmetry-allowed coupling is
- * quadratic in ε (see docs/tmfeo3_notes.tex).
+ * Symmetry (audit 2026-08, ncto_phonon/audit): a single SOC honeycomb layer
+ * of Na2Co2TeO6 has point symmetry D3 (C3 ⊥ plane, three C2 axes along the
+ * bonds); C2 about the plane normal is the 6_3/2_1 screw that exchanges the
+ * two layers and is NOT a symmetry of one layer's J–K–Γ–Γ' Hamiltonian.
+ * Under D3 the polar coordinate ε (E) couples to the bond channels
+ * (A1 ⊕ E per channel) as
+ *   quadratic:  λ_{X,0}|ε|²  and  λ_{X,2}[(ε_x²−ε_y²)cos2θ + 2ε_xε_y sin2θ]
+ *   LINEAR   :  λ_{X,1}[ε_x cos2θ_γ − ε_y sin2θ_γ]   (see below; off by default)
+ * and to the ring operator (A1) only through |ε|².  The "no linear term"
+ * statement holds for the layer-summed q=0 response under the bilayer D6,
+ * not for the single-layer model integrated here.
  */
 struct SpinPhononCouplingParams {
     // Kitaev-Heisenberg-Γ-Γ' parameters (Songvilay defaults)
@@ -209,6 +223,18 @@ struct SpinPhononCouplingParams {
     double lambda_E1_Gamma_2  = 0.0;
     double lambda_E1_Gammap_0 = 0.0;
     double lambda_E1_Gammap_2 = 0.0;
+    // LINEAR E-channel striction, allowed by the D3 symmetry of one SOC
+    // honeycomb layer (P6_322 Co site symmetry 32, twofold axes along bonds):
+    //   δX_γ^{(1)}(ε) = λ_{X,1} [ε_x cos2θ_γ − ε_y sin2θ_γ] = λ_{X,1}|ε| cos(θ_pol + 2θ_γ).
+    // It is the unique D3 invariant Re[ε₊N₊] (rotational weight 1+2 = 3);
+    // it is odd in ε, so it averages out over a drive cycle and does not
+    // rectify, but it is first order in the phonon amplitude.  Forbidden only
+    // by the layer-exchanging C6 of the bilayer (which acts on the layer-summed
+    // response).  Default 0 = the purely quadratic model of the manuscript.
+    double lambda_E1_J_1      = 0.0;
+    double lambda_E1_K_1      = 0.0;
+    double lambda_E1_Gamma_1  = 0.0;
+    double lambda_E1_Gammap_1 = 0.0;
 
     /// Kitaev local-to-global rotation matrix R.
     static SpinMatrix get_kitaev_rotation() {
@@ -895,6 +921,12 @@ public:
      */
     double total_energy() const {
         return spin_energy() + phonon_energy() + spin_phonon_energy();
+    }
+
+    /// Extensivity factor of the zone-centre phonon sector: N_sites when the
+    /// back-action is normalised per site (physical), 1 in the legacy mode.
+    double phonon_norm() const {
+        return phonon_params.per_site_backaction ? double(lattice_size) : 1.0;
     }
     
     /**

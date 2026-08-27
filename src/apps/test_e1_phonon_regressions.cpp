@@ -57,6 +57,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <string>
 
 namespace {
@@ -85,12 +86,13 @@ std::pair<double, double> n_gamma(int bond_type) {
 }
 
 double delta_X_reference(double lambda0, double lambda2,
-                         double qx, double qy, int bond_type) {
+                         double qx, double qy, int bond_type, double lambda1 = 0.0) {
     const auto [c2, s2] = n_gamma(bond_type);
     const double q0 = qx * qx + qy * qy;
     const double qc = qx * qx - qy * qy;
     const double qs = 2.0 * qx * qy;
-    return lambda0 * q0 + lambda2 * (qc * c2 + qs * s2);
+    // λ1 term: the D3 invariant Re[ε₊N₊] = ε_x cos2θ − ε_y sin2θ (note the sign).
+    return lambda0 * q0 + lambda2 * (qc * c2 + qs * s2) + lambda1 * (qx * c2 - qy * s2);
 }
 
 // Per-bond magnetoelastic energy in the LOCAL Kitaev frame (notes' Eq. for
@@ -100,10 +102,10 @@ double bond_energy_reference_local(
     const Eigen::Vector3d& Si_local, const Eigen::Vector3d& Sj_local,
     const SpinPhononCouplingParams& p, double qx, double qy, int bond_type)
 {
-    const double dJ  = delta_X_reference(p.lambda_E1_J_0,      p.lambda_E1_J_2,      qx, qy, bond_type);
-    const double dK  = delta_X_reference(p.lambda_E1_K_0,      p.lambda_E1_K_2,      qx, qy, bond_type);
-    const double dG  = delta_X_reference(p.lambda_E1_Gamma_0,  p.lambda_E1_Gamma_2,  qx, qy, bond_type);
-    const double dGp = delta_X_reference(p.lambda_E1_Gammap_0, p.lambda_E1_Gammap_2, qx, qy, bond_type);
+    const double dJ  = delta_X_reference(p.lambda_E1_J_0,      p.lambda_E1_J_2,      qx, qy, bond_type, p.lambda_E1_J_1);
+    const double dK  = delta_X_reference(p.lambda_E1_K_0,      p.lambda_E1_K_2,      qx, qy, bond_type, p.lambda_E1_K_1);
+    const double dG  = delta_X_reference(p.lambda_E1_Gamma_0,  p.lambda_E1_Gamma_2,  qx, qy, bond_type, p.lambda_E1_Gamma_1);
+    const double dGp = delta_X_reference(p.lambda_E1_Gammap_0, p.lambda_E1_Gammap_2, qx, qy, bond_type, p.lambda_E1_Gammap_1);
 
     const int gamma = bond_type;
     const int alpha = (gamma == 0) ? 1 : 0;
@@ -482,6 +484,332 @@ bool test_isotropic_only_invariant_part(std::ostream& out) {
     return true;
 }
 
+// -------------------------------------------------------------------------
+//  Audit additions (2026-08): full Hamiltonian (J2/J3/J7/λ_J7/λ1) and the
+//  coupled equations of motion.
+// -------------------------------------------------------------------------
+
+/// Lattice with every channel switched on: J2_A≠J2_B, J3, J7, λ_J7, λ1, λ0, λ2.
+PhononLattice make_lattice_full(size_t L, bool with_linear = true, bool per_site = true) {
+    SpinConfig config;
+    config.set_param("J",      0.68);
+    config.set_param("K",     -7.89);
+    config.set_param("Gamma",  3.07);
+    config.set_param("Gammap",-2.94);
+    config.set_param("J2_A",  -0.06);
+    config.set_param("J2_B",  -0.70);
+    config.set_param("J3",     0.52);
+    config.field_strength = 0.0;
+
+    UnitCell uc = build_phonon_honeycomb(config);
+    PhononLattice lattice(uc, L, L, 1, 1.0f);
+
+    SpinPhononCouplingParams sp;
+    sp.J = 0.68; sp.K = -7.89; sp.Gamma = 3.07; sp.Gammap = -2.94;
+    sp.J2_A = -0.06; sp.J2_B = -0.70; sp.J3 = 0.52;
+    sp.J7 = -0.40;  sp.lambda_E1_J7_0 = 1.0e-3;
+    sp.lambda_E1_J_0 = 0.004;  sp.lambda_E1_J_2 = -0.0017;
+    sp.lambda_E1_K_0 = -0.006; sp.lambda_E1_K_2 = 0.02;
+    sp.lambda_E1_Gamma_0 = 0.003;  sp.lambda_E1_Gamma_2 = -0.0078;
+    sp.lambda_E1_Gammap_0 = -0.002; sp.lambda_E1_Gammap_2 = 0.0075;
+    if (with_linear) {
+        sp.lambda_E1_J_1 = 0.011; sp.lambda_E1_K_1 = -0.05;
+        sp.lambda_E1_Gamma_1 = 0.02; sp.lambda_E1_Gammap_1 = -0.017;
+    }
+    PhononParams ph;
+    ph.omega_E1 = 4.0; ph.gamma_E1 = 0.0; ph.lambda_E1_quartic = 0.3; ph.Z_star = 1.0;
+    ph.per_site_backaction = per_site;
+    DriveParams dr;
+    lattice.set_parameters(sp, ph, dr);
+    return lattice;
+}
+
+size_t site_index(const PhononLattice& L, size_t i, size_t j, size_t atom) {
+    // Constructor ordering: for i, for j, for k, for atom.
+    return ((i * L.dim2 + j) * L.dim3 + 0) * L.N_atoms + atom;
+}
+
+/// σ_A(i,j) = (−1)^j, σ_B(i,j) = (−1)^{j+1}: FM along x/y bonds, AFM on z bonds.
+void set_zigzag(PhononLattice& L, const Eigen::Vector3d& axis) {
+    const Eigen::Vector3d n = axis.normalized() * L.spin_length;
+    for (size_t i = 0; i < L.dim1; ++i)
+        for (size_t j = 0; j < L.dim2; ++j) {
+            const double s = (j % 2 == 0) ? 1.0 : -1.0;
+            L.spins[site_index(L, i, j, 0)] =  s * n;
+            L.spins[site_index(L, i, j, 1)] = -s * n;
+        }
+}
+
+bool test_bond_coordination_and_hexagons(std::ostream& out) {
+    out << "[9] Bond-list coordination (NN=3, J2=6, J3=3) and hexagon bookkeeping\n";
+    PhononLattice L = make_lattice_full(6);
+    const size_t N = L.lattice_size;
+    for (size_t i = 0; i < N; ++i) {
+        if (L.nn_partners[i].size() != 3 || L.j2_partners[i].size() != 6 || L.j3_partners[i].size() != 3) {
+            out << "[FAIL] site " << i << " has NN=" << L.nn_partners[i].size()
+                << " J2=" << L.j2_partners[i].size() << " J3=" << L.j3_partners[i].size() << "\n";
+            return false;
+        }
+        // reciprocity: every partner lists us back
+        for (size_t j : L.j3_partners[i]) {
+            if (std::find(L.j3_partners[j].begin(), L.j3_partners[j].end(), i) == L.j3_partners[j].end()) {
+                out << "[FAIL] J3 bond " << i << "->" << j << " not reciprocal\n"; return false;
+            }
+        }
+        for (size_t j : L.j2_partners[i]) {
+            if (std::find(L.j2_partners[j].begin(), L.j2_partners[j].end(), i) == L.j2_partners[j].end()) {
+                out << "[FAIL] J2 bond " << i << "->" << j << " not reciprocal\n"; return false;
+            }
+        }
+        if (L.site_hexagons[i].size() != 3) {
+            out << "[FAIL] site " << i << " belongs to " << L.site_hexagons[i].size() << " hexagons (expected 3)\n";
+            return false;
+        }
+    }
+    if (L.hexagons.size() != N / 2) {
+        out << "[FAIL] " << L.hexagons.size() << " hexagons for N=" << N << " (expected N/2)\n"; return false;
+    }
+    // every consecutive pair around a hexagon must be an NN bond, and the six sites distinct
+    for (const auto& hex : L.hexagons) {
+        std::set<size_t> distinct(hex.begin(), hex.end());
+        if (distinct.size() != 6) { out << "[FAIL] hexagon with repeated site\n"; return false; }
+        for (int p = 0; p < 6; ++p) {
+            const size_t a = hex[p], b = hex[(p + 1) % 6];
+            if (std::find(L.nn_partners[a].begin(), L.nn_partners[a].end(), b) == L.nn_partners[a].end()) {
+                out << "[FAIL] hexagon edge " << a << "-" << b << " is not an NN bond\n"; return false;
+            }
+        }
+    }
+    out << "    N=" << N << ": uniform coordination, " << L.hexagons.size()
+        << " hexagons, 3 per site, all edges NN bonds\n";
+    out << "[PASS] coordination and hexagons\n\n";
+    return true;
+}
+
+bool test_ring_collinear_identities(std::ostream& out) {
+    out << "[10] Ring operator on collinear states: R_hex = Π σ  (FM: +N/2, zigzag: −N/2)\n";
+    PhononLattice L = make_lattice_full(6);
+    const double Nh = double(L.lattice_size) / 2.0;
+    for (size_t i = 0; i < L.lattice_size; ++i) L.spins[i] = Eigen::Vector3d(0.3, -0.5, 0.8).normalized();
+    const double R_fm = L.ring_exchange_normalized();
+    set_zigzag(L, Eigen::Vector3d(0.1, 0.9, -0.4));
+    const double R_zz = L.ring_exchange_normalized();
+    out << "    FM: R7/N_hex = " << R_fm / Nh << "   zigzag: R7/N_hex = " << R_zz / Nh << "\n";
+    if (!nearly_equal(R_fm, Nh, 1e-9) || !nearly_equal(R_zz, -Nh, 1e-9)) {
+        out << "[FAIL] collinear ring identity violated\n"; return false;
+    }
+    // ring energy with J7_eff = J7 + λ|ε|²
+    L.phonons.Q_x_E1 = 1.3; L.phonons.Q_y_E1 = -0.7;
+    const double J7eff = L.spin_phonon_params.J7 + L.spin_phonon_params.lambda_E1_J7_0 * (1.3 * 1.3 + 0.49);
+    if (!nearly_equal(L.ring_exchange_energy(), J7eff * R_zz, 1e-9, 1e-12)) {
+        out << "[FAIL] ring_exchange_energy != J7_eff * R7\n"; return false;
+    }
+    out << "[PASS] ring identities\n\n";
+    return true;
+}
+
+bool test_full_hamiltonian_forces(std::ostream& out) {
+    out << "[11] Full-Hamiltonian force consistency (J2/J3/J7/λ_J7/λ1/λ0/λ2 all on)\n";
+    PhononLattice L = make_lattice_full(4);
+    deterministic_spins(L, 0.59);
+    L.phonons.Q_x_E1 = 0.9; L.phonons.Q_y_E1 = -1.4;
+
+    // (a) phonon force: raw ∂(H_sp-ph + H_7)/∂ε vs finite difference
+    auto Hph = [&](double qx, double qy) {
+        L.phonons.Q_x_E1 = qx; L.phonons.Q_y_E1 = qy;
+        return L.spin_phonon_energy() + L.ring_exchange_energy();
+    };
+    const double qx0 = 0.9, qy0 = -1.4;
+    const double an_x = L.dH_dQx_E1(), an_y = L.dH_dQy_E1();
+    const double fd_x = (Hph(qx0 + kFDStep, qy0) - Hph(qx0 - kFDStep, qy0)) / (2 * kFDStep);
+    const double fd_y = (Hph(qx0, qy0 + kFDStep) - Hph(qx0, qy0 - kFDStep)) / (2 * kFDStep);
+    Hph(qx0, qy0);
+    out << "    ∂H/∂ε_x analytic=" << an_x << " FD=" << fd_x << "   ∂H/∂ε_y analytic=" << an_y << " FD=" << fd_y << "\n";
+    if (!nearly_equal(an_x, fd_x, 1e-6, 1e-7) || !nearly_equal(an_y, fd_y, 1e-6, 1e-7)) {
+        out << "[FAIL] phonon force with ring/linear channels\n"; return false;
+    }
+    // linear channel must give a NON-zero force at ε = 0 (it is first order)
+    L.phonons.Q_x_E1 = 0.0; L.phonons.Q_y_E1 = 0.0;
+    out << "    with λ1 ≠ 0: ∂H/∂ε|_{ε=0} = (" << L.dH_dQx_E1() << ", " << L.dH_dQy_E1() << ")  (nonzero expected)\n";
+    if (std::abs(L.dH_dQx_E1()) + std::abs(L.dH_dQy_E1()) < 1e-8) {
+        out << "[FAIL] linear channel produces no force\n"; return false;
+    }
+    L.phonons.Q_x_E1 = qx0; L.phonons.Q_y_E1 = qy0;
+
+    // (b) spin field: H_eff = −∂E_total/∂S (includes ring field with J7_eff and λ1 modulation)
+    double max_err = 0.0;
+    for (size_t site : {0u, 5u, 9u, 17u, 30u}) {
+        const Eigen::Vector3d H_an = L.get_local_field(site);
+        const Eigen::Vector3d S0 = L.spins[site];
+        Eigen::Vector3d H_fd;
+        for (int a = 0; a < 3; ++a) {
+            Eigen::Vector3d dlt = Eigen::Vector3d::Zero(); dlt(a) = kFDStep;
+            L.spins[site] = S0 + dlt; const double Ep = L.total_energy();
+            L.spins[site] = S0 - dlt; const double Em = L.total_energy();
+            L.spins[site] = S0;
+            H_fd(a) = -(Ep - Em) / (2 * kFDStep);
+        }
+        max_err = std::max(max_err, (H_an - H_fd).cwiseAbs().maxCoeff());
+    }
+    out << "    spin field max |analytic − FD| = " << max_err << "\n";
+    if (max_err > 1e-6) { out << "[FAIL] spin field with ring/linear channels\n"; return false; }
+
+    // (c) Metropolis increment: site_energy_diff == ΔE_total for a single-spin change
+    const size_t s = 7;
+    const Eigen::Vector3d old_spin = L.spins[s];
+    const Eigen::Vector3d new_spin = Eigen::Vector3d(-0.2, 0.7, 0.4).normalized() * L.spin_length;
+    const double E0 = L.total_energy();
+    const double dE_local = L.site_energy_diff(new_spin, old_spin, s);
+    L.spins[s] = new_spin; const double E1 = L.total_energy(); L.spins[s] = old_spin;
+    out << "    site_energy_diff=" << dE_local << "  ΔE_total=" << (E1 - E0) << "\n";
+    if (!nearly_equal(dE_local, E1 - E0, 1e-9, 1e-10)) { out << "[FAIL] MC increment inconsistent\n"; return false; }
+
+    // (d) ode_system phonon acceleration uses the PER-SITE force
+    PhononLattice::ODEState x = L.spins_to_state(), dxdt(x.size());
+    L.ode_system(x, dxdt, 0.0);
+    const size_t off = 3 * L.lattice_size;
+    const double w2 = L.phonon_params.omega_E1 * L.phonon_params.omega_E1;
+    const double Q2 = qx0 * qx0 + qy0 * qy0, l4 = L.phonon_params.lambda_E1_quartic;
+    const double N = double(L.lattice_size);
+    const double ax_expect = -w2 * qx0 - l4 * Q2 * qx0 - L.dH_dQx_E1() / N;
+    const double ay_expect = -w2 * qy0 - l4 * Q2 * qy0 - L.dH_dQy_E1() / N;
+    out << "    ε̈_x: ode=" << dxdt[off + 2] << " expected=" << ax_expect
+        << "   ε̈_y: ode=" << dxdt[off + 3] << " expected=" << ay_expect << "\n";
+    if (!nearly_equal(dxdt[off + 2], ax_expect, 1e-9, 1e-10) || !nearly_equal(dxdt[off + 3], ay_expect, 1e-9, 1e-10)) {
+        out << "[FAIL] phonon EOM is not the per-site Euler–Lagrange equation\n"; return false;
+    }
+    out << "[PASS] full-Hamiltonian forces, MC increment and EOM plumbing\n\n";
+    return true;
+}
+
+/// Plain RK4 on the public ode_system, no renormalisation (we monitor |S| drift).
+void rk4_integrate(PhononLattice& L, PhononLattice::ODEState& x, double dt, size_t steps) {
+    const size_t n = x.size();
+    PhononLattice::ODEState k1(n), k2(n), k3(n), k4(n), tmp(n);
+    double t = 0.0;
+    for (size_t s = 0; s < steps; ++s) {
+        L.ode_system(x, k1, t);
+        for (size_t i = 0; i < n; ++i) tmp[i] = x[i] + 0.5 * dt * k1[i];
+        L.ode_system(tmp, k2, t + 0.5 * dt);
+        for (size_t i = 0; i < n; ++i) tmp[i] = x[i] + 0.5 * dt * k2[i];
+        L.ode_system(tmp, k3, t + 0.5 * dt);
+        for (size_t i = 0; i < n; ++i) tmp[i] = x[i] + dt * k3[i];
+        L.ode_system(tmp, k4, t + dt);
+        for (size_t i = 0; i < n; ++i) x[i] += dt / 6.0 * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+        t += dt;
+    }
+}
+
+bool test_energy_conservation(std::ostream& out) {
+    out << "[12] Energy conservation of the undamped, undriven coupled dynamics (ring channel active)\n";
+    PhononLattice L = make_lattice_full(4);
+    L.alpha_gilbert = 0.0;
+    deterministic_spins(L, 0.37);
+    L.phonons.Q_x_E1 = 0.6; L.phonons.Q_y_E1 = -0.3; L.phonons.V_x_E1 = 0.5; L.phonons.V_y_E1 = 0.2;
+    const double E0 = L.total_energy();
+    PhononLattice::ODEState x = L.spins_to_state();
+    double worst_rel = 0.0;
+    for (int chunk = 0; chunk < 5; ++chunk) {
+        rk4_integrate(L, x, 0.002, 400);
+        // energy from the raw (un-normalised) state: copy without renormalising
+        for (size_t i = 0; i < L.lattice_size; ++i)
+            L.spins[i] = Eigen::Vector3d(x[3 * i], x[3 * i + 1], x[3 * i + 2]);
+        L.phonons.from_array(&x[3 * L.lattice_size]);
+        const double E = L.total_energy();
+        double max_norm_dev = 0.0;
+        for (size_t i = 0; i < L.lattice_size; ++i) max_norm_dev = std::max(max_norm_dev, std::abs(L.spins[i].norm() - 1.0));
+        worst_rel = std::max(worst_rel, std::abs(E - E0) / std::abs(E0));
+        out << "    t=" << 0.8 * (chunk + 1) << "  E/N=" << E / L.lattice_size
+            << "  |ΔE/E|=" << std::abs(E - E0) / std::abs(E0)
+            << "  |ε|=" << L.E1_amplitude() << "  max||S|−1|=" << max_norm_dev << "\n";
+    }
+    if (worst_rel > 1e-7) { out << "[FAIL] energy drift " << worst_rel << "\n"; return false; }
+    out << "[PASS] energy conserved to " << worst_rel << " (RK4, dt=0.002)\n\n";
+    return true;
+}
+
+bool test_size_independence(std::ostream& out) {
+    out << "[13] Size independence of ε(t) and E/N for a translation-invariant zigzag state (L=4 vs L=6)\n";
+    auto run = [&](size_t Lsz, bool per_site, double& eps_final, double& e_per_site) {
+        PhononLattice L = make_lattice_full(Lsz, true, per_site);
+        L.alpha_gilbert = 0.0;
+        set_zigzag(L, Eigen::Vector3d(0.2, -0.6, 0.75));   // L even: exact zigzag
+        L.phonons.Q_x_E1 = 0.5; L.phonons.Q_y_E1 = 0.2;
+        PhononLattice::ODEState x = L.spins_to_state();
+        rk4_integrate(L, x, 0.002, 600);
+        L.state_to_spins(x);
+        eps_final = L.E1_amplitude();
+        e_per_site = L.energy_density();
+    };
+    double e4, E4, e6, E6, e4l, E4l, e6l, E6l;
+    run(4, true, e4, E4); run(6, true, e6, E6);
+    run(4, false, e4l, E4l); run(6, false, e6l, E6l);
+    out << "    per-site normalisation: |ε|(t=1.2) L=4: " << e4 << "  L=6: " << e6 << "   E/N: " << E4 << "  " << E6 << "\n";
+    out << "    legacy (extensive):     |ε|(t=1.2) L=4: " << e4l << "  L=6: " << e6l << "   E/N: " << E4l << "  " << E6l << "\n";
+    if (!nearly_equal(e4, e6, 1e-9, 1e-9) || !nearly_equal(E4, E6, 1e-9, 1e-9)) {
+        out << "[FAIL] dynamics depends on lattice size with per-site normalisation\n"; return false;
+    }
+    out << "[PASS] size-independent with per-site normalisation (legacy differs by "
+        << std::abs(e4l - e6l) / std::max(std::abs(e4l), 1e-300) * 100 << "% in |ε|)\n\n";
+    return true;
+}
+
+bool test_stability_bound(std::ostream& out) {
+    out << "[14] E1 mode stiffness: ω_eff² = ω² + (1/N)∂²H_sp-ph/∂ε² on zigzag and random states\n";
+    PhononLattice L = make_lattice_full(6, false);   // production-like quadratic couplings only
+    const double w2 = L.phonon_params.omega_E1 * L.phonon_params.omega_E1;
+    const double N = double(L.lattice_size);
+    auto curvature = [&](double qx, double qy, int a) {   // ∂²H/∂ε_a² by central FD of the raw force
+        const double h = 1e-3;
+        L.phonons.Q_x_E1 = qx + (a == 0 ? h : 0); L.phonons.Q_y_E1 = qy + (a == 1 ? h : 0);
+        const double fp = (a == 0) ? L.dH_dQx_E1() : L.dH_dQy_E1();
+        L.phonons.Q_x_E1 = qx - (a == 0 ? h : 0); L.phonons.Q_y_E1 = qy - (a == 1 ? h : 0);
+        const double fm = (a == 0) ? L.dH_dQx_E1() : L.dH_dQy_E1();
+        L.phonons.Q_x_E1 = qx; L.phonons.Q_y_E1 = qy;
+        return (fp - fm) / (2 * h);
+    };
+    bool ok = true;
+    for (int which = 0; which < 2; ++which) {
+        if (which == 0) set_zigzag(L, Eigen::Vector3d(0.2, -0.6, 0.75)); else deterministic_spins(L, 2.1);
+        for (int a = 0; a < 2; ++a) {
+            const double c = curvature(0.0, 0.0, a);
+            const double weff2_site = w2 + c / N, weff2_legacy = w2 + c;
+            out << "    " << (which == 0 ? "zigzag" : "random") << " ε_" << (a == 0 ? 'x' : 'y')
+                << ": ∂²H/∂ε² = " << c << "  → ω_eff²/ω² per-site = " << weff2_site / w2
+                << " ; legacy(N=" << N << ") = " << weff2_legacy / w2
+                << " ; legacy extrapolated to N=2592: " << (w2 + c / N * 2592.0) / w2 << "\n";
+            if (weff2_site <= 0) ok = false;
+        }
+    }
+    if (!ok) { out << "[FAIL] E1 mode soft with per-site normalisation\n"; return false; }
+    out << "[PASS] E1 mode stiff (ω_eff² > 0) with per-site normalisation\n\n";
+    return true;
+}
+
+bool test_linear_channel_pattern(std::ostream& out) {
+    out << "[15] Linear channel pattern: ε∥x → (1,−½,−½)λ1ε ; ε∥y → (0,+√3/2,−√3/2)λ1ε ; period 120° in θ_pol\n";
+    SpinPhononCouplingParams p;  // all zero except λ_K1
+    p.lambda_E1_K_1 = 1.0;
+    const double e = 0.37;
+    const std::array<double, 3> ex_expect = {1.0, -0.5, -0.5};
+    const std::array<double, 3> ey_expect = {0.0, 0.5 * kSqrt3, -0.5 * kSqrt3};
+    for (int g = 0; g < 3; ++g) {
+        const double dx = delta_X_reference(0, 0, e, 0, g, 1.0) / e;
+        const double dy = delta_X_reference(0, 0, 0, e, g, 1.0) / e;
+        out << "    γ=" << g << "  ε∥x: " << dx << " (exp " << ex_expect[g] << ")   ε∥y: " << dy << " (exp " << ey_expect[g] << ")\n";
+        if (!nearly_equal(dx, ex_expect[g], kAnalyticTol) || !nearly_equal(dy, ey_expect[g], kAnalyticTol)) {
+            out << "[FAIL] linear pattern\n"; return false;
+        }
+        // three-fold periodicity in polarization: θ_pol → θ_pol + 120° with γ → γ+1 leaves δX invariant
+        const double th = 0.61;
+        const double a0 = delta_X_reference(0, 0, e * std::cos(th), e * std::sin(th), g, 1.0);
+        const double a1 = delta_X_reference(0, 0, e * std::cos(th + 2 * kPi / 3), e * std::sin(th + 2 * kPi / 3), (g + 1) % 3, 1.0);
+        if (!nearly_equal(a0, a1, kAnalyticTol)) { out << "[FAIL] linear term not C3 covariant\n"; return false; }
+    }
+    out << "[PASS] linear channel pattern and C3 covariance\n\n";
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -496,6 +824,13 @@ int main() {
     ok = test_C3_invariance_per_bond(std::cout)          && ok;
     ok = test_bond_modulation_pattern(std::cout)         && ok;
     ok = test_isotropic_only_invariant_part(std::cout)   && ok;
+    ok = test_bond_coordination_and_hexagons(std::cout)  && ok;
+    ok = test_ring_collinear_identities(std::cout)       && ok;
+    ok = test_full_hamiltonian_forces(std::cout)         && ok;
+    ok = test_energy_conservation(std::cout)             && ok;
+    ok = test_size_independence(std::cout)               && ok;
+    ok = test_stability_bound(std::cout)                 && ok;
+    ok = test_linear_channel_pattern(std::cout)          && ok;
 
     if (!ok) {
         std::cout << "E1 phonon Hamiltonian regression FAILURES detected.\n";
