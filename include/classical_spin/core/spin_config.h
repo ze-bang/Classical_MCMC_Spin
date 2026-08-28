@@ -262,6 +262,7 @@ struct SpinConfig {
     
     // Initial configuration
     string initial_spin_config = "";  // Empty means random
+    string local_field_config = "";   // Directions file for the local_field_h triple-q stabiliser (empty: loaded spins)
     string pinning_field_config = ""; // Optional rows: site Bx By Bz
     string nn_exchange_disorder_config = ""; // Optional rows: site partner scale
     string nn_exchange_channel_disorder_config = ""; // Optional rows: site partner dJ dK dGamma dGammap

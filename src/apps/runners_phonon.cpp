@@ -286,6 +286,26 @@ void run_molecular_dynamics_phonon(PhononLattice& lattice, const SpinConfig& con
             );
         } else {
             lattice.load_spin_config(config.initial_spin_config);
+            // Krüger et al. (PRL 131, 146702) local-field stand-in for the ring exchange: H_nbl = -h Σ n_i·S_i
+            // with n_i the triple-q directions of the loaded configuration (S = 1/2: h = 0.88 meV).
+            {
+                const double h_loc = config.get_param("local_field_h", 0.0);
+                if (h_loc != 0.0) {
+                    // directions: the file local_field_config (the T = 0 triple-q state) if given, else the loaded spins
+                    std::vector<Eigen::Vector3d> dirs(lattice.lattice_size);
+                    std::string src = "the loaded spin directions";
+                    const std::string lf = config.local_field_config;
+                    if (!lf.empty()) {
+                        std::ifstream in(lf);
+                        for (size_t s = 0; s < lattice.lattice_size && in; ++s) { double x, y, z; in >> x >> y >> z; dirs[s] = Eigen::Vector3d(x, y, z).normalized(); }
+                        src = lf;
+                    } else {
+                        for (size_t s = 0; s < lattice.lattice_size; ++s) dirs[s] = lattice.spins[s].normalized();
+                    }
+                    for (size_t s = 0; s < lattice.lattice_size; ++s) lattice.field[s] += h_loc * dirs[s];
+                    if (rank == 0) cout << "Local field h = " << h_loc << " meV along " << src << " (triple-q stabiliser)" << endl;
+                }
+            }
         }
         
         // Relax phonons to equilibrium for the current spin configuration
@@ -418,6 +438,26 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
             );
         } else {
             lattice.load_spin_config(config.initial_spin_config);
+            // Krüger et al. (PRL 131, 146702) local-field stand-in for the ring exchange: H_nbl = -h Σ n_i·S_i
+            // with n_i the triple-q directions of the loaded configuration (S = 1/2: h = 0.88 meV).
+            {
+                const double h_loc = config.get_param("local_field_h", 0.0);
+                if (h_loc != 0.0) {
+                    // directions: the file local_field_config (the T = 0 triple-q state) if given, else the loaded spins
+                    std::vector<Eigen::Vector3d> dirs(lattice.lattice_size);
+                    std::string src = "the loaded spin directions";
+                    const std::string lf = config.local_field_config;
+                    if (!lf.empty()) {
+                        std::ifstream in(lf);
+                        for (size_t s = 0; s < lattice.lattice_size && in; ++s) { double x, y, z; in >> x >> y >> z; dirs[s] = Eigen::Vector3d(x, y, z).normalized(); }
+                        src = lf;
+                    } else {
+                        for (size_t s = 0; s < lattice.lattice_size; ++s) dirs[s] = lattice.spins[s].normalized();
+                    }
+                    for (size_t s = 0; s < lattice.lattice_size; ++s) lattice.field[s] += h_loc * dirs[s];
+                    if (rank == 0) cout << "Local field h = " << h_loc << " meV along " << src << " (triple-q stabiliser)" << endl;
+                }
+            }
         }
         
         // Relax spins and phonons to joint equilibrium
@@ -585,6 +625,26 @@ void run_2dcs_phonon(PhononLattice& lattice, const SpinConfig& config, int rank,
             );
         } else {
             lattice.load_spin_config(config.initial_spin_config);
+            // Krüger et al. (PRL 131, 146702) local-field stand-in for the ring exchange: H_nbl = -h Σ n_i·S_i
+            // with n_i the triple-q directions of the loaded configuration (S = 1/2: h = 0.88 meV).
+            {
+                const double h_loc = config.get_param("local_field_h", 0.0);
+                if (h_loc != 0.0) {
+                    // directions: the file local_field_config (the T = 0 triple-q state) if given, else the loaded spins
+                    std::vector<Eigen::Vector3d> dirs(lattice.lattice_size);
+                    std::string src = "the loaded spin directions";
+                    const std::string lf = config.local_field_config;
+                    if (!lf.empty()) {
+                        std::ifstream in(lf);
+                        for (size_t s = 0; s < lattice.lattice_size && in; ++s) { double x, y, z; in >> x >> y >> z; dirs[s] = Eigen::Vector3d(x, y, z).normalized(); }
+                        src = lf;
+                    } else {
+                        for (size_t s = 0; s < lattice.lattice_size; ++s) dirs[s] = lattice.spins[s].normalized();
+                    }
+                    for (size_t s = 0; s < lattice.lattice_size; ++s) lattice.field[s] += h_loc * dirs[s];
+                    if (rank == 0) cout << "Local field h = " << h_loc << " meV along " << src << " (triple-q stabiliser)" << endl;
+                }
+            }
         }
         
         // Relax spins and phonons to joint equilibrium before 2DCS

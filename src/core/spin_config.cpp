@@ -337,6 +337,9 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "g_factor") {
                 config.g_factor = parse_vector(value);
             }
+            else if (key == "local_field_config") {
+                config.local_field_config = value;
+            }
             else if (key == "initial_spin_config") {
                 config.initial_spin_config = value;
             }
