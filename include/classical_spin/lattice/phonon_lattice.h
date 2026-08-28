@@ -580,6 +580,11 @@ public:
     vector<vector<Eigen::Vector3d>> nn_bond_vec, j2_bond_vec;   // unit vectors i→j per site per neighbour
     vector<vector<Eigen::Vector2d>> nn_bond_cq;                  // A→B direction of the bond in the doublet frame (cx, cy)
     void enable_sld(bool on);
+    /// Static relaxation of the site displacements to the magnetostrictive equilibrium of the current
+    /// spins (Jacobi iteration on the lattice forces; p = 0).  Returns the final max |F|.  Without this
+    /// u = 0 carries an elastic energy F²/2k per site that is released as lattice heat at t = 0.
+    double relax_sld_static(int max_iter = 500, double tol = 1e-6);
+    int sld_relax = 200;
     size_t mode_dof() const;
     size_t sld_offset() const { return spin_dim * lattice_size + mode_dof(); }
     double sld_energy() const;

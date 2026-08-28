@@ -461,6 +461,7 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
             lattice.sld_T       = config.get_param("sld_T", -1.0);
             lattice.sld_init_T  = config.get_param("sld_init_T", 0.0);
             lattice.sld_quantum = config.get_param("sld_quantum", 0.0) > 0.5;
+            lattice.sld_relax   = static_cast<int>(config.get_param("sld_relax", 200.0));
             lattice.langevin_temperature = langevin_T_pp;
             lattice.enable_sld(true);
         }

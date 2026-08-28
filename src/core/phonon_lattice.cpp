@@ -650,6 +650,36 @@ void PhononLattice::recompute_state_size() {
     state_size = spin_dim * lattice_size + phonon_dof();
 }
 
+double PhononLattice::relax_sld_static(int max_iter, double tol) {
+    if (!sld_enabled) return 0.0;
+    for (auto& p : p_site) p.setZero();
+    ODEState x = spins_to_state(), dxdt(state_size);
+    const size_t off = sld_offset(), poff = off + 3 * lattice_size;
+    // diagonal stiffness seen by one site: 3 NN springs (k, each contributing k d d^T ~ k/2 per in-plane
+    // direction on average → 3k/2) plus 6 second-neighbour springs (3 k2); damped Jacobi step
+    const double kdiag = 1.5 * sld_k + 3.0 * sld_k2;
+    double fmax = 0.0;
+    int it = 0;
+    for (; it < max_iter; ++it) {
+        ode_system(x, dxdt, 0.0);
+        fmax = 0.0;
+        for (size_t i = 0; i < lattice_size; ++i) {
+            for (int d = 0; d < 2; ++d) {
+                const double F = dxdt[poff + 3 * i + d];        // p = 0 → pure force
+                fmax = std::max(fmax, std::abs(F));
+                x[off + 3 * i + d] += 0.7 * F / kdiag;
+            }
+        }
+        if (fmax < tol) break;
+    }
+    state_to_spins(x);
+    for (auto& p : p_site) p.setZero();
+    cout << "  SLD static relaxation: " << it << " iterations, max|F| = " << fmax
+         << ", spring energy " << sld_spring_energy() / double(lattice_size) * 1e3
+         << " ueV/site, striction energy " << sld_striction_energy() / double(lattice_size) * 1e3 << " ueV/site" << endl;
+    return fmax;
+}
+
 void PhononLattice::pack_lattice(double* arr) const {
     phonons.to_array(arr);
     size_t p = PhononState::N_DOF;
@@ -2228,6 +2258,7 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
     std::unique_ptr<BoseNoise> lnoise;
     auto Tl_at_step = [&](long s) { return sld_T >= 0.0 ? sld_T : T_at_step(s); };
     if (sld_enabled) {
+        if (sld_relax > 0) relax_sld_static(sld_relax, 1e-6);
         if (sld_init_T > 0.0) {
             bool cold = true;
             for (const auto& p : p_site) if (p.squaredNorm() > 0.0) { cold = false; break; }
