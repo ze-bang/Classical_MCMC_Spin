@@ -457,6 +457,9 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
             lattice.langevin_t_step  = config.get_param("langevin_t_step", config.pump_time);
             lattice.langevin_tau_on  = config.get_param("langevin_tau_on", 5.0);
             lattice.langevin_tau_off = config.get_param("langevin_tau_off", 0.0);
+            lattice.langevin_quantum = config.get_param("langevin_quantum", 0.0) > 0.5;
+            lattice.langevin_block   = static_cast<int>(config.get_param("langevin_block", 4096.0));
+            lattice.langevin_bath_C  = config.get_param("langevin_bath_C", 0.0);
             if (lattice.alpha_gilbert <= 0.0)
                 lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.01);
             if (rank == 0) {

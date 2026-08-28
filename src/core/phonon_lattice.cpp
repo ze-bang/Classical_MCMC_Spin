@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <random>
 #include <algorithm>
+#include <complex>
 #include <mpi.h>
 
 #ifdef _OPENMP
@@ -1931,6 +1932,86 @@ void PhononLattice::molecular_dynamics(
 // LANGEVIN DYNAMICS (qualitative, fixed-step RK4 + per-step noise)
 // ============================================================
 
+namespace {
+// In-place iterative radix-2 complex FFT (forward: e^{-i}, inverse: e^{+i}; no 1/N scaling).
+void fft_radix2(std::vector<std::complex<double>>& a, bool inverse) {
+    const size_t n = a.size();
+    for (size_t i = 1, j = 0; i < n; ++i) {
+        size_t bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(a[i], a[j]);
+    }
+    for (size_t len = 2; len <= n; len <<= 1) {
+        const double ang = 2.0 * M_PI / static_cast<double>(len) * (inverse ? 1.0 : -1.0);
+        const std::complex<double> wl(std::cos(ang), std::sin(ang));
+        for (size_t i = 0; i < n; i += len) {
+            std::complex<double> w(1.0, 0.0);
+            for (size_t k = 0; k < len / 2; ++k) {
+                const std::complex<double> u = a[i + k], v = a[i + k + len / 2] * w;
+                a[i + k] = u + v; a[i + k + len / 2] = u - v; w *= wl;
+            }
+        }
+    }
+}
+
+// Bose-coloured Gaussian noise for the semi-quantum thermostat.  Channel c (= 3*site + comp) of
+// block b is a periodic Gaussian process of length Nb whose power spectrum is F(ω_k, T_b) times the
+// classical white level; blocks overlap by half their length and are summed with sine windows
+// (w_n = sin(π(n+½)/Nb), so that w_n² + w_{n+Nb/2}² = 1) — a stationary process with the target
+// spectrum up to the 1/Nb spectral smearing of the window.  Each (block, channel) uses its own
+// deterministic RNG stream derived from the run seed, so runs are reproducible and OpenMP-safe.
+struct BoseNoise {
+    int Nb, H; size_t nch; double dt, alpha, S; uint64_t seed;
+    std::vector<double> blk[2]; int blk_id[2] = {-1, -1};
+    std::vector<double> win;
+    BoseNoise(int Nb_, size_t nch_, double dt_, double alpha_, double S_, uint64_t seed_)
+        : Nb(Nb_), H(Nb_ / 2), nch(nch_), dt(dt_), alpha(alpha_), S(S_), seed(seed_) {
+        blk[0].assign(static_cast<size_t>(Nb) * nch, 0.0); blk[1].assign(static_cast<size_t>(Nb) * nch, 0.0);
+        win.resize(Nb);
+        for (int n = 0; n < Nb; ++n) win[n] = std::sin(M_PI * (n + 0.5) / Nb);
+    }
+    // block b covers steps [(b-1)H, (b+1)H); fill slot b%2 for bath temperature T (meV)
+    void generate(int b, double T) {
+        const int slot = b & 1; blk_id[slot] = b;
+        std::vector<double> F(Nb / 2 + 1);
+        for (int k = 0; k <= Nb / 2; ++k) {
+            const double w = 2.0 * M_PI * k / (Nb * dt);          // ħω in meV (time unit ħ/meV)
+            const double x = (T > 0.0) ? w / T : 1e300;
+            F[k] = (k == 0) ? 1.0 : (x < 700.0 ? x / std::expm1(x) : 0.0);
+        }
+        const double sigma = std::sqrt(2.0 * alpha * T / (S * dt));   // classical white level
+        double* out = blk[slot].data();
+        #pragma omp parallel for schedule(static)
+        for (long c = 0; c < static_cast<long>(nch); ++c) {
+            std::mt19937_64 rng(seed ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(b + 1)) ^ (0xC2B2AE3D27D4EB4FULL * (uint64_t)(c + 1)));
+            std::normal_distribution<double> g(0.0, 1.0);
+            std::vector<std::complex<double>> Y(Nb);
+            Y[0] = std::complex<double>(g(rng) * std::sqrt((double)Nb) * std::sqrt(F[0]), 0.0);
+            Y[Nb / 2] = std::complex<double>(g(rng) * std::sqrt((double)Nb) * std::sqrt(F[Nb / 2]), 0.0);
+            for (int k = 1; k < Nb / 2; ++k) {
+                const double a = std::sqrt(Nb / 2.0) * std::sqrt(F[k]);
+                Y[k] = std::complex<double>(a * g(rng), a * g(rng)); Y[Nb - k] = std::conj(Y[k]);
+            }
+            fft_radix2(Y, true);
+            for (int n = 0; n < Nb; ++n) out[static_cast<size_t>(n) * nch + c] = sigma * Y[n].real() / Nb;
+        }
+    }
+    // noise value for channel c at global step s (s >= 0)
+    inline double sample(long s, size_t c) const {
+        const int b1 = static_cast<int>(s / H); const int b2 = b1 + 1;
+        const long n1 = s - static_cast<long>(b1 - 1) * H, n2 = s - static_cast<long>(b1) * H;
+        const double* B1 = blk[b1 & 1].data(); const double* B2 = blk[b2 & 1].data();
+        return win[n1] * B1[static_cast<size_t>(n1) * nch + c] + win[n2] * B2[static_cast<size_t>(n2) * nch + c];
+    }
+    // make sure blocks floor(s/H) and floor(s/H)+1 are present, generating with the bath T at the block centre
+    template <class TF> void ensure(long s, const TF& T_at_step) {
+        const int b1 = static_cast<int>(s / H);
+        for (int b : {b1, b1 + 1}) if (blk_id[b & 1] != b) generate(b, T_at_step(static_cast<long>(b) * H));
+    }
+};
+} // namespace
+
 void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
                                        const string& output_dir,
                                        size_t save_every,
@@ -1987,6 +2068,25 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
     // half-step; kept zero during the deterministic RK4 sub-stages).
     langevin_noise.assign(lattice_size, Eigen::Vector3d::Zero());
     use_langevin_noise = false;  // off during deterministic RK4
+
+    // Semi-quantum thermostat: Bose-coloured noise blocks (see BoseNoise above)
+    std::unique_ptr<BoseNoise> qnoise;
+    if (langevin_quantum) {
+        int Nb = 16; while (Nb < langevin_block) Nb <<= 1;     // power of two
+        qnoise = std::make_unique<BoseNoise>(Nb, 3 * lattice_size, dt, alpha_gilbert, spin_length, seed);
+        std::cout << "  SEMI-QUANTUM thermostat: Bose-coloured noise, block " << Nb
+                  << " steps (" << Nb * dt << " code units), overlap-add sine windows; no zero-point term"
+                  << std::endl;
+    }
+    // Finite-capacity bath: dynamical bath temperature T_dyn (meV), energy bookkeeping per step
+    const bool finiteC = (langevin_bath_C > 0.0);
+    double T_dyn = langevin_temperature, E_prev = 0.0, Qx_prev = 0.0, Qy_prev = 0.0;
+    const double bathN = static_cast<double>(lattice_size) * langevin_bath_C;   // meV per meV of T
+    if (finiteC) {
+        std::cout << "  FINITE-CAPACITY bath: C_l = " << langevin_bath_C << " k_B per spin; T_bath evolves by energy"
+                  << " conservation (phonon dissipation + spin damping heat it, noise cools it)" << std::endl;
+    }
+    auto T_at_step = [&](long s) { return finiteC ? T_dyn : langevin_bath_T(t_start + std::max(0.0, static_cast<double>(s)) * dt); };
 
     std::cout << "PhononLattice Langevin dynamics (Strang split: RK4 + Euler-Maruyama)"
               << std::endl;
@@ -2057,15 +2157,21 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
             f.Qy = state[spin_offset + 1];
             f.Vx = state[spin_offset + 2];
             f.Vy = state[spin_offset + 3];
-            f.T_bath = langevin_bath_T(t);
+            f.T_bath = finiteC ? T_dyn : langevin_bath_T(t);
             f.spin_snapshot = spins;
             traj.push_back(f);
+        }
+
+        if (finiteC) {
+            sync_back(); E_prev = total_energy();
+            Qx_prev = state[spin_offset + 0]; Qy_prev = state[spin_offset + 1];
         }
 
         // ── Step A: deterministic RK4 on H_eff (no noise) ──
         use_langevin_noise = false;
         stepper.do_step(rhs, state, t, dt);
-        if (langevin_dT != 0.0) sigma_eff = sigma_of_T(langevin_bath_T(t));
+        if (finiteC) sigma_eff = sigma_of_T(T_dyn);
+        else if (langevin_dT != 0.0) sigma_eff = sigma_of_T(langevin_bath_T(t));
 
         // ── Step B: stochastic Euler-Maruyama on the noise force ──
         //
@@ -2077,12 +2183,20 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
         // with σ² = 2 α k_B T / (|S| dt) realizes the Itô discretization of
         // the Wiener increment dW = sqrt(dt) η consistent with the FDT.
         const double inv_S = (spin_length > 0) ? alpha_gilbert / spin_length : 0.0;
+        if (qnoise) qnoise->ensure(static_cast<long>(step), T_at_step);
         for (size_t i = 0; i < lattice_size; ++i) {
             const size_t idx = i * spin_dim;
             Eigen::Vector3d S(state[idx], state[idx + 1], state[idx + 2]);
-            Eigen::Vector3d H_noise(sigma_eff * normal(rng),
-                                    sigma_eff * normal(rng),
-                                    sigma_eff * normal(rng));
+            Eigen::Vector3d H_noise;
+            if (qnoise) {
+                H_noise = Eigen::Vector3d(qnoise->sample(static_cast<long>(step), 3 * i + 0),
+                                          qnoise->sample(static_cast<long>(step), 3 * i + 1),
+                                          qnoise->sample(static_cast<long>(step), 3 * i + 2));
+            } else {
+                H_noise = Eigen::Vector3d(sigma_eff * normal(rng),
+                                          sigma_eff * normal(rng),
+                                          sigma_eff * normal(rng));
+            }
             Eigen::Vector3d dS = dt * S.cross(H_noise);
             if (alpha_gilbert > 0.0) {
                 dS -= dt * inv_S * S.cross(S.cross(H_noise));
@@ -2102,6 +2216,17 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
                 state[idx + 1] = sy * s;
                 state[idx + 2] = sz * s;
             }
+        }
+
+        if (finiteC) {
+            // energy conservation: whatever the system (spins + phonon + coupling) lost that was not
+            // supplied by the drive went into the bath; W_drive = N Z* E(t+dt/2)·ΔQ
+            sync_back(); const double E_now = total_energy();
+            double Ex = 0.0, Ey = 0.0; drive_params.E_field(t + 0.5 * dt, Ex, Ey);
+            const double W = phonon_norm() * phonon_params.Z_star *
+                             (Ex * (state[spin_offset + 0] - Qx_prev) + Ey * (state[spin_offset + 1] - Qy_prev));
+            T_dyn -= (E_now - E_prev - W) / bathN;
+            if (T_dyn < 0.0) T_dyn = 0.0;
         }
 
         t += dt;

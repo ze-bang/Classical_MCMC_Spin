@@ -528,6 +528,23 @@ public:
     // temperature is  T_b(t) = T0 + dT * Θ(t - t_step) (1 - e^{-(t-t_step)/tau_on}) e^{-(t-t_step)/tau_off}
     // i.e. a hot phonon reservoir filled within tau_on (the E1 ring-down) and, optionally,
     // cooling with tau_off (0 = no decay).  dT = 0 reproduces the constant-T thermostat.
+    // Semi-quantum thermostat (Barker & Bauer, PRB 100, 140401 (2019)): the stochastic field is
+    // coloured Gaussian noise whose power spectrum is the Bose energy of a mode at frequency ω,
+    //     P(ω) = P_classical(T) · F(ω,T),   F = x/(e^x − 1),  x = ħω/k_B T,
+    // (no zero-point term), while the Gilbert damping stays Markovian.  For every harmonic mode the
+    // steady state is then E_k = ħω_k n_B(ω_k): quantum thermal occupation without a quantum solver.
+    // The noise is generated in FFT blocks of langevin_block steps, overlap-added with sine windows
+    // (Σ w² = 1) so that the process is stationary; the block temperature is the bath temperature at
+    // the block centre.  langevin_quantum = false reproduces the classical white-noise thermostat.
+    bool langevin_quantum = false;
+    int langevin_block = 4096;
+    // Finite-capacity, energy-conserving bath (two-temperature model built from the dynamics):
+    // when langevin_bath_C > 0 (heat capacity of the bath in k_B per spin) the bath temperature is a
+    // dynamical variable, T_b(t+dt) = T_b(t) - [E_sys(t+dt) - E_sys(t) - W_drive]/(N C_l), i.e. every
+    // unit of energy the system loses (phonon damping γ, Gilbert damping) heats the bath and every
+    // unit the noise injects cools it; the E1 ring-down is then the deposit itself and no
+    // langevin_dT step is needed.  0 = infinite bath with the prescribed profile.
+    double langevin_bath_C = 0.0;
     double langevin_dT = 0.0;
     double langevin_t_step = 0.0;
     double langevin_tau_on = 5.0;     // code units (5 = 3.3 ps)
