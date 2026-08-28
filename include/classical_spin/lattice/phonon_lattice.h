@@ -563,6 +563,34 @@ public:
     vector<Eigen::Vector3d> langevin_noise;
     bool use_langevin_noise = false;
 
+    // ---- Spin–lattice dynamics (SLD): in-plane site displacements u_i and momenta p_i ----
+    // Harmonic NN (k) and 2nd-NN (k2) central springs; exchange striction δM_ij = g δr_ij M_ij with
+    // δr_ij = (u_j − u_i)·d̂_ij (g = ∂ln X/∂r, one common Grüneisen fraction for J, K, Γ, Γ′, same
+    // convention as the E1 coupling λ_X1); optional cubic E1–acoustic vertex
+    // H3 = v3 Σ_bonds (Q·d̂_γ) δr_ij² (decay of the E1 mode into acoustic pairs); lattice friction γ_l
+    // with the matching Langevin noise on p in integrate_langevin (classical or Bose-coloured).
+    // Units: length = lattice constant a, energy meV, time ħ/meV, mass in meV·(ħ/meV)²/a²
+    // (= 0.150 amu for a = 5.27 Å).  ODE layout: after the mode block,
+    // [u_0(3), …, u_{N−1}(3), p_0(3), …, p_{N−1}(3)]; z components are kept at zero.
+    bool sld_enabled = false;
+    double sld_mass = 1000.0, sld_k = 1.5e5, sld_k2 = 4.0e4, sld_g = 0.0, sld_v3 = 0.0;
+    double sld_gamma = 0.0, sld_T = -1.0, sld_init_T = 0.0;
+    bool sld_quantum = false;
+    vector<Eigen::Vector3d> u_site, p_site;
+    vector<vector<Eigen::Vector3d>> nn_bond_vec, j2_bond_vec;   // unit vectors i→j per site per neighbour
+    vector<vector<Eigen::Vector2d>> nn_bond_cq;                  // A→B direction of the bond in the doublet frame (cx, cy)
+    void enable_sld(bool on);
+    size_t mode_dof() const;
+    size_t sld_offset() const { return spin_dim * lattice_size + mode_dof(); }
+    double sld_energy() const;
+    double sld_kinetic_energy() const;
+    double sld_spring_energy() const;
+    double sld_striction_energy() const;
+    /// Lattice temperature from equipartition of the 2N in-plane momenta: T_l = E_kin/N.
+    double sld_lattice_temperature() const {
+        return (sld_enabled && lattice_size) ? sld_kinetic_energy() / double(lattice_size) : 0.0;
+    }
+
     // ODE state size
     size_t state_size;
     
@@ -1052,7 +1080,7 @@ public:
      * Total energy
      */
     double total_energy() const {
-        return spin_energy() + phonon_energy() + spin_phonon_energy() + anharmonic_energy();
+        return spin_energy() + phonon_energy() + spin_phonon_energy() + anharmonic_energy() + sld_energy();
     }
 
     /// Extensivity factor of the zone-centre phonon sector: N_sites when the

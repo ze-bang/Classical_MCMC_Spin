@@ -450,6 +450,20 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
         // drive_params inside ode_system() in both branches, so the pulse is applied
         // identically.  (Before this branch existed the key was silently ignored here.)
         const double langevin_T_pp = config.get_param("langevin_temperature", 0.0);
+        // Spin–lattice dynamics (explicit in-plane acoustic phonons with exchange striction)
+        if (config.get_param("sld_enabled", 0.0) > 0.5) {
+            lattice.sld_mass    = config.get_param("sld_mass", lattice.sld_mass);
+            lattice.sld_k       = config.get_param("sld_k", lattice.sld_k);
+            lattice.sld_k2      = config.get_param("sld_k2", lattice.sld_k2);
+            lattice.sld_g       = config.get_param("sld_g", 0.0);
+            lattice.sld_v3      = config.get_param("sld_v3", 0.0);
+            lattice.sld_gamma   = config.get_param("sld_gamma", 0.0);
+            lattice.sld_T       = config.get_param("sld_T", -1.0);
+            lattice.sld_init_T  = config.get_param("sld_init_T", 0.0);
+            lattice.sld_quantum = config.get_param("sld_quantum", 0.0) > 0.5;
+            lattice.langevin_temperature = langevin_T_pp;
+            lattice.enable_sld(true);
+        }
         if (langevin_T_pp > 0.0) {
             lattice.langevin_temperature = langevin_T_pp;
             // two-reservoir bath profile (scenario 1): optional keys

@@ -160,6 +160,9 @@ PhononLattice::PhononLattice(const UnitCell& uc, size_t d1, size_t d2, size_t d3
     }
     j2_cls.assign(lattice_size, {});
     j3_cls.assign(lattice_size, {});
+    nn_bond_vec.assign(lattice_size, {});
+    nn_bond_cq.assign(lattice_size, {});
+    j2_bond_vec.assign(lattice_size, {});
     n_j2_cls = 0;
     n_j3_cls = 0;
     auto bond_class = [&](const Eigen::Vector3d& r, bool isJ3) {
@@ -198,11 +201,25 @@ PhononLattice::PhononLattice(const UnitCell& uc, size_t d1, size_t d2, size_t d3
                             nn_interaction[site].push_back(bi.interaction);
                             nn_partners[site].push_back(partner);
                             nn_bond_types[site].push_back(bi.bond_type);
-                            
+
                             // Reverse bond
                             nn_interaction[partner].push_back(bi.interaction.transpose());
                             nn_partners[partner].push_back(site);
                             nn_bond_types[partner].push_back(bi.bond_type);
+
+                            // Bond geometry for the spin–lattice dynamics: unit vector i→j (both ends) and
+                            // the A→B direction of the bond in the doublet frame (for the E1–acoustic vertex).
+                            {
+                                Eigen::Vector3d rb = uc.lattice_pos[bi.partner] - uc.lattice_pos[atom];
+                                for (int kk = 0; kk < 3; ++kk) rb += double(bi.offset[kk]) * uc.lattice_vectors[kk];
+                                const Eigen::Vector3d d = rb.normalized();
+                                const Eigen::Vector3d dAB = (atom == 0) ? d : Eigen::Vector3d(-d);
+                                const Eigen::Vector2d cq(dAB.dot(ex_code), dAB.dot(ey_code));
+                                nn_bond_vec[site].push_back(d);
+                                nn_bond_vec[partner].push_back(-d);
+                                nn_bond_cq[site].push_back(cq);
+                                nn_bond_cq[partner].push_back(cq);
+                            }
                         } else {
                             // J2/J3 interaction (no phonon coupling)
                             // Use j2 for same-sublattice, j3 for different sublattice
@@ -226,6 +243,8 @@ PhononLattice::PhononLattice(const UnitCell& uc, size_t d1, size_t d2, size_t d3
                                 j2_interaction[partner].push_back(bi.interaction.transpose());
                                 j2_partners[partner].push_back(site);
                                 j2_cls[partner].push_back(cls);
+                                j2_bond_vec[site].push_back(rbond.normalized());
+                                j2_bond_vec[partner].push_back(-rbond.normalized());
                             } else {
                                 // Different sublattice -> J3
                                 const int cls = bond_class(rbond, true);
@@ -602,10 +621,29 @@ double PhononLattice::ring_exchange_normalized() const {
 // LATTICE COORDINATES, BOND INCREMENTS AND MAGNETOELASTIC ENERGIES
 // ============================================================
 
-size_t PhononLattice::phonon_dof() const {
+size_t PhononLattice::mode_dof() const {
     size_t n = PhononState::N_DOF;
     for (size_t m = 1; m < modes.size(); ++m) n += modes[m].ndof();
     return n;
+}
+
+size_t PhononLattice::phonon_dof() const {
+    return mode_dof() + (sld_enabled ? 6 * lattice_size : 0);
+}
+
+void PhononLattice::enable_sld(bool on) {
+    sld_enabled = on;
+    u_site.assign(lattice_size, Eigen::Vector3d::Zero());
+    p_site.assign(lattice_size, Eigen::Vector3d::Zero());
+    recompute_state_size();
+    if (on) {
+        cout << "Spin–lattice dynamics ENABLED: " << 6 * lattice_size << " site DOF (in-plane u, p);"
+             << " m = " << sld_mass << ", k = " << sld_k << ", k2 = " << sld_k2
+             << ", striction g = " << sld_g << " /a, v3 = " << sld_v3
+             << ", gamma_l = " << sld_gamma << (sld_quantum ? " (Bose-coloured noise)" : " (white noise)")
+             << ", T_l = " << (sld_T >= 0.0 ? sld_T : langevin_temperature) << endl;
+        cout << "  ODE state size now " << state_size << endl;
+    }
 }
 
 void PhononLattice::recompute_state_size() {
@@ -623,6 +661,10 @@ void PhononLattice::pack_lattice(double* arr) const {
         arr[p++] = md.V1;
         if (md.ncoord() == 2) arr[p++] = md.V2;
     }
+    if (sld_enabled) {
+        for (size_t i = 0; i < lattice_size; ++i) for (int d = 0; d < 3; ++d) arr[p++] = u_site[i](d);
+        for (size_t i = 0; i < lattice_size; ++i) for (int d = 0; d < 3; ++d) arr[p++] = p_site[i](d);
+    }
 }
 
 void PhononLattice::unpack_lattice(const double* arr) {
@@ -636,6 +678,60 @@ void PhononLattice::unpack_lattice(const double* arr) {
         md.V1 = arr[p++];
         if (md.ncoord() == 2) md.V2 = arr[p++];
     }
+    if (sld_enabled) {
+        for (size_t i = 0; i < lattice_size; ++i) for (int d = 0; d < 3; ++d) u_site[i](d) = arr[p++];
+        for (size_t i = 0; i < lattice_size; ++i) for (int d = 0; d < 3; ++d) p_site[i](d) = arr[p++];
+    }
+}
+
+// ---- spin–lattice dynamics energies (u, p from u_site/p_site) ----
+double PhononLattice::sld_kinetic_energy() const {
+    if (!sld_enabled) return 0.0;
+    double E = 0.0;
+    for (const auto& p : p_site) E += p.squaredNorm();
+    return 0.5 * E / sld_mass;
+}
+
+double PhononLattice::sld_spring_energy() const {
+    if (!sld_enabled) return 0.0;
+    double E = 0.0;
+    for (size_t i = 0; i < lattice_size; ++i) {
+        for (size_t n = 0; n < nn_partners[i].size(); ++n) {
+            const size_t j = nn_partners[i][n];
+            if (j <= i) continue;
+            const double dr = (u_site[j] - u_site[i]).dot(nn_bond_vec[i][n]);
+            E += 0.5 * sld_k * dr * dr;
+        }
+        for (size_t n = 0; n < j2_partners[i].size(); ++n) {
+            const size_t j = j2_partners[i][n];
+            if (j <= i) continue;
+            const double dr = (u_site[j] - u_site[i]).dot(j2_bond_vec[i][n]);
+            E += 0.5 * sld_k2 * dr * dr;
+        }
+    }
+    return E;
+}
+
+double PhononLattice::sld_striction_energy() const {
+    // Σ_bonds g δr_ij S_i·M_ij S_j  +  v3 Σ_bonds (Q·d̂_γ) δr_ij²
+    if (!sld_enabled) return 0.0;
+    double E = 0.0;
+    const double Qx = phonons.Q_x_E1, Qy = phonons.Q_y_E1;
+    for (size_t i = 0; i < lattice_size; ++i) {
+        for (size_t n = 0; n < nn_partners[i].size(); ++n) {
+            const size_t j = nn_partners[i][n];
+            if (j <= i) continue;
+            const double dr = (u_site[j] - u_site[i]).dot(nn_bond_vec[i][n]);
+            E += sld_g * dr * spins[i].dot(nn_interaction[i][n] * spins[j]);
+            if (sld_v3 != 0.0) E += sld_v3 * (Qx * nn_bond_cq[i][n](0) + Qy * nn_bond_cq[i][n](1)) * dr * dr;
+        }
+    }
+    return E;
+}
+
+double PhononLattice::sld_energy() const {
+    if (!sld_enabled) return 0.0;
+    return sld_kinetic_energy() + sld_spring_energy() + sld_striction_energy();
 }
 
 PhononLattice::Coords PhononLattice::coords_current() const {
@@ -967,6 +1063,7 @@ double PhononLattice::site_energy(const Eigen::Vector3d& spin_here, size_t site)
         const Eigen::Vector3d& Sj = spins[j];
         E += spin_here.dot(nn_interaction[site][n] * Sj);
         E += isA ? spin_here.dot(dM[g] * Sj) : spin_here.dot(dM[g].transpose() * Sj);
+        if (sld_enabled) E += sld_g * (u_site[j] - u_site[site]).dot(nn_bond_vec[site][n]) * spin_here.dot(nn_interaction[site][n] * Sj);
     }
     for (size_t n = 0; n < j2_partners[site].size(); ++n) {
         const size_t j = j2_partners[site][n];
@@ -1075,6 +1172,7 @@ SpinVector PhononLattice::get_local_field(size_t site) const {
         const Eigen::Vector3d& Sj = spins[j];
         H -= nn_interaction[site][n] * Sj;
         H -= isA ? Eigen::Vector3d(dM[g] * Sj) : Eigen::Vector3d(dM[g].transpose() * Sj);
+        if (sld_enabled) H -= sld_g * (u_site[j] - u_site[site]).dot(nn_bond_vec[site][n]) * (nn_interaction[site][n] * Sj);
     }
     for (size_t n = 0; n < j2_partners[site].size(); ++n) {
         const size_t j = j2_partners[site][n];
@@ -1331,6 +1429,15 @@ void PhononLattice::ode_system(const ODEState& x, ODEState& dxdt, double t) {
             dJ3[k] = further_bond_modulation(c, j3_cs[k].first, j3_cs[k].second, 3, 0);
     }
 
+    // Spin–lattice dynamics: site displacements/momenta live after the mode block.
+    const double* U = sld_enabled ? &x[sld_offset()] : nullptr;
+    const double* P = U ? U + 3 * lattice_size : nullptr;
+    double* dU = sld_enabled ? &dxdt[sld_offset()] : nullptr;
+    double* dP = dU ? dU + 3 * lattice_size : nullptr;
+    double F3x = 0.0, F3y = 0.0;                       // ∂H3/∂Q (E1–acoustic vertex), extensive
+    const double Qx0 = c.q1[0], Qy0 = c.q2[0];
+    const double inv_m = sld_enabled ? 1.0 / sld_mass : 0.0;
+
     // Spin equations:  dS/dt = S × H_eff + α S × (S × H_eff)
     for (size_t i = 0; i < lattice_size; ++i) {
         const size_t idx = i * spin_dim;
@@ -1338,18 +1445,46 @@ void PhononLattice::ode_system(const ODEState& x, ODEState& dxdt, double t) {
         const bool isA = (i % N_atoms == 0);
         const int sub = int(i % N_atoms);
         Eigen::Vector3d H = field[i];
+        Eigen::Vector3d Fi = Eigen::Vector3d::Zero();
+        const Eigen::Vector3d ui = U ? Eigen::Vector3d(U[3 * i], U[3 * i + 1], U[3 * i + 2]) : Eigen::Vector3d::Zero();
 
         for (size_t n = 0; n < nn_partners[i].size(); ++n) {
             const size_t j = nn_partners[i][n];
             const int g = nn_bond_types[i][n];
             const Eigen::Vector3d& Sj = spins[j];
-            H -= nn_interaction[i][n] * Sj;
+            const Eigen::Vector3d MSj = nn_interaction[i][n] * Sj;
+            H -= MSj;
             H -= isA ? Eigen::Vector3d(dM[g] * Sj) : Eigen::Vector3d(dM[g].transpose() * Sj);
+            if (U) {
+                // exchange striction: δM_ij = g δr_ij M_ij, δr_ij = (u_j − u_i)·d̂_ij; forces on u_i
+                // from the spring (½k δr²), the striction (g δr S·M·S) and the cubic vertex (s3 δr²)
+                const Eigen::Vector3d uj(U[3 * j], U[3 * j + 1], U[3 * j + 2]);
+                const Eigen::Vector3d& d = nn_bond_vec[i][n];
+                const double dr = (uj - ui).dot(d);
+                H -= sld_g * dr * MSj;
+                const double s3 = sld_v3 * (Qx0 * nn_bond_cq[i][n](0) + Qy0 * nn_bond_cq[i][n](1));
+                Fi += (sld_k * dr + sld_g * Si.dot(MSj) + 2.0 * s3 * dr) * d;
+                if (isA && sld_v3 != 0.0) {          // each NN bond has exactly one A end: counted once
+                    F3x += sld_v3 * nn_bond_cq[i][n](0) * dr * dr;
+                    F3y += sld_v3 * nn_bond_cq[i][n](1) * dr * dr;
+                }
+            }
         }
         for (size_t n = 0; n < j2_partners[i].size(); ++n) {
             const size_t j = j2_partners[i][n];
             H -= j2_interaction[i][n] * spins[j];
             if (has_further_modulation) H -= dJ2[sub][j2_cls[i][n]] * spins[j];
+            if (U && sld_k2 != 0.0) {
+                const Eigen::Vector3d uj(U[3 * j], U[3 * j + 1], U[3 * j + 2]);
+                const Eigen::Vector3d& d2 = j2_bond_vec[i][n];
+                Fi += sld_k2 * (uj - ui).dot(d2) * d2;
+            }
+        }
+        if (U) {
+            // in-plane phonons only: z components stay frozen at zero
+            const Eigen::Vector3d pi(P[3 * i], P[3 * i + 1], 0.0);
+            dU[3 * i] = pi(0) * inv_m; dU[3 * i + 1] = pi(1) * inv_m; dU[3 * i + 2] = 0.0;
+            dP[3 * i] = Fi(0) - sld_gamma * pi(0); dP[3 * i + 1] = Fi(1) - sld_gamma * pi(1); dP[3 * i + 2] = 0.0;
         }
         for (size_t n = 0; n < j3_partners[i].size(); ++n) {
             const size_t j = j3_partners[i][n];
@@ -1380,8 +1515,8 @@ void PhononLattice::ode_system(const ODEState& x, ODEState& dxdt, double t) {
     // Primary E1 mode
     PhononState ph;
     ph.from_array(&x[spin_offset]);
-    const double F0x = lattice_force_raw(c, scale, C, Cj2, Cj3, R7, 0, 0) * inv_norm;
-    const double F0y = lattice_force_raw(c, scale, C, Cj2, Cj3, R7, 0, 1) * inv_norm;
+    const double F0x = (lattice_force_raw(c, scale, C, Cj2, Cj3, R7, 0, 0) + F3x) * inv_norm;
+    const double F0y = (lattice_force_raw(c, scale, C, Cj2, Cj3, R7, 0, 1) + F3y) * inv_norm;
     PhononState dph_dt;
     phonon_derivatives(ph, t, F0x, F0y, dph_dt);
     dph_dt.to_array(&dxdt[spin_offset]);
@@ -2088,6 +2223,30 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
     }
     auto T_at_step = [&](long s) { return finiteC ? T_dyn : langevin_bath_T(t_start + std::max(0.0, static_cast<double>(s)) * dt); };
 
+    // Spin–lattice dynamics: Langevin noise on the in-plane momenta, σ_l² = 2 γ_l m T_l / dt, classical or
+    // Bose-coloured (same BoseNoise machinery: alpha→γ_l m, S→1).  T_l follows sld_T if set, else the bath.
+    std::unique_ptr<BoseNoise> lnoise;
+    auto Tl_at_step = [&](long s) { return sld_T >= 0.0 ? sld_T : T_at_step(s); };
+    if (sld_enabled) {
+        if (sld_init_T > 0.0) {
+            bool cold = true;
+            for (const auto& p : p_site) if (p.squaredNorm() > 0.0) { cold = false; break; }
+            if (cold) {
+                std::mt19937_64 rng0(seed ^ 0x5bd1e9955bd1e995ULL);
+                std::normal_distribution<double> n0(0.0, std::sqrt(sld_mass * sld_init_T));
+                for (auto& p : p_site) p = Eigen::Vector3d(n0(rng0), n0(rng0), 0.0);
+                std::cout << "  SLD: momenta initialised from a Maxwell distribution at T = " << sld_init_T << std::endl;
+            }
+        }
+        if (sld_quantum && sld_gamma > 0.0) {
+            int Nb = 16; while (Nb < langevin_block) Nb <<= 1;
+            lnoise = std::make_unique<BoseNoise>(Nb, 2 * lattice_size, dt, sld_gamma * sld_mass, 1.0, seed ^ 0x9e3779b97f4a7c15ULL);
+            std::cout << "  SLD: Bose-coloured lattice noise, block " << Nb << " steps" << std::endl;
+        }
+        std::cout << "  SLD: gamma_l = " << sld_gamma << ", T_l = " << Tl_at_step(0) << " (meV), m = " << sld_mass
+                  << ", k = " << sld_k << ", k2 = " << sld_k2 << ", g = " << sld_g << ", v3 = " << sld_v3 << std::endl;
+    }
+
     std::cout << "PhononLattice Langevin dynamics (Strang split: RK4 + Euler-Maruyama)"
               << std::endl;
     std::cout << "  t = " << t_start << " → " << t_end << ", dt = " << dt << std::endl;
@@ -2128,7 +2287,9 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
         double E_total;
         double Qx, Qy, Vx, Vy;
         double T_bath;
+        double T_lat = 0.0, E_kin_lat = 0.0, E_pot_lat = 0.0, E_str = 0.0;
         SpinConfig spin_snapshot;
+        std::vector<float> u_snapshot;      // (u_x, u_y) per site when SLD is on
     };
     vector<Frame> traj;
     traj.reserve(static_cast<size_t>((t_end - t_start) / (dt * save_every)) + 1);
@@ -2159,6 +2320,17 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
             f.Vy = state[spin_offset + 3];
             f.T_bath = finiteC ? T_dyn : langevin_bath_T(t);
             f.spin_snapshot = spins;
+            if (sld_enabled) {
+                f.T_lat = sld_lattice_temperature();
+                f.E_kin_lat = sld_kinetic_energy();
+                f.E_pot_lat = sld_spring_energy();
+                f.E_str = sld_striction_energy();
+                f.u_snapshot.resize(2 * lattice_size);
+                for (size_t i = 0; i < lattice_size; ++i) {
+                    f.u_snapshot[2 * i] = static_cast<float>(u_site[i](0));
+                    f.u_snapshot[2 * i + 1] = static_cast<float>(u_site[i](1));
+                }
+            }
             traj.push_back(f);
         }
 
@@ -2170,7 +2342,11 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
         // ── Step A: deterministic RK4 on H_eff (no noise) ──
         use_langevin_noise = false;
         stepper.do_step(rhs, state, t, dt);
-        if (finiteC) sigma_eff = sigma_of_T(T_dyn);
+        if (finiteC) {
+            // heat escape of the finite bath to the cryostat: T_dyn relaxes to T0 with langevin_tau_off
+            if (langevin_tau_off > 0.0) T_dyn -= (T_dyn - langevin_temperature) * dt / langevin_tau_off;
+            sigma_eff = sigma_of_T(T_dyn);
+        }
         else if (langevin_dT != 0.0) sigma_eff = sigma_of_T(langevin_bath_T(t));
 
         // ── Step B: stochastic Euler-Maruyama on the noise force ──
@@ -2218,6 +2394,19 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
             }
         }
 
+        // ── Step B′: Langevin kick on the in-plane lattice momenta (friction is in ode_system) ──
+        if (sld_enabled && sld_gamma > 0.0) {
+            const size_t poff = sld_offset() + 3 * lattice_size;
+            if (lnoise) lnoise->ensure(static_cast<long>(step), Tl_at_step);
+            const double sigma_l = std::sqrt(2.0 * sld_gamma * sld_mass * Tl_at_step(static_cast<long>(step)) / dt);
+            for (size_t i = 0; i < lattice_size; ++i) {
+                for (int d = 0; d < 2; ++d) {
+                    const double eta = lnoise ? lnoise->sample(static_cast<long>(step), 2 * i + d) : sigma_l * normal(rng);
+                    state[poff + 3 * i + d] += dt * eta;
+                }
+            }
+        }
+
         if (finiteC) {
             // energy conservation: whatever the system (spins + phonon + coupling) lost that was not
             // supplied by the drive went into the bath; W_drive = N Z* E(t+dt/2)·ΔQ
@@ -2243,7 +2432,8 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
     if (!output_dir.empty() && !traj.empty()) {
         std::ofstream f(output_dir + "/langevin_trajectory.txt");
         f << "# t  Mx My Mz |M|  Mstag_x Mstag_y Mstag_z |M_stag|  "
-          << "E_total  Qx_E1 Qy_E1 Vx_E1 Vy_E1  T_bath\n";
+          << "E_total  Qx_E1 Qy_E1 Vx_E1 Vy_E1  T_bath"
+          << (sld_enabled ? "  T_lat E_kin_lat E_pot_lat E_striction\n" : "\n");
         f << std::scientific << std::setprecision(10);
         for (const auto& fr : traj) {
             const double Mn = fr.M.norm();
@@ -2254,7 +2444,27 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
               << ' ' << Msn << ' '
               << fr.E_total << ' '
               << fr.Qx << ' ' << fr.Qy << ' ' << fr.Vx << ' ' << fr.Vy << ' '
-              << fr.T_bath << '\n';
+              << fr.T_bath;
+            if (sld_enabled) f << ' ' << fr.T_lat << ' ' << fr.E_kin_lat << ' ' << fr.E_pot_lat << ' ' << fr.E_str;
+            f << '\n';
+        }
+        if (sld_enabled) {
+            // lattice displacement snapshots (float32): /u [nframe, N, 2], /t [nframe]
+            try {
+                H5::H5File lf(output_dir + "/langevin_lattice.h5", H5F_ACC_TRUNC);
+                hsize_t dims[3] = {traj.size(), lattice_size, 2};
+                H5::DataSet du = lf.createDataSet("u", H5::PredType::NATIVE_FLOAT, H5::DataSpace(3, dims));
+                std::vector<float> buf; buf.reserve(traj.size() * 2 * lattice_size);
+                std::vector<double> tt; tt.reserve(traj.size());
+                for (const auto& fr : traj) { buf.insert(buf.end(), fr.u_snapshot.begin(), fr.u_snapshot.end()); tt.push_back(fr.t); }
+                du.write(buf.data(), H5::PredType::NATIVE_FLOAT);
+                hsize_t d1[1] = {traj.size()};
+                H5::DataSet dtm = lf.createDataSet("t", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(1, d1));
+                dtm.write(tt.data(), H5::PredType::NATIVE_DOUBLE);
+                std::cout << "Lattice displacement snapshots written to " << output_dir << "/langevin_lattice.h5" << std::endl;
+            } catch (const H5::Exception& e) {
+                std::cerr << "WARNING: could not write langevin_lattice.h5: " << e.getDetailMsg() << std::endl;
+            }
         }
         std::cout << "Langevin trajectory written to " << output_dir
                   << "/langevin_trajectory.txt (" << traj.size() << " snapshots)" << std::endl;
@@ -2763,6 +2973,15 @@ void PhononLattice::save_state_hdf5(const string& filename) const {
         }
         dataset.write(data.data(), H5::PredType::NATIVE_DOUBLE);
     }
+    // Spin–lattice dynamics: site displacements and momenta [N, 3]
+    if (sld_enabled) {
+        H5::Group lg = file.createGroup("/lattice");
+        hsize_t dims[2] = {lattice_size, 3};
+        vector<double> ub(lattice_size * 3), pb(lattice_size * 3);
+        for (size_t i = 0; i < lattice_size; ++i) for (int d = 0; d < 3; ++d) { ub[3 * i + d] = u_site[i](d); pb[3 * i + d] = p_site[i](d); }
+        lg.createDataSet("u", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, dims)).write(ub.data(), H5::PredType::NATIVE_DOUBLE);
+        lg.createDataSet("p", H5::PredType::NATIVE_DOUBLE, H5::DataSpace(2, dims)).write(pb.data(), H5::PredType::NATIVE_DOUBLE);
+    }
 
     file.close();
 }
@@ -2790,6 +3009,13 @@ void PhononLattice::load_state_hdf5(const string& filename) {
         double ph_data[PhononState::N_DOF];
         dataset.read(ph_data, H5::PredType::NATIVE_DOUBLE);
         phonons.from_array(ph_data);
+    }
+    if (sld_enabled && H5Lexists(file.getId(), "/lattice", H5P_DEFAULT) > 0) {
+        vector<double> ub(lattice_size * 3), pb(lattice_size * 3);
+        file.openDataSet("/lattice/u").read(ub.data(), H5::PredType::NATIVE_DOUBLE);
+        file.openDataSet("/lattice/p").read(pb.data(), H5::PredType::NATIVE_DOUBLE);
+        for (size_t i = 0; i < lattice_size; ++i) for (int d = 0; d < 3; ++d) { u_site[i](d) = ub[3 * i + d]; p_site[i](d) = pb[3 * i + d]; }
+        cout << "  loaded lattice displacements/momenta from " << filename << endl;
     }
     if (modes.size() > 1 && H5Lexists(file.getId(), "/phonons/extra_modes", H5P_DEFAULT) > 0) {
         H5::DataSet dataset = file.openDataSet("/phonons/extra_modes");
