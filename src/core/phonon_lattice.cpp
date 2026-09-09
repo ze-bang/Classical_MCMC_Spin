@@ -64,10 +64,18 @@ inline Eigen::Matrix3d TE2(int k, int g) { return tbl(classical_spin::ncto_me::N
 inline Eigen::Matrix3d TA1(int k, int g) { return tbl(classical_spin::ncto_me::NCTO_ME_A1[k][g]); }
 inline Eigen::Matrix3d TA2(int k, int g) { return tbl(classical_spin::ncto_me::NCTO_ME_A2[k][g]); }
 
-/// Bond-line projection of an E doublet, f = q1 cos2θ + t2 q2 sin2θ with
-/// t2 = −1 for a weight-1 (polar, E1-type) doublet and +1 for weight-2 (E2-type).
+/// Bond-line projection of an E doublet, f = q1 cos2θ − t2 q2 sin2θ, with
+/// t2 = q2sign() = +1 for a weight-1 (polar, E1-type) doublet and −1 for
+/// weight-2 (E2-type).  For weight 1 this is exactly Q·d̂_γ, because the bond
+/// angles satisfy cos2θ_γ = cos θ_γ and sin2θ_γ = −sin θ_γ.
+///
+/// The minus sign in front of t2 is REQUIRED for consistency with the compiled
+/// tensor table, which stores T^{E2}_{k,γ} = −sin2θ_γ × (structure) and is
+/// contracted as q1 T^{E1} + t2 q2 T^{E2}.  Before 2026-09-02 this function had
+/// `+ t2 q2 s2`, which mirrored the J2/J3 nematic channel about the x-bond line
+/// relative to every other channel (silent whenever q2 = 0 or λ_J2 = λ_J3 = 0).
 inline double bond_projection(double q1, double q2, double t2, double c2, double s2) {
-    return q1 * c2 + t2 * q2 * s2;
+    return q1 * c2 - t2 * q2 * s2;
 }
 
 }  // namespace
@@ -934,7 +942,8 @@ double PhononLattice::further_bond_modulation_deriv(const Coords& c, double c2, 
     const double q1 = c.q1[m], q2 = c.q2[m];
     switch (md.irrep) {
     case LatticeMode::Irrep::E:
-        return comp == 0 ? (lin * c2 + sq * 2.0 * q1) : (lin * md.q2sign() * s2 + sq * 2.0 * q2);
+        // d/dq of bond_projection() = q1 c2 − t2 q2 s2  (see the note there)
+        return comp == 0 ? (lin * c2 + sq * 2.0 * q1) : (-lin * md.q2sign() * s2 + sq * 2.0 * q2);
     case LatticeMode::Irrep::A1: return comp == 0 ? lin : 0.0;
     case LatticeMode::Irrep::A2: return 0.0;
     }

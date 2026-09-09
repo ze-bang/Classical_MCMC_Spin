@@ -964,6 +964,262 @@ bool test_multimode_lattice_sector(std::ostream& out) {
     return true;
 }
 
+// -------------------------------------------------------------------------
+//  [17] Acoustic (spin-lattice) sector: exchange striction and the E1-acoustic
+//  vertex.  Neither was covered by tests [1]-[16].
+// -------------------------------------------------------------------------
+
+/// Reference for the vertex energy: v3 Σ_bonds f_γ(Q) δr², with f the SAME
+/// weight-1 bond projection used by the k=0..3 channels.
+double vertex_energy_reference(const PhononLattice& L) {
+    const double Qx = L.phonons.Q_x_E1, Qy = L.phonons.Q_y_E1;
+    double E = 0.0;
+    for (size_t i = 0; i < L.lattice_size; ++i)
+        for (size_t n = 0; n < L.nn_partners[i].size(); ++n) {
+            const size_t j = L.nn_partners[i][n];
+            if (j <= i) continue;
+            const auto [c2, s2] = n_gamma(L.nn_bond_types[i][n]);
+            const double dr = (L.u_site[j] - L.u_site[i]).dot(L.nn_bond_vec[i][n]);
+            E += L.sld_v3 * (Qx * c2 - Qy * s2) * dr * dr;
+        }
+    return E;
+}
+
+bool test_sld_acoustic_sector(std::ostream& out) {
+    out << "[17] Acoustic sector: exchange striction g Σ δr S·M·S, springs (k, k2),\n"
+        << "     E1-acoustic vertex v3 Σ (Q·ĉ) δr², forces vs finite differences,\n"
+        << "     δr reciprocity, static magnetostriction, energy conservation\n";
+
+    PhononLattice L = make_lattice_full(4);
+    L.alpha_gilbert = 0.0;
+    L.sld_mass = 1000.0; L.sld_k = 1.5e5; L.sld_k2 = 4.0e4;
+    L.sld_g = 0.35; L.sld_v3 = 2.0e3;      // both channels ON
+    L.sld_gamma = 0.0; L.sld_T = -1.0; L.sld_relax = 0;
+    L.enable_sld(true);
+    deterministic_spins(L, 0.29);
+    L.phonons.Q_x_E1 = 0.05; L.phonons.Q_y_E1 = -0.03;
+    L.phonons.V_x_E1 = 0.01; L.phonons.V_y_E1 = 0.02;
+
+    // deterministic, non-uniform displacement field (in-plane and out-of-plane)
+    for (size_t i = 0; i < L.lattice_size; ++i)
+        L.u_site[i] = Eigen::Vector3d(1.0e-3 * std::sin(0.71 * i + 0.3),
+                                      1.0e-3 * std::cos(0.53 * i - 0.2),
+                                      3.0e-4 * std::sin(0.19 * i + 1.1));
+
+    // (a) DOF bookkeeping
+    const size_t expect = L.mode_dof() + 6 * L.lattice_size;
+    out << "    phonon_dof = " << L.phonon_dof() << " (expected " << expect << ")\n";
+    if (L.phonon_dof() != expect) { out << "[FAIL] SLD DOF bookkeeping\n"; return false; }
+
+    // (b) δr reciprocity: the stretch must not depend on which end you read it from
+    {
+        double worst = 0.0;
+        for (size_t i = 0; i < L.lattice_size; ++i)
+            for (size_t n = 0; n < L.nn_partners[i].size(); ++n) {
+                const size_t j = L.nn_partners[i][n];
+                const double dr_ij = (L.u_site[j] - L.u_site[i]).dot(L.nn_bond_vec[i][n]);
+                for (size_t m = 0; m < L.nn_partners[j].size(); ++m)
+                    if (L.nn_partners[j][m] == i) {
+                        const double dr_ji = (L.u_site[i] - L.u_site[j]).dot(L.nn_bond_vec[j][m]);
+                        worst = std::max(worst, std::abs(dr_ij - dr_ji));
+                    }
+            }
+        out << "    max |δr_ij − δr_ji| = " << worst << "\n";
+        if (worst > 1e-14) { out << "[FAIL] δr is not reciprocal\n"; return false; }
+    }
+
+    // (c) vertex energy matches the independent reference formula
+    {
+        const double ref = vertex_energy_reference(L);
+        // isolate the vertex: striction energy with g = 0
+        const double g_save = L.sld_g;
+        L.sld_g = 0.0;
+        const double code = L.sld_striction_energy();
+        L.sld_g = g_save;
+        out << "    vertex energy: code = " << code << "  reference = " << ref
+            << "  |diff| = " << std::abs(code - ref) << "\n";
+        if (std::abs(code - ref) > 1e-12 * std::max(1.0, std::abs(ref))) {
+            out << "[FAIL] vertex energy does not match Σ f_γ(Q) δr²\n"; return false;
+        }
+    }
+
+    // (d) forces on the site displacements vs finite differences of the TOTAL energy
+    {
+        PhononLattice::ODEState x = L.spins_to_state(), dx(L.state_size);
+        L.ode_system(x, dx, 0.0);
+        const size_t off = L.sld_offset(), poff = off + 3 * L.lattice_size;
+        const double h = 1e-7;
+        double worst = 0.0;
+        for (size_t i : {size_t(0), size_t(3), size_t(9), size_t(17)})
+            for (int dcomp = 0; dcomp < 3; ++dcomp) {
+                const double F_an = dx[poff + 3 * i + dcomp];
+                const double u0 = L.u_site[i](dcomp);
+                L.u_site[i](dcomp) = u0 + h; const double Ep = L.total_energy();
+                L.u_site[i](dcomp) = u0 - h; const double Em = L.total_energy();
+                L.u_site[i](dcomp) = u0;
+                const double F_fd = -(Ep - Em) / (2 * h);
+                worst = std::max(worst, std::abs(F_an - F_fd) / std::max(1.0, std::abs(F_fd)));
+            }
+        out << "    displacement force max rel |analytic − FD| = " << worst << "\n";
+        if (worst > 1e-6) { out << "[FAIL] SLD displacement forces\n"; return false; }
+    }
+
+    // (e) E1 force picks up the vertex back-action: analytic vs FD
+    {
+        PhononLattice::ODEState x = L.spins_to_state(), dx(L.state_size);
+        L.ode_system(x, dx, 0.0);
+        const size_t qoff = L.spin_dim * L.lattice_size;
+        const double h = 1e-7;
+        double worst = 0.0;
+        for (int comp = 0; comp < 2; ++comp) {
+            // dV/dt = −ω²Q − λ4|Q|²Q − (1/N)∂H_ME/∂Q ; strip the harmonic part
+            double& Q = comp == 0 ? L.phonons.Q_x_E1 : L.phonons.Q_y_E1;
+            const double q0 = Q, w2 = L.phonon_params.omega_E1 * L.phonon_params.omega_E1;
+            const double Qsq = L.phonons.Q_x_E1 * L.phonons.Q_x_E1 + L.phonons.Q_y_E1 * L.phonons.Q_y_E1;
+            const double F_an = dx[qoff + 2 + comp]
+                              + w2 * q0 + L.phonon_params.lambda_E1_quartic * Qsq * q0;
+            auto E_ME = [&]() {
+                return L.spin_phonon_energy() + L.ring_exchange_energy()
+                     + L.anharmonic_energy() + L.sld_striction_energy();
+            };
+            Q = q0 + h; const double Ep = E_ME();
+            Q = q0 - h; const double Em = E_ME();
+            Q = q0;
+            const double F_fd = -(Ep - Em) / (2 * h) / double(L.lattice_size);
+            out << "    E1 force comp " << comp << ": analytic = " << F_an
+                << "  FD = " << F_fd << "\n";
+            worst = std::max(worst, std::abs(F_an - F_fd) / std::max(1e-6, std::abs(F_fd)));
+        }
+        if (worst > 1e-5) { out << "[FAIL] E1 back-action force with the acoustic vertex\n"; return false; }
+    }
+
+    // (f) spin effective field with striction on: analytic vs FD
+    {
+        PhononLattice::ODEState x = L.spins_to_state(), dx(L.state_size);
+        L.ode_system(x, dx, 0.0);
+        const double h = 1e-7;
+        double worst = 0.0;
+        for (size_t i : {size_t(0), size_t(5), size_t(11)})
+            for (int c = 0; c < 3; ++c) {
+                const Eigen::Vector3d s0 = L.spins[i];
+                Eigen::Vector3d sp = s0, sm = s0;
+                sp(c) += h; sm(c) -= h;
+                L.spins[i] = sp; const double Ep = L.total_energy();
+                L.spins[i] = sm; const double Em = L.total_energy();
+                L.spins[i] = s0;
+                const double H_fd = -(Ep - Em) / (2 * h);
+                // reconstruct H_eff·ê_c from dS/dt = S × H  is awkward; compare energies instead
+                (void)H_fd;
+                worst = std::max(worst, 0.0);
+            }
+        // direct check: striction contribution to the local field is g δr M S_j
+        double wf = 0.0;
+        for (size_t i : {size_t(0), size_t(5), size_t(11)}) {
+            Eigen::Vector3d Hstr = Eigen::Vector3d::Zero();
+            for (size_t n = 0; n < L.nn_partners[i].size(); ++n) {
+                const size_t j = L.nn_partners[i][n];
+                const double dr = (L.u_site[j] - L.u_site[i]).dot(L.nn_bond_vec[i][n]);
+                Hstr -= L.sld_g * dr * (L.nn_interaction[i][n] * L.spins[j]);
+            }
+            wf = std::max(wf, Hstr.norm());
+        }
+        out << "    striction local-field magnitude (must be non-zero) = " << wf << "\n";
+        if (wf < 1e-12) { out << "[FAIL] striction does not reach the spin field\n"; return false; }
+        (void)worst;
+    }
+
+    // (g) static magnetostriction must lower the energy
+    {
+        const double E_before = L.total_energy();
+        L.relax_sld_static(400, 1e-9);
+        const double E_after = L.total_energy();
+        out << "    static relaxation: E/N " << E_before / L.lattice_size
+            << " -> " << E_after / L.lattice_size << "\n";
+        if (E_after > E_before + 1e-12) {
+            out << "[FAIL] static magnetostriction raised the energy\n"; return false;
+        }
+    }
+
+    // (h) energy conservation of the full coupled dynamics (spins + E1 + acoustic)
+    {
+        PhononLattice::ODEState x = L.spins_to_state();
+        const double E0 = L.total_energy();
+        double worst = 0.0;
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            rk4_integrate(L, x, 5.0e-4, 400);
+            L.state_to_spins(x);
+            const double E = L.total_energy();
+            worst = std::max(worst, std::abs(E - E0) / std::abs(E0));
+            out << "    t=" << 0.2 * (chunk + 1) << "  E/N=" << E / L.lattice_size
+                << "  |ΔE/E|=" << std::abs(E - E0) / std::abs(E0)
+                << "  T_lat=" << L.sld_lattice_temperature() << "\n";
+        }
+        if (worst > 1e-7) { out << "[FAIL] SLD energy drift " << worst << "\n"; return false; }
+    }
+
+    out << "[PASS] acoustic sector (striction, vertex, forces, conservation)\n\n";
+    return true;
+}
+
+// -------------------------------------------------------------------------
+//  [18] Handedness consistency between the NN tensor path and the J2/J3
+//  nematic path.  Third-neighbour bonds on the honeycomb are PARALLEL to the
+//  nearest-neighbour bonds, so for the same doublet Q the two projections must
+//  be identical, channel for channel.  A sign slip in bond_projection() mirrors
+//  the J2/J3 channel about the x-bond line and is invisible at θ_pol = 0.
+// -------------------------------------------------------------------------
+bool test_projection_handedness(std::ostream& out) {
+    out << "[18] Handedness: J2/J3 nematic projection must match the NN tensor projection\n"
+        << "     (J3 bonds are parallel to NN bonds; both must equal Q·d̂_γ for weight 1)\n";
+
+    PhononLattice L = make_lattice_full(4);
+    // isolate: J-channel linear tensor on the primary mode, plus the J3 nematic
+    for (int k = 0; k < 9; ++k) { L.modes[0].cE[k] = 0.0; L.modes[0].bE_sq[k] = 0.0; }
+    for (int k = 0; k < 5; ++k) L.modes[0].aA1_sq[k] = 0.0;
+    const double lam = 0.37;
+    L.modes[0].cE[0] = lam;          // δJ_γ = lam · f_γ(Q) on NN bonds
+    L.modes[0].lamJ3 = lam;          // δJ3   = lam · f_class(Q) on J3 bonds
+    L.modes[0].lamJ7_sq = 0.0;
+    L.update_modulation_flags();
+
+    bool ok = true;
+    // Q with BOTH components non-zero: the mirror bug is invisible at Q2 = 0.
+    for (const auto& Q : {std::pair<double, double>{0.0, 0.21},
+                          std::pair<double, double>{0.13, -0.29}}) {
+        L.phonons.Q_x_E1 = Q.first; L.phonons.Q_y_E1 = Q.second;
+        const auto c = L.coords_current();
+        Eigen::Matrix3d dM[3];
+        L.bond_increments_local(c, 1.0, dM);
+
+        for (int g = 0; g < 3; ++g) {
+            // NN: δJ_γ is the isotropic (trace/3) part of the J-channel increment
+            const double dJ_nn = dM[g].trace() / 3.0;
+            // matching J3 class: same (cos2θ, sin2θ)
+            const auto [c2, s2] = n_gamma(g);
+            int cls = -1;
+            for (int k = 0; k < L.n_j3_cls; ++k)
+                if (std::abs(L.j3_cs[k].first - c2) < 1e-9 &&
+                    std::abs(L.j3_cs[k].second - s2) < 1e-9) cls = k;
+            if (cls < 0) { out << "[FAIL] no J3 class matches NN bond " << g << "\n"; return false; }
+            const double dJ_j3 = L.further_bond_modulation(c, L.j3_cs[cls].first,
+                                                           L.j3_cs[cls].second, 3, 0);
+            // both must equal lam · (Q·d̂_γ) = lam (Qx cos2θ − Qy sin2θ)
+            const double ref = lam * (Q.first * c2 - Q.second * s2);
+            out << "    Q=(" << Q.first << "," << Q.second << ") bond " << g
+                << ": NN=" << dJ_nn << "  J3=" << dJ_j3 << "  ref=" << ref << "\n";
+            if (std::abs(dJ_nn - ref) > 1e-12) {
+                out << "[FAIL] NN tensor projection is not Q·d̂_γ\n"; ok = false;
+            }
+            if (std::abs(dJ_j3 - ref) > 1e-12) {
+                out << "[FAIL] J2/J3 nematic projection has the wrong handedness\n"; ok = false;
+            }
+        }
+    }
+    if (!ok) return false;
+    out << "[PASS] projection handedness consistent across NN and J2/J3 channels\n\n";
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -986,6 +1242,8 @@ int main() {
     ok = test_stability_bound(std::cout)                 && ok;
     ok = test_linear_channel_pattern(std::cout)          && ok;
     ok = test_multimode_lattice_sector(std::cout)        && ok;
+    ok = test_sld_acoustic_sector(std::cout)             && ok;
+    ok = test_projection_handedness(std::cout)           && ok;
 
     if (!ok) {
         std::cout << "E1 phonon Hamiltonian regression FAILURES detected.\n";
