@@ -3817,6 +3817,36 @@ public:
     }
 
     /**
+     * Diagnostic ablation: evaluate the SU(2) drive torque on the equilibrium
+     * spin configuration rather than the instantaneous one.
+     *
+     * The Zeeman torque is S x h(t).  Writing S = S0 + dS, the piece S0 x h
+     * creates the magnon while the piece dS x h converts one magnon into
+     * another while the pulse is present -- the field-mediated (field-assisted)
+     * magnon-magnon channel.  Enabling this flag keeps only S0 x h, which
+     * removes that channel exactly while leaving the intrinsic anharmonicity of
+     * the spin Hamiltonian (anisotropy, Dzyaloshinskii-Moriya, exchange in the
+     * canted structure) untouched.  This is an ablation, not a physical model:
+     * the modified torque is no longer perpendicular to S, so |S| drifts at
+     * O(h |dS|); the drift is reported by the caller and is ~1e-9 at the
+     * perturbative drive amplitudes used for the 2DCS reference runs.
+     *
+     * Must be called after the ground state is loaded/annealed and
+     * synchronized, since it snapshots spins_SU2 as the reference S0.
+     */
+    bool linear_drive_torque_SU2 = false;
+    std::vector<double> drive_ref_SU2;   // flat lattice_size_SU2 * spin_dim_SU2
+
+    void set_linear_drive_torque_SU2(bool on) {
+        linear_drive_torque_SU2 = on;
+        if (!on) { drive_ref_SU2.clear(); return; }
+        drive_ref_SU2.assign(lattice_size_SU2 * spin_dim_SU2, 0.0);
+        for (size_t i = 0; i < lattice_size_SU2; ++i)
+            for (size_t d = 0; d < spin_dim_SU2; ++d)
+                drive_ref_SU2[i * spin_dim_SU2 + d] = spins_SU2[i](d);
+    }
+
+    /**
      * Compute time-dependent drive field for SU(2) site (pre-transformed to local frame)
      */
     SpinVector drive_field_SU2_at_time(double t, size_t site_index) const;

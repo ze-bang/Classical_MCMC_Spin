@@ -154,3 +154,54 @@ example_configs/test_correlation_accumulator.param
 
 # Local run scratch (spin/phonon snapshots written by the NCTO/TmFeO3 drivers)
 scratch_runs/
+
+# ============================================================================
+# Research-project material -- NOT part of the library
+# ----------------------------------------------------------------------------
+# This repository is the generic classical-spin Monte Carlo / molecular
+# dynamics engine. Compound-specific campaigns (manuscripts, sweep configs,
+# derivation notes, per-compound analysis scripts and their data) live in the
+# private per-project repositories, not here. The files may still sit in a
+# working copy -- they are simply never committed.
+#
+# These rules come AFTER the !example_configs/** and !docs/** whitelists above
+# so they actually take effect.
+# ============================================================================
+
+# Campaign / manuscript trees
+TmFeO3_manuscript/
+TmFeO3_manuscript_pre_*/
+TmFeO3_temperature_and_orbitals/
+TmFeO3_temperature_and_orbitals.tar.gz
+NCTO_project_paper/
+NCTO_phonon_v0/
+NCTO_phonon_*/
+
+# Loose research output at the repository root
+disorder_pinned_droplet_lifetime.pdf
+disorder_pinned_droplet_lifetimeNotes.bib
+reference_Efield*.zip
+
+# Compound-specific run configurations
+example_configs/BCAO/
+example_configs/TmFeO3*/
+example_configs/NCTO*/
+
+# Compound-specific derivation notes and figures
+docs/tmfeo3_*
+docs/ncto_*
+docs/bcao_*
+docs/kcto_*
+docs/chi_activity_table.*
+docs/chi_bonds_3d_structure.*
+docs/chi_fe_frames.*
+docs/chi_tm_frames.*
+
+# Compound-specific analysis / reader scripts
+util/*tmfeo3*
+util/aux/*tmfeo3*
+util/aux/visualize_TmFe_coupling.py
+util/classical_solvers/bcao_*
+util/classical_solvers/*_BCAO.py
+util/readers/reader_TmFeO3.py
+util/readers_new/reader_TmFeO3*
