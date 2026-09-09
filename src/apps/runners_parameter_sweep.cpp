@@ -16,7 +16,6 @@
 #include "classical_spin/lattice/lattice.h"
 #include "classical_spin/lattice/mixed_lattice.h"
 #include "classical_spin/lattice/phonon_lattice.h"
-#include "classical_spin/lattice/strain_phonon_lattice.h"
 
 #include <mpi.h>
 #include <iostream>
@@ -275,41 +274,6 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                 
                 // Run PT with proper sub-communicator rank/size
                 run_parallel_tempering_mixed(mixed_lattice, sweep_config, sweep_rank, sweep_size, sweep_comm);
-            } else if (sweep_config.system == SystemType::NCTO_STRAIN) {
-                // StrainPhononLattice magnetoelastic system
-                UnitCell strain_uc = build_strain_honeycomb(sweep_config);
-                StrainPhononLattice strain_lattice(strain_uc,
-                                                   sweep_config.lattice_size[0],
-                                                   sweep_config.lattice_size[1],
-                                                   sweep_config.lattice_size[2],
-                                                   sweep_config.spin_length);
-                
-                // Build parameters from config
-                MagnetoelasticParams me_params;
-                ElasticParams el_params;
-                StrainDriveParams dr_params;
-                build_strain_params(sweep_config, me_params, el_params, dr_params);
-                
-                // Set parameters
-                strain_lattice.set_parameters(me_params, el_params, dr_params);
-                strain_lattice.alpha_gilbert = sweep_config.get_param("alpha_gilbert", 0.0);
-                
-                // Set magnetic field
-                Eigen::Vector3d B;
-                B << sweep_config.field_strength * sweep_config.field_direction[0],
-                     sweep_config.field_strength * sweep_config.field_direction[1],
-                     sweep_config.field_strength * sweep_config.field_direction[2];
-                strain_lattice.set_uniform_field(B);
-                
-                // Initialize spins
-                if (!sweep_config.initial_spin_config.empty()) {
-                    strain_lattice.load_spin_config(sweep_config.initial_spin_config);
-                } else {
-                    strain_lattice.init_random();
-                }
-                
-                // Run PT with proper sub-communicator rank/size
-                run_parallel_tempering_strain(strain_lattice, sweep_config, sweep_rank, sweep_size, sweep_comm);
             } else {
                 // Standard lattice systems
                 UnitCell* uc_ptr = nullptr;
@@ -488,57 +452,6 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                     break;
                 default:
                     cerr << "[Rank " << rank << "] Error: Unsupported base simulation for parameter sweep with PhononLattice" << endl;
-                    break;
-            }
-        } else if (sweep_config.system == SystemType::NCTO_STRAIN) {
-            // StrainPhononLattice magnetoelastic (spin-strain) coupled system (honeycomb)
-            UnitCell strain_uc = build_strain_honeycomb(sweep_config);
-            StrainPhononLattice strain_lattice(strain_uc,
-                                               sweep_config.lattice_size[0],
-                                               sweep_config.lattice_size[1],
-                                               sweep_config.lattice_size[2],
-                                               sweep_config.spin_length);
-            
-            // Build parameters from config
-            MagnetoelasticParams me_params;
-            ElasticParams el_params;
-            StrainDriveParams dr_params;
-            build_strain_params(sweep_config, me_params, el_params, dr_params);
-            
-            // Set parameters
-            strain_lattice.set_parameters(me_params, el_params, dr_params);
-            strain_lattice.alpha_gilbert = sweep_config.get_param("alpha_gilbert", 0.0);
-            
-            // Set magnetic field
-            Eigen::Vector3d B;
-            B << sweep_config.field_strength * sweep_config.field_direction[0],
-                 sweep_config.field_strength * sweep_config.field_direction[1],
-                 sweep_config.field_strength * sweep_config.field_direction[2];
-            strain_lattice.set_uniform_field(B);
-            
-            // Initialize spins
-            if (!sweep_config.initial_spin_config.empty()) {
-                strain_lattice.load_spin_config(sweep_config.initial_spin_config);
-            } else {
-                strain_lattice.init_random();
-            }
-            
-            // Run appropriate simulation
-            switch (sweep_config.simulation) {
-                case SimulationType::SIMULATED_ANNEALING:
-                    run_simulated_annealing_strain(strain_lattice, sweep_config, 0, 1);
-                    break;
-                case SimulationType::MOLECULAR_DYNAMICS:
-                    run_molecular_dynamics_strain(strain_lattice, sweep_config, 0, 1);
-                    break;
-                case SimulationType::PUMP_PROBE:
-                    run_pump_probe_strain(strain_lattice, sweep_config, 0, 1);
-                    break;
-                case SimulationType::KINETIC_BARRIER_ANALYSIS:
-                    run_kinetic_barrier_analysis_strain(strain_lattice, sweep_config, 0, 1);
-                    break;
-                default:
-                    cerr << "[Rank " << rank << "] Error: Unsupported base simulation for parameter sweep with StrainPhononLattice" << endl;
                     break;
             }
         } else if (sweep_config.system == SystemType::TMFEO3) {

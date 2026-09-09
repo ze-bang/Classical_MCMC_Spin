@@ -40,7 +40,5 @@ UnitCell build_tmfeo3_tm(const SpinConfig& config);
 // Includes NN with bond_type metadata, J2 (sublattice-dependent), J3, and sublattice frames
 UnitCell build_phonon_honeycomb(const SpinConfig& config);
 
-// Build honeycomb unit cell for strain phonon lattice (same geometry, different param names)
-UnitCell build_strain_honeycomb(const SpinConfig& config);
 
 #endif // UNITCELL_BUILDERS_H

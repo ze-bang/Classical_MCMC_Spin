@@ -25,7 +25,6 @@ enum class SystemType {
     TMFEO3_FE,                // TmFeO3 Fe-only (SU2 only, no Tm)
     TMFEO3_TM,                // TmFeO3 Tm-only (SU3 only, no Fe)
     NCTO,                     // NCTO spin-phonon coupled honeycomb
-    NCTO_STRAIN,              // NCTO magnetoelastic (spin-strain) coupled honeycomb
     TRIANGULAR_ANISOTROPIC,   // NMAO triangular: Jzz, Jpm, Jpmpm, Jzpm (YbMgGaO4-type)
     CUSTOM                    // Custom from JSON
 };
@@ -264,6 +263,7 @@ struct SpinConfig {
     
     // Initial configuration
     string initial_spin_config = "";  // Empty means random
+    string local_field_config = "";   // Directions file for the local_field_h triple-q stabiliser (empty: loaded spins)
     string pinning_field_config = ""; // Optional rows: site Bx By Bz
     string nn_exchange_disorder_config = ""; // Optional rows: site partner scale
     string nn_exchange_channel_disorder_config = ""; // Optional rows: site partner dJ dK dGamma dGammap
@@ -320,7 +320,6 @@ inline SystemType parse_system(const string& str) {
     if (s == "tmfeo3_fe" || s == "TMFEO3_FE" || s == "TmFeO3_Fe") return SystemType::TMFEO3_FE;
     if (s == "tmfeo3_tm" || s == "TMFEO3_TM" || s == "TmFeO3_Tm") return SystemType::TMFEO3_TM;
     if (s == "ncto" || s == "NCTO" || s == "Na2Co2TeO6") return SystemType::NCTO;
-    if (s == "ncto_strain" || s == "NCTO_STRAIN" || s == "strain") return SystemType::NCTO_STRAIN;
     if (s == "triangular_anisotropic" || s == "TRIANGULAR_ANISOTROPIC" ||
         s == "triangular" || s == "nmao") return SystemType::TRIANGULAR_ANISOTROPIC;
     if (s == "custom" || s == "CUSTOM") return SystemType::CUSTOM;
@@ -340,7 +339,6 @@ inline string system_type_to_string(SystemType sys) {
         case SystemType::TMFEO3_FE: return "tmfeo3_fe";
         case SystemType::TMFEO3_TM: return "tmfeo3_tm";
         case SystemType::NCTO: return "ncto";
-        case SystemType::NCTO_STRAIN: return "ncto_strain";
         case SystemType::TRIANGULAR_ANISOTROPIC: return "triangular_anisotropic";
         case SystemType::CUSTOM: return "custom";
         default: return "unknown";

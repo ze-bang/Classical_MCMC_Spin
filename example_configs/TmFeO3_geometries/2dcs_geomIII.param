@@ -1,0 +1,125 @@
+# TmFeO3 2DCS — Geometry III (H || c, E || a, VH)
+#
+# Pump:  THz pulse with H||c, E||a.
+#        Magnetic drive J_z^eff = 5.264 lambda^2          (auto from mu_act)
+#        Electric drive d_x^eff ~ lambda^1                (NOT applied — see plan §2)
+#        Fe Zeeman h_z·S^z directly torques weak-FM component → qFM excitation.
+# Detection (post-process from M_global):
+#        VH ⇒ E_det || c, H_det || a
+#        Read M_global_SU2[0]  (Fe magnetic, M_x^Fe → qFM/qAFM emission along c)
+#             M_global_SU3[3,5] (Tm electric d_z^eff → c-polarized)
+#             M_global_SU3[4,6] (Tm magnetic J_x^eff → a-polarized; sub-leading)
+#
+# Expected dominant peaks (notes Sec. sec:geomIII):
+#   (E1→E2, qAFM)         — direct even Tm pump → χ_{2z}·G_z → qAFM (Fe emission)
+#   (qFM,   qAFM)         — direct qFM → nonlinear Fe LLG → qAFM
+#   (0,     qAFM)         — rectified Tm population (λ^{3,8}) → anisotropy shift → qAFM
+# Suppressed in this VH:
+#   (qFM, qFM)            — destructive Fe/Tm interference along E_c (Sec. emissionsum)
+
+# === Simulation Type ===
+system = tmfeo3
+simulation_mode = 2dcs
+
+lattice_size = 3,3,3
+# Fe global lab frame + corrected Fe-Tm eta premultiplication; see 2dcs_geomI.param.
+use_global_frame = 1
+
+# === Fe sector — see geomI for retuning rationale ===
+J1ab = 4.74
+J1c  = 5.15
+J2ab = 0.15
+J2c  = 0.30
+Ka   = -0.016
+Kb   =  0.0
+Kc   = -0.013
+D1   =  0.12
+D2   =  0.0
+
+# === Tm CEF (see geomI for derivation) — match user targets 0.50/0.70/1.20 THz ===
+e1 = 2.069
+e2 = 4.965
+tm_alpha_scale = 1.0
+tm_beta_scale  = 1.0
+
+# === Tm projected magnetic moment ===
+mu_2x = 0.0
+mu_2y = 0.0
+mu_2z = 5.264
+mu_5x = 2.3915
+mu_5y = -2.7866
+mu_5z = 0.0
+mu_7x = 0.9128
+mu_7y = 0.4655
+mu_7z = 0.0
+g_ratio_tm = 0.5833
+
+# === Tm-Fe linear transfer ===
+chi2x = 0.0
+chi2y = 0.0
+chi2z = 0.05
+chi5x = 0.0
+chi5y = 0.0
+chi5z = 0.0
+chi7x = 0.0
+chi7y = 0.0
+chi7z = 0.0
+
+# === On-site W (legacy u1 → W1_zz = +u1, W1_xx = -u1) ===
+W1_xx = -0.005
+W1_zz =  0.005
+
+# === Tm-Tm: zero ===
+Jtm_1 = 0.0
+Jtm_2 = 0.0
+Jtm_3 = 0.0
+Jtm_4 = 0.0
+Jtm_5 = 0.0
+Jtm_6 = 0.0
+Jtm_7 = 0.0
+Jtm_8 = 0.0
+
+# === Static field ===
+field_strength  = 0.0
+field_direction = 0,0,1
+
+# === Equilibration ===
+T_start = 20.0
+T_end   = 0.05
+annealing_steps = 10000
+overrelaxation_rate = 1
+use_twist_boundary = false
+gaussian_move = false
+T_zero = true
+
+spin_length     = 2.5
+spin_length_su3 = 1.0
+
+# === Pump (Geometry III: H || c) — SU3 drive DISABLED ===
+auto_su3_pump  = 0
+pump_direction = 0,0,1
+pump_amplitude = 0.30
+pump_width     = 0.40
+pump_frequency = 0.40
+
+pump_amplitude_su3 = 0.0
+pump_width_su3     = 0.40
+pump_frequency_su3 = 0.40
+
+# === 2DCS scan (see 2dcs_geomI.param for convention notes) ===
+tau_start = 0.0
+tau_end   = -100.0
+tau_step  = -0.02
+parallel_tau = true
+num_trials   = 1
+
+# === Time evolution ===
+md_time_start = -100.0
+md_time_end   =  100.0
+md_timestep   = 0.02
+md_integrator = rk4
+use_gpu = false
+
+# === Output ===
+output_dir = TmFeO3_2DCS_geomIII
+save_observables = false

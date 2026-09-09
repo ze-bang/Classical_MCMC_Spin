@@ -52,6 +52,7 @@ int main(int argc, char** argv) {
     TimeDependentSpinPhononParams td_sp_params;
     build_phonon_params(config, sp_params, ph_params, dr_params, td_sp_params);
     lattice.set_parameters(sp_params, ph_params, dr_params);
+    build_lattice_modes(config, lattice);
 
     // Apply the same quenched-disorder channels the SA/MD runners use, so the
     // evaluated energy/gradient match the in-model Hamiltonian (e.g. a line
@@ -104,8 +105,10 @@ int main(int argc, char** argv) {
         }
 
         const double E = lattice.total_energy() / static_cast<double>(N);
-        const double Fqx = -lattice.dH_dQx_E1();
-        const double Fqy = -lattice.dH_dQy_E1();
+        // Strain force per site, −∂(H_sp-ph/N_ph)/∂ε, i.e. the same normalisation
+        // as the phonon equation of motion and relax_phonons (phonon_norm()).
+        const double Fqx = -lattice.dH_dQx_E1() / lattice.phonon_norm();
+        const double Fqy = -lattice.dH_dQy_E1() / lattice.phonon_norm();
 
         // Write per-site effective fields.
         ofstream ff(field_out);

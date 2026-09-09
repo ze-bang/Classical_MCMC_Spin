@@ -337,6 +337,9 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "g_factor") {
                 config.g_factor = parse_vector(value);
             }
+            else if (key == "local_field_config") {
+                config.local_field_config = value;
+            }
             else if (key == "initial_spin_config") {
                 config.initial_spin_config = value;
             }
@@ -503,7 +506,6 @@ void SpinConfig::to_file(const string& filename) const {
         case SystemType::TMFEO3_FE: file << "tmfeo3_fe"; break;
         case SystemType::TMFEO3_TM: file << "tmfeo3_tm"; break;
         case SystemType::NCTO: file << "ncto"; break;
-        case SystemType::NCTO_STRAIN: file << "ncto_strain"; break;
         case SystemType::TRIANGULAR_ANISOTROPIC: file << "triangular_anisotropic"; break;
         case SystemType::CUSTOM: file << "custom"; break;
     }
@@ -631,7 +633,6 @@ void SpinConfig::print() const {
         case SystemType::TMFEO3_FE: cout << "TmFeO3 (Fe only)"; break;
         case SystemType::TMFEO3_TM: cout << "TmFeO3 (Tm only)"; break;
         case SystemType::NCTO: cout << "NCTO (Na2Co2TeO6) Spin-Phonon"; break;
-        case SystemType::NCTO_STRAIN: cout << "NCTO Magnetoelastic (Spin-Strain)"; break;
         case SystemType::TRIANGULAR_ANISOTROPIC: cout << "Triangular (anisotropic)"; break;
         case SystemType::CUSTOM: cout << "Custom"; break;
     }

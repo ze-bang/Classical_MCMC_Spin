@@ -62,7 +62,10 @@
 #include "unitcell_builders.h"
 #include "simple_linear_alg.h"
 #include "kitaev_bonds.h"
+#include "classical_spin/lattice/ncto_me_tensors.h"   // D3-covariant magnetoelastic tensors
 #include "classical_spin/lattice/pulse_chunking.h"  // Ingredient XVIII tols + W3 helper
+#include <string>
+#include <stdexcept>
 #include <vector>
 #include <array>
 #include <functional>
@@ -107,7 +110,72 @@ using std::function;
 using std::array;
 
 /**
+ * A zone-centre lattice coordinate of the honeycomb layer with its complete
+ * D3-symmetry-allowed magnetoelastic couplings (audit 2026-08, see
+ * ncto_phonon/audit/NCTO_full_model_hamiltonian.tex and ncto_me_tensors.h).
+ *
+ *   irrep E  : in-plane doublet (Q1,Q2). weight = 1: polar / IR-active E1 mode
+ *              (couples to the THz field through Zstar); weight = 2: E2-type
+ *              (Raman mode or in-plane shear strain). The weight fixes the sign
+ *              with which Q2 enters the tensor tables (q2sign()).
+ *   irrep A1 : scalar (Raman A1 mode, eps_xx+eps_yy, eps_zz)
+ *   irrep A2 : scalar, c-polarised optical displacement u_z
+ *
+ * First order:  dM_gamma = Σ_k cE[k] (Q1 T1_k + t2 Q2 T2_k)   (E, 9 tensors)
+ *                        = Q Σ_k aA1[k] TA1_k                  (A1, 5 tensors incl. DM ∥ bond)
+ *                        = Q Σ_k dA2[k] TA2_k                  (A2, 4 tensors)
+ *               J7 += lamJ7 Q (A1);  J2A/J2B/J3 += lamJ2A.. Q (A1) or bond-projected nematic (E)
+ * Second order (E only): |Q|² Σ aA1_sq TA1 + (Q⊗Q)_E · Σ bE_sq (T1,T2);  J7 += lamJ7_sq |Q|²;
+ *               J2/J3 += lam.._sq |Q|².  For the primary E1 mode these are the legacy
+ *               lambda_E1_X_{0,1,2} and lambda_E1_J7_0.
+ * frozen = true turns the coordinate into a static parameter (uniform strain).
+ */
+struct LatticeMode {
+    enum class Irrep { E, A1, A2 };
+    Irrep irrep = Irrep::E;
+    int weight = 1;
+    std::string name;
+    double omega = 1.0, gamma = 0.0, quartic = 0.0, Zstar = 0.0;
+    bool frozen = false;
+    std::array<double, 9> cE{};
+    std::array<double, 5> aA1{};
+    std::array<double, 4> dA2{};
+    double lamJ7 = 0.0, lamJ2A = 0.0, lamJ2B = 0.0, lamJ3 = 0.0;
+    std::array<double, 5> aA1_sq{};
+    std::array<double, 9> bE_sq{};
+    double lamJ7_sq = 0.0, lamJ2A_sq = 0.0, lamJ2B_sq = 0.0, lamJ3_sq = 0.0;
+    // coordinates and velocities (mode 0 = primary E1 keeps its state in PhononState)
+    double Q1 = 0.0, Q2 = 0.0, V1 = 0.0, V2 = 0.0;
+    int ncoord() const { return irrep == Irrep::E ? 2 : 1; }
+    int ndof() const { return frozen ? 0 : 2 * ncoord(); }
+    double q2sign() const { return weight == 2 ? -1.0 : 1.0; }
+};
+
+/// Cubic anharmonic transfer −N g Q_target (Q_lam ⊗ Q_lamp)_{irrep(target)}:
+/// target A1: Q (Q_lam · Q_lamp); target E (weight 2): Q1 P1 + Q2 P2 with
+/// P = (Q_lam1 Q_lamp1 − Q_lam2 Q_lamp2, Q_lam1 Q_lamp2 + Q_lam2 Q_lamp1).
+struct AnharmonicTerm {
+    int target = 0, lam = 0, lamp = 0;
+    double g = 0.0;
+};
+
+/**
  * Zone-center E1 phonon state.
+ *
+ * NORMALISATION OF Q (one dictionary, used everywhere — energy, drive, coupling, EOM):
+ *   Q is the mass-normalised amplitude of the zone-centre mode, one coordinate per unit
+ *   cell, intensive.  With ħ = 1, energies in meV and time in ħ/meV,
+ *     phonon energy   E_ph    = N_sites · [ ½|Q̇|² + ½ ω² |Q|² ]          (ω in meV)
+ *     drive energy    E_drive = − N_sites · Z* E(t)·Q
+ *     coupling        δX_γ    = λ_{X,1} Q·d̂_γ + λ_{X,2} (Q⊗Q)_E ...        (meV per unit Q, Q²)
+ *     equation of motion  Q̈ = −ω²Q − γQ̇ + Z*E(t) − (1/N_sites) ∂H_ME/∂Q
+ *   so Q² carries units of 1/meV (= ħ²/(meV) in SI).  Physical dictionary for a mode with
+ *   effective mass M_cell per unit cell and atomic displacement u:
+ *     Q = sqrt(M_cell/2) · u / ħ     (the ½ because N_sites = 2 N_cell)
+ *     e.g. M_cell = 30 amu, u = 2 pm  →  Q ≈ 0.012;  7 µeV per Co of absorbed energy at
+ *     4.2 THz  →  |Q| = sqrt(2·0.007/17.37²) ≈ 0.007.
+ *     Z* E0 = (N_cell/N_sites) Z_e e E0_phys ħ / sqrt(M_cell/2): the impulsive response of the
+ *     matched pulse is |Q|max = 0.0097 per unit Z*E0, hence Z*E0 ≈ 1 ↔ 300 kV/cm.
  *
  * The E1 optical strain field is a single in-plane two-component coordinate
  * ε = (Q_x, Q_y) with conjugate velocities (V_x, V_y). Total DOF = 4.
@@ -152,10 +220,19 @@ struct PhononState {
  * E1 phonon parameters.
  */
 struct PhononParams {
-    double omega_E1 = 1.0;          ///< E1 mode frequency ω_E1
-    double gamma_E1 = 0.1;          ///< E1 mode damping γ_E1
+    // Defaults = the Na2Co2TeO6 experimental operating point (NCTO_phonon_v0, 6 K):
+    // dominant IR-active E1 line at 4.2 THz (h·ν = 17.37 meV), amplitude ring-down
+    // 2/γ = 6.6 ps (measured 5–10 ps).  Time unit ħ/meV = 0.658 ps.
+    double omega_E1 = 17.37;        ///< E1 mode frequency ω_E1 (meV) = 4.2 THz
+    double gamma_E1 = 0.20;         ///< E1 mode damping γ_E1 (1/code time): 2/γ = 6.6 ps
     double lambda_E1_quartic = 0.0; ///< Optional quartic self-coupling λ (ε²)²/4
     double Z_star = 1.0;            ///< Effective charge for E(t) coupling
+    /// Normalise the magnetoelastic force in the phonon equation of motion per
+    /// site (true, physical: zone-centre mode has extensive inertia N, so
+    /// ε̈ = ... − (1/N)∂H_sp-ph/∂ε and E_phonon = N(½ε̇²+½ω²ε²)).  false
+    /// reproduces the legacy extensive back-action, whose effective phonon
+    /// frequency depends on lattice size and goes soft at N ~ ω²/λ.
+    bool per_site_backaction = true;
 };
 
 /**
@@ -173,34 +250,48 @@ struct PhononParams {
  * with bond-axis angles θ_x = 0, θ_y = 2π/3, θ_z = 4π/3 (i.e.
  * cos(2θ_γ) = (1, -1/2, -1/2) and sin(2θ_γ) = (0, -√3/2, +√3/2)).
  *
- * Linear-in-ε exchange-striction terms are FORBIDDEN by the full C6 symmetry
- * of the ideal honeycomb layer, so the leading symmetry-allowed coupling is
- * quadratic in ε (see docs/tmfeo3_notes.tex).
+ * Symmetry (audit 2026-08, ncto_phonon/audit): a single SOC honeycomb layer
+ * of Na2Co2TeO6 has point symmetry D3 (C3 ⊥ plane, three C2 axes along the
+ * bonds); C2 about the plane normal is the 6_3/2_1 screw that exchanges the
+ * two layers and is NOT a symmetry of one layer's J–K–Γ–Γ' Hamiltonian.
+ * Under D3 the polar coordinate ε (E) couples to the bond channels
+ * (A1 ⊕ E per channel) as
+ *   quadratic:  λ_{X,0}|ε|²  and  λ_{X,2}[(ε_x²−ε_y²)cos2θ + 2ε_xε_y sin2θ]
+ *   LINEAR   :  λ_{X,1}[ε_x cos2θ_γ − ε_y sin2θ_γ]   (see below; off by default)
+ * and to the ring operator (A1) only through |ε|².  The "no linear term"
+ * statement holds for the layer-summed q=0 response under the bilayer D6,
+ * not for the single-layer model integrated here.
  */
 struct SpinPhononCouplingParams {
-    // Kitaev-Heisenberg-Γ-Γ' parameters (Songvilay defaults)
-    double J = -0.1;       ///< Heisenberg coupling
-    double K = -9.0;       ///< Kitaev coupling
-    double Gamma = 1.8;    ///< Γ (off-diagonal symmetric)
-    double Gammap = 0.3;   ///< Γ' (off-diagonal asymmetric)
+    // Defaults = Na2Co2TeO6 operating point: Krüger et al. neutron fit (meV) with the ring
+    // exchange J7 at the corrected 3Q/zigzag near-degeneracy (fixed J2/J3 bond lists).
+    double J = 0.68;       ///< Heisenberg coupling
+    double K = -7.89;      ///< Kitaev coupling
+    double Gamma = 3.07;   ///< Γ (off-diagonal symmetric)
+    double Gammap = -2.94; ///< Γ' (off-diagonal asymmetric)
 
-    // 2nd NN exchange (isotropic Heisenberg, sublattice-dependent)
-    double J2_A = 0.3;
-    double J2_B = 0.3;
+    // 2nd NN exchange (isotropic Heisenberg, sublattice-dependent: Co1 (2b) ≠ Co2 (2d))
+    double J2_A = -0.06;
+    double J2_B = -0.70;
 
     // 3rd NN exchange (isotropic Heisenberg)
-    double J3 = 0.9;
+    double J3 = 0.52;
 
-    // Six-spin ring exchange on hexagonal plaquettes
-    double J7 = 0.0;
+    // Six-spin ring exchange on hexagonal plaquettes (3Q ground state for J7 < -0.4096)
+    double J7 = -0.4096;
     // Scalar quadratic E1 modulation of ring exchange:
-    //   J7_eff(ε) = J7 + lambda_E1_J7_0 (ε_x² + ε_y²).
-    // Set lambda_E1_J7_0 < 0 when the E1 distortion should decrease J7.
+    //   J7_eff(ε) = J7 + lambda_E1_J7_0 (ε_x² + ε_y²)   (the phonon effect on J_ring;
+    // λ > 0 drives |J7| down, i.e. towards zigzag, for any polarization).  The ring operator
+    // is A1, so this |Q|² term is its LEADING coupling; off by default (scenario 2 turns it on).
     double lambda_E1_J7_0 = 0.0;
 
     // Quadratic E1 exchange-modulation coefficients δX_γ(ε):
     //   λ_{X,0} multiplies the rotational invariant ε_x² + ε_y²
     //   λ_{X,2} multiplies the bond-dependent rank-2 piece
+    // Second-order (|Q|² and (Q⊗Q)_E) bilinear couplings: OFF by default.  They are not the
+    // leading term for a polar E1 mode of one D3 layer — the linear channel below is — and the
+    // rectified E2-shear physics they were meant to model arises automatically, at O(λ1²/ω²),
+    // from the time-dependent linear modulation once the dynamics is integrated.
     double lambda_E1_J_0      = 0.0;
     double lambda_E1_J_2      = 0.0;
     double lambda_E1_K_0      = 0.0;
@@ -209,6 +300,21 @@ struct SpinPhononCouplingParams {
     double lambda_E1_Gamma_2  = 0.0;
     double lambda_E1_Gammap_0 = 0.0;
     double lambda_E1_Gammap_2 = 0.0;
+    // LINEAR E-channel striction, allowed by the D3 symmetry of one SOC
+    // honeycomb layer (P6_322 Co site symmetry 32, twofold axes along bonds):
+    //   δX_γ^{(1)}(ε) = λ_{X,1} [ε_x cos2θ_γ − ε_y sin2θ_γ] = λ_{X,1}|ε| cos(θ_pol + 2θ_γ).
+    // It is the unique D3 invariant Re[ε₊N₊] (rotational weight 1+2 = 3);
+    // it is odd in ε (no static rectification at first order) but it is FIRST order in the
+    // phonon amplitude: the leading magnetoelastic term of a polar E1 mode of one D3 layer.
+    // Forbidden only by the layer-exchanging C6 of the bilayer (layer-summed response).
+    // Defaults = the experimental operating point with a stipulated Grüneisen-type scale:
+    // δX/X common to all channels, λ_{X,1} = (X/K) λ_{K,1}, λ_{K,1} = 40 meV per unit Q, i.e.
+    // a 5 % modulation of every exchange at the physical amplitude |Q| ≈ 0.01 (γ_G ≈ 10 with a
+    // Co1–Co2 relative displacement of ~1 pm at 300 kV/cm).  Replace by DFT/Raman-anomaly values.
+    double lambda_E1_J_1      = -3.447;
+    double lambda_E1_K_1      = 40.0;
+    double lambda_E1_Gamma_1  = -15.56;
+    double lambda_E1_Gammap_1 = 14.91;
 
     /// Kitaev local-to-global rotation matrix R.
     static SpinMatrix get_kitaev_rotation() {
@@ -282,19 +388,22 @@ struct TimeDependentSpinPhononParams {
  *   H_drive = -Z* [E_x(t) ε_x + E_y(t) ε_y].
  */
 struct DriveParams {
+    // Defaults = the measured NCTO THz transient (SI Fig. S1b,c): ~1.5-cycle pulse, envelope
+    // FWHM ≈ 0.6 ps, spectrum 1–5 THz peaking at 3–4 THz  →  Gaussian σ = 0.18 ps = 0.273 code
+    // units, carrier 3.0 THz = 12.41 meV, CEP 0, centred 6.6 ps (10 code units) after t = 0.
     // Pulse 1 (pump)
     double E0_1    = 0.0;
-    double omega_1 = 1.0;
-    double t_1     = 0.0;
-    double sigma_1 = 1.0;
+    double omega_1 = 12.41;
+    double t_1     = 10.0;
+    double sigma_1 = 0.273;
     double phi_1   = 0.0;
-    double theta_1 = 0.0;  ///< Polarization angle (0 = x, π/2 = y)
+    double theta_1 = 0.0;  ///< Polarization angle from the x-bond line (0 = x, π/2 = y)
 
-    // Pulse 2 (probe)
+    // Pulse 2 (second THz pulse of the coherent-control protocol; E2 ≈ 0.6 E1 in the experiment)
     double E0_2    = 0.0;
-    double omega_2 = 1.0;
-    double t_2     = 0.0;
-    double sigma_2 = 1.0;
+    double omega_2 = 12.41;
+    double t_2     = 10.0;
+    double sigma_2 = 0.273;
     double phi_2   = 0.0;
     double theta_2 = 0.0;
 
@@ -356,9 +465,25 @@ public:
     SpinConfig spins;
     vector<Eigen::Vector3d> site_positions;
     
-    // Phonon state
+    // Phonon state (primary E1 mode)
     PhononState phonons;
-    
+
+    // Complete lattice sector: modes[0] mirrors the primary E1 mode (its
+    // coordinates live in `phonons`), modes[1..] are extra E/A1/A2 modes or
+    // frozen strains; anharmonic = cubic transfer terms between them.
+    vector<LatticeMode> modes;
+    vector<AnharmonicTerm> anharmonic;
+    bool has_further_modulation = false;
+    // In-plane doublet frame of the layer: e_x = A→B direction of the x bond,
+    // e_y = n × e_x. Further-neighbour bonds are grouped into ≤3 line-angle
+    // classes per sublattice with form factors (cos2θ, sin2θ).
+    Eigen::Vector3d ex_code = Eigen::Vector3d::UnitX();
+    Eigen::Vector3d ey_code = Eigen::Vector3d::UnitY();
+    vector<vector<int>> j2_cls, j3_cls;
+    std::array<std::pair<double, double>, 3> j2_cs{}, j3_cs{};
+    int n_j2_cls = 0, n_j3_cls = 0;
+    struct Coords { std::vector<double> q1, q2; };
+
     // NN interactions (stored per site to avoid double counting)
     vector<vector<SpinMatrix>> nn_interaction;      // J1 matrices
     vector<vector<size_t>> nn_partners;             // NN partner indices
@@ -399,11 +524,77 @@ public:
     // deterministically (E1 phonon thermal noise neglected at this stage).
     double langevin_temperature = 0.0;
 
+    // Two-reservoir ("scenario 1") bath profile for integrate_langevin(): the spin bath
+    // temperature is  T_b(t) = T0 + dT * Θ(t - t_step) (1 - e^{-(t-t_step)/tau_on}) e^{-(t-t_step)/tau_off}
+    // i.e. a hot phonon reservoir filled within tau_on (the E1 ring-down) and, optionally,
+    // cooling with tau_off (0 = no decay).  dT = 0 reproduces the constant-T thermostat.
+    // Semi-quantum thermostat (Barker & Bauer, PRB 100, 140401 (2019)): the stochastic field is
+    // coloured Gaussian noise whose power spectrum is the Bose energy of a mode at frequency ω,
+    //     P(ω) = P_classical(T) · F(ω,T),   F = x/(e^x − 1),  x = ħω/k_B T,
+    // (no zero-point term), while the Gilbert damping stays Markovian.  For every harmonic mode the
+    // steady state is then E_k = ħω_k n_B(ω_k): quantum thermal occupation without a quantum solver.
+    // The noise is generated in FFT blocks of langevin_block steps, overlap-added with sine windows
+    // (Σ w² = 1) so that the process is stationary; the block temperature is the bath temperature at
+    // the block centre.  langevin_quantum = false reproduces the classical white-noise thermostat.
+    bool langevin_quantum = false;
+    int langevin_block = 4096;
+    // Finite-capacity, energy-conserving bath (two-temperature model built from the dynamics):
+    // when langevin_bath_C > 0 (heat capacity of the bath in k_B per spin) the bath temperature is a
+    // dynamical variable, T_b(t+dt) = T_b(t) - [E_sys(t+dt) - E_sys(t) - W_drive]/(N C_l), i.e. every
+    // unit of energy the system loses (phonon damping γ, Gilbert damping) heats the bath and every
+    // unit the noise injects cools it; the E1 ring-down is then the deposit itself and no
+    // langevin_dT step is needed.  0 = infinite bath with the prescribed profile.
+    double langevin_bath_C = 0.0;
+    double langevin_dT = 0.0;
+    double langevin_t_step = 0.0;
+    double langevin_tau_on = 5.0;     // code units (5 = 3.3 ps)
+    double langevin_tau_off = 0.0;
+    double langevin_bath_T(double t) const {
+        if (langevin_dT == 0.0 || t < langevin_t_step) return langevin_temperature;
+        const double s = t - langevin_t_step;
+        double f = (langevin_tau_on > 0.0) ? 1.0 - std::exp(-s / langevin_tau_on) : 1.0;
+        if (langevin_tau_off > 0.0) f *= std::exp(-s / langevin_tau_off);
+        return langevin_temperature + langevin_dT * f;
+    }
+
     // External "noise field" used by integrate_langevin(): one 3-vector per
     // site, regenerated at every Langevin time step and added to H_eff in
     // ode_system() when use_langevin_noise == true.
     vector<Eigen::Vector3d> langevin_noise;
     bool use_langevin_noise = false;
+
+    // ---- Spin–lattice dynamics (SLD): in-plane site displacements u_i and momenta p_i ----
+    // Harmonic NN (k) and 2nd-NN (k2) central springs; exchange striction δM_ij = g δr_ij M_ij with
+    // δr_ij = (u_j − u_i)·d̂_ij (g = ∂ln X/∂r, one common Grüneisen fraction for J, K, Γ, Γ′, same
+    // convention as the E1 coupling λ_X1); optional cubic E1–acoustic vertex
+    // H3 = v3 Σ_bonds (Q·d̂_γ) δr_ij² (decay of the E1 mode into acoustic pairs); lattice friction γ_l
+    // with the matching Langevin noise on p in integrate_langevin (classical or Bose-coloured).
+    // Units: length = lattice constant a, energy meV, time ħ/meV, mass in meV·(ħ/meV)²/a²
+    // (= 0.150 amu for a = 5.27 Å).  ODE layout: after the mode block,
+    // [u_0(3), …, u_{N−1}(3), p_0(3), …, p_{N−1}(3)]; z components are kept at zero.
+    bool sld_enabled = false;
+    double sld_mass = 1000.0, sld_k = 1.5e5, sld_k2 = 4.0e4, sld_g = 0.0, sld_v3 = 0.0;
+    double sld_gamma = 0.0, sld_T = -1.0, sld_init_T = 0.0;
+    bool sld_quantum = false;
+    vector<Eigen::Vector3d> u_site, p_site;
+    vector<vector<Eigen::Vector3d>> nn_bond_vec, j2_bond_vec;   // unit vectors i→j per site per neighbour
+    vector<vector<Eigen::Vector2d>> nn_bond_cq;                  // A→B direction of the bond in the doublet frame (cx, cy)
+    void enable_sld(bool on);
+    /// Static relaxation of the site displacements to the magnetostrictive equilibrium of the current
+    /// spins (Jacobi iteration on the lattice forces; p = 0).  Returns the final max |F|.  Without this
+    /// u = 0 carries an elastic energy F²/2k per site that is released as lattice heat at t = 0.
+    double relax_sld_static(int max_iter = 500, double tol = 1e-6);
+    int sld_relax = 200;
+    size_t mode_dof() const;
+    size_t sld_offset() const { return spin_dim * lattice_size + mode_dof(); }
+    double sld_energy() const;
+    double sld_kinetic_energy() const;
+    double sld_spring_energy() const;
+    double sld_striction_energy() const;
+    /// Lattice temperature from equipartition of the 2N in-plane momenta: T_l = E_kin/N.
+    double sld_lattice_temperature() const {
+        return (sld_enabled && lattice_size) ? sld_kinetic_energy() / double(lattice_size) : 0.0;
+    }
 
     // ODE state size
     size_t state_size;
@@ -894,7 +1085,13 @@ public:
      * Total energy
      */
     double total_energy() const {
-        return spin_energy() + phonon_energy() + spin_phonon_energy();
+        return spin_energy() + phonon_energy() + spin_phonon_energy() + anharmonic_energy() + sld_energy();
+    }
+
+    /// Extensivity factor of the zone-centre phonon sector: N_sites when the
+    /// back-action is normalised per site (physical), 1 in the legacy mode.
+    double phonon_norm() const {
+        return phonon_params.per_site_backaction ? double(lattice_size) : 1.0;
     }
     
     /**
@@ -912,22 +1109,43 @@ public:
     double dH_dQx_E1() const;
     /// ∂H_sp-ph/∂ε_y for the zone-center E1 coordinate.
     double dH_dQy_E1() const;
-    /// Effective ring exchange under the scalar quadratic E1 distortion.
-    double effective_J7(double qx, double qy) const {
-        return spin_phonon_params.J7 +
-               spin_phonon_params.lambda_E1_J7_0 * (qx * qx + qy * qy);
-    }
-    double effective_J7_for_hexagon(size_t hex_idx, double qx, double qy) const {
+    // ---- complete lattice sector (all modes) ----
+    size_t phonon_dof() const;
+    void recompute_state_size();
+    void pack_lattice(double* arr) const;
+    void unpack_lattice(const double* arr);
+    Coords coords_current() const;
+    Coords coords_from_state(const double* arr) const;
+    void bond_increments_local(const Coords& c, double scale, Eigen::Matrix3d dM[3]) const;
+    void bond_increment_derivs_local(const Coords& c, double scale, size_t m, int comp, Eigen::Matrix3d dD[3]) const;
+    void bond_increments_global(const Coords& c, double scale, Eigen::Matrix3d dM[3]) const;
+    void bond_increment_derivs_global(const Coords& c, double scale, size_t m, int comp, Eigen::Matrix3d dD[3]) const;
+    void bond_correlations(Eigen::Matrix3d C[3]) const;
+    void further_correlations(double Cj2[2][3], double Cj3[3]) const;
+    double further_bond_modulation(const Coords& c, double c2, double s2, int which, int sub) const;
+    double further_bond_modulation_deriv(const Coords& c, double c2, double s2, int which, int sub, size_t m, int comp) const;
+    double further_neighbour_modulation_energy(const Coords& c) const;
+    /// Effective ring exchange J7 + Σ_E λ_J7|Q|² + Σ_A1 λ_J7 Q (+ frozen strains).
+    double effective_J7(const Coords& c) const;
+    double effective_J7() const;
+    double effective_J7_for_hexagon(size_t hex_idx, double J7eff) const {
         const double offset = hex_idx < plaquette_j7_offsets.size()
                                 ? plaquette_j7_offsets[hex_idx] : 0.0;
-        return effective_J7(qx, qy) + offset;
+        return J7eff + offset;
     }
-    double dJ7_dQx_E1(double qx, double /*qy*/) const {
-        return 2.0 * spin_phonon_params.lambda_E1_J7_0 * qx;
-    }
-    double dJ7_dQy_E1(double /*qx*/, double qy) const {
-        return 2.0 * spin_phonon_params.lambda_E1_J7_0 * qy;
-    }
+    double dJ7_dq(const Coords& c, size_t m, int comp) const;
+    double anharmonic_energy(const Coords& c) const;
+    double anharmonic_energy() const;
+    double anharmonic_deriv(const Coords& c, size_t m, int comp) const;
+    /// Raw (extensive) ∂H_ME/∂q for mode m, component comp.
+    double lattice_force_raw(const Coords& c, double scale, const Eigen::Matrix3d C[3],
+                             const double Cj2[2][3], const double Cj3[3], double R7,
+                             size_t m, int comp) const;
+    /// Raw ∂H_ME/∂q for every coordinate, in mode order (q1[,q2] per mode).
+    std::vector<double> lattice_forces_raw() const;
+    void rebuild_primary_mode();
+    void update_modulation_flags();
+    void set_modes(const std::vector<LatticeMode>& extra, const std::vector<AnharmonicTerm>& anh);
     
     /**
      * Compute ring exchange contribution to effective field on spin at given site
@@ -938,7 +1156,7 @@ public:
      * ring exchange term with respect to that spin.
      */
     SpinVector get_ring_exchange_field(size_t site) const;
-    SpinVector get_ring_exchange_field(size_t site, double qx, double qy) const;
+    SpinVector get_ring_exchange_field(size_t site, double J7eff) const;
     
     /**
      * Compute effective field on spin i (for spin EOM)
@@ -1008,7 +1226,7 @@ public:
                 state[idx++] = spins[i](d);
             }
         }
-        phonons.to_array(&state[idx]);
+        pack_lattice(&state[idx]);
         return state;
     }
     
@@ -1024,7 +1242,7 @@ public:
             // Renormalize spins
             spins[i] = spins[i].normalized() * spin_length;
         }
-        phonons.from_array(&state[idx]);
+        unpack_lattice(&state[idx]);
     }
     
     // Legacy aliases for backward compatibility
@@ -1232,10 +1450,18 @@ public:
      * @param save_every       save observables every N steps
      * @param seed             RNG seed; if 0, uses random_device
      */
+    /// @param on_save  optional observer invoked every save_every steps, after the
+    ///                 state has been synced back into spins[]/phonons, so that a
+    ///                 caller can emit arbitrary observables WITHOUT chopping the run
+    ///                 into separate integrate_langevin() calls. Chopping restarts the
+    ///                 noise stream, which truncates its correlations at the chunk
+    ///                 length — fatal for the Bose-coloured thermostat, whose
+    ///                 correlation time is hbar/k_B T (1.9 code units at 6 K).
     void integrate_langevin(double t_start, double t_end, double dt,
                             const string& output_dir = "",
                             size_t save_every = 100,
-                            uint64_t seed = 0);
+                            uint64_t seed = 0,
+                            const std::function<void(double)>& on_save = {});
     
     // ============================================================
     // MONTE CARLO METHODS (consistent with Lattice / StrainPhononLattice)

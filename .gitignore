@@ -151,3 +151,6 @@ example_configs/NCTO_strain/
 example_configs/TmFeO3/
 example_configs/Kitaev/pt_gradient_test.param
 example_configs/test_correlation_accumulator.param
+
+# Local run scratch (spin/phonon snapshots written by the NCTO/TmFeO3 drivers)
+scratch_runs/
