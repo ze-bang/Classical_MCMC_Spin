@@ -353,6 +353,9 @@ int main(int argc, char** argv) {
                 case SystemType::PYROCHLORE:
                     uc_ptr = new UnitCell(build_pyrochlore(config));
                     break;
+                case SystemType::TRIANGULAR_ANISOTROPIC:
+                    uc_ptr = new UnitCell(build_triangular_anisotropic(config));
+                    break;
                 case SystemType::PYROCHLORE_NON_KRAMER:
                     uc_ptr = new UnitCell(build_pyrochlore_non_kramer(config));
                     break;

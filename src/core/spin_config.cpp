@@ -504,6 +504,7 @@ void SpinConfig::to_file(const string& filename) const {
         case SystemType::TMFEO3_TM: file << "tmfeo3_tm"; break;
         case SystemType::NCTO: file << "ncto"; break;
         case SystemType::NCTO_STRAIN: file << "ncto_strain"; break;
+        case SystemType::TRIANGULAR_ANISOTROPIC: file << "triangular_anisotropic"; break;
         case SystemType::CUSTOM: file << "custom"; break;
     }
     file << "\n";
@@ -631,6 +632,7 @@ void SpinConfig::print() const {
         case SystemType::TMFEO3_TM: cout << "TmFeO3 (Tm only)"; break;
         case SystemType::NCTO: cout << "NCTO (Na2Co2TeO6) Spin-Phonon"; break;
         case SystemType::NCTO_STRAIN: cout << "NCTO Magnetoelastic (Spin-Strain)"; break;
+        case SystemType::TRIANGULAR_ANISOTROPIC: cout << "Triangular (anisotropic)"; break;
         case SystemType::CUSTOM: cout << "Custom"; break;
     }
     cout << "\n";

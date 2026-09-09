@@ -23,6 +23,10 @@ UnitCell build_pyrochlore(const SpinConfig& config);
 // Build non-Kramers pyrochlore unit cell (Jpm, Jzz, Jpmpm exchange)
 UnitCell build_pyrochlore_non_kramer(const SpinConfig& config);
 
+// Build the NdMgAl11O19 anisotropic triangular unit cell
+// (Jzz, Jpm, Jpmpm, Jzpm with bond phases 0, -2pi/3, +2pi/3)
+UnitCell build_triangular_anisotropic(const SpinConfig& config);
+
 // Build TmFeO3 mixed unit cell (SU2 Fe + SU3 Tm)
 MixedUnitCell build_tmfeo3(const SpinConfig& config);
 

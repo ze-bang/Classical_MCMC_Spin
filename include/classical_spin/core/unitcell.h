@@ -289,6 +289,17 @@ public:
 };
 
 
+// Triangular Bravais lattice: ONE site per cell, a1=(1,0), a2=(1/2,sqrt3/2).
+// Used for the NdMgAl11O19 anisotropic model (Jzz, Jpm, Jpmpm, Jzpm).
+class Triangular : public UnitCell {
+public:
+    Triangular(size_t spin_dim)
+        : UnitCell(spin_dim, 1,
+                   {Vector3d(0, 0, 0)},
+                   {Vector3d(1, 0, 0), Vector3d(0.5, sqrt(3.0)/2, 0), Vector3d(0, 0, 1)}) {}
+};
+
+
 class HoneyComb_alt : public UnitCell {
 public:
     HoneyComb_alt(size_t spin_dim) 

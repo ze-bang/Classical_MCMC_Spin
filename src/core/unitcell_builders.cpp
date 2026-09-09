@@ -112,6 +112,69 @@ UnitCell build_bcao_honeycomb(const SpinConfig& config) {
     return atoms;
 }
 
+
+// -----------------------------------------------------------------------------
+// NdMgAl11O19: anisotropic (YbMgGaO4-type) exchange on the triangular lattice.
+//
+//   H = sum_<ij> [ Jzz Sz Sz
+//                + Jpm  (S+_i S-_j + S-_i S+_j)
+//                + Jpmpm(g_ij S+_i S+_j + g*_ij S-_i S-_j)
+//                - (i Jzpm/2)((g*_ij S+_i - g_ij S-_i) Sz_j + (i<->j)) ]
+//   g_ij = e^{i phi},  phi = 0, -2pi/3, +2pi/3 on the a1, a2, a3 bonds.
+//
+// Converting to the Cartesian bilinear form H = S_i^T J(phi) S_j, using
+// S+- = Sx +- i Sy, gives
+//
+//   Jxx = 2 Jpm + 2 Jpmpm cos(phi)      Jxy = Jyx = -2 Jpmpm sin(phi)
+//   Jyy = 2 Jpm - 2 Jpmpm cos(phi)      Jxz = Jzx = -Jzpm sin(phi)
+//   Jzz = Jzz                           Jyz = Jzy = +Jzpm cos(phi)
+//
+// Two exact identities the matrix must satisfy -- re-check them if this block
+// is ever edited. (Validated 2026-08-04: the Cartesian matrix reproduces the
+// spin-1/2 bond Hamiltonian of qed_nlce to 7e-18 for arbitrary phi, and the
+// Heisenberg limit Jzz=1, Jpm=0.5 gives E/site = -1.500000 in the solver.
+// There is no in-repo unit test for this yet.)
+//   * Tr J = 4 Jpm + Jzz, independent of phi.
+//   * Summed over the three bond phases the Jpmpm and Jzpm parts cancel
+//     (cos0 + cos(2pi/3) + cos(4pi/3) = 0), so the bond-averaged exchange is
+//     pure XXZ with Jxy = 2 Jpm -- i.e. Jpm carries NO factor 1/2, matching
+//     qed_nlce/hamiltonians/triangular.py.
+//
+// Only three of the six NN bonds are declared: Lattice adds each reverse bond
+// with J^T, so declaring all six would double count (same rule as the J2 block
+// of build_bcao_honeycomb above).
+// -----------------------------------------------------------------------------
+UnitCell build_triangular_anisotropic(const SpinConfig& config) {
+    const double Jzz   = config.get_param("Jzz",   1.0);
+    const double Jpm   = config.get_param("Jpm",   0.0);
+    const double Jpmpm = config.get_param("Jpmpm", 0.0);
+    const double Jzpm  = config.get_param("Jzpm",  0.0);
+
+    Triangular atoms(3);
+
+    auto bond_matrix = [&](double phi) {
+        const double c = cos(phi), s = sin(phi);
+        Eigen::Matrix3d J;
+        J << 2*Jpm + 2*Jpmpm*c,  -2*Jpmpm*s,        -Jzpm*s,
+             -2*Jpmpm*s,          2*Jpm - 2*Jpmpm*c, Jzpm*c,
+             -Jzpm*s,             Jzpm*c,            Jzz;
+        return J;
+    };
+
+    // a1 = (1,0,0); a2 = (0,1,0); a3 = a2 - a1 = (-1,1,0)
+    atoms.set_bilinear_interaction(bond_matrix(0.0),          0, 0, Eigen::Vector3i(1, 0, 0));
+    atoms.set_bilinear_interaction(bond_matrix(-2*M_PI/3),    0, 0, Eigen::Vector3i(0, 1, 0));
+    atoms.set_bilinear_interaction(bond_matrix(+2*M_PI/3),    0, 0, Eigen::Vector3i(-1, 1, 0));
+
+    Eigen::Vector3d field;
+    field << config.g_factor[0] * config.field_strength * config.field_direction[0],
+             config.g_factor[1] * config.field_strength * config.field_direction[1],
+             config.g_factor[2] * config.field_strength * config.field_direction[2];
+    atoms.set_field(field, 0);
+
+    return atoms;
+}
+
 UnitCell build_kitaev_honeycomb(const SpinConfig& config) {
     const double K = config.get_param("K", -1.0);
     const double Gamma = config.get_param("Gamma", 0.25);

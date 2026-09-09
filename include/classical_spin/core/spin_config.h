@@ -26,6 +26,7 @@ enum class SystemType {
     TMFEO3_TM,                // TmFeO3 Tm-only (SU3 only, no Fe)
     NCTO,                     // NCTO spin-phonon coupled honeycomb
     NCTO_STRAIN,              // NCTO magnetoelastic (spin-strain) coupled honeycomb
+    TRIANGULAR_ANISOTROPIC,   // NMAO triangular: Jzz, Jpm, Jpmpm, Jzpm (YbMgGaO4-type)
     CUSTOM                    // Custom from JSON
 };
 
@@ -320,6 +321,8 @@ inline SystemType parse_system(const string& str) {
     if (s == "tmfeo3_tm" || s == "TMFEO3_TM" || s == "TmFeO3_Tm") return SystemType::TMFEO3_TM;
     if (s == "ncto" || s == "NCTO" || s == "Na2Co2TeO6") return SystemType::NCTO;
     if (s == "ncto_strain" || s == "NCTO_STRAIN" || s == "strain") return SystemType::NCTO_STRAIN;
+    if (s == "triangular_anisotropic" || s == "TRIANGULAR_ANISOTROPIC" ||
+        s == "triangular" || s == "nmao") return SystemType::TRIANGULAR_ANISOTROPIC;
     if (s == "custom" || s == "CUSTOM") return SystemType::CUSTOM;
     throw runtime_error("Unknown system type: " + str);
 }
@@ -338,6 +341,7 @@ inline string system_type_to_string(SystemType sys) {
         case SystemType::TMFEO3_TM: return "tmfeo3_tm";
         case SystemType::NCTO: return "ncto";
         case SystemType::NCTO_STRAIN: return "ncto_strain";
+        case SystemType::TRIANGULAR_ANISOTROPIC: return "triangular_anisotropic";
         case SystemType::CUSTOM: return "custom";
         default: return "unknown";
     }
