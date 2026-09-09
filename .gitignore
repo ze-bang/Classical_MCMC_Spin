@@ -183,6 +183,7 @@ disorder_pinned_droplet_lifetimeNotes.bib
 reference_Efield*.zip
 
 # Compound-specific run configurations
+example_configs/param_sweeps/ncto_*
 example_configs/BCAO/
 example_configs/TmFeO3*/
 example_configs/NCTO*/
