@@ -483,16 +483,26 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
         }
     }
     
-    // Normalize all SU3 pump directions
-    for (auto& dir : pump_dirs_su3_norm) {
-        double norm = 0.0;
-        for (const auto& comp : dir) {
-            norm += comp * comp;
+    // Normalize the SU3 pump directions.  A single (broadcast) direction is
+    // normalized to unit length as before.  A per-sublattice list is normalized
+    // by its COMMON maximum norm so that the relative magnitudes (and hence the
+    // sublattice pattern purity) supplied by the user are preserved.
+    {
+        double norm_max = 0.0;
+        for (const auto& dir : pump_dirs_su3_norm) {
+            double norm = 0.0;
+            for (const auto& comp : dir) norm += comp * comp;
+            norm_max = std::max(norm_max, sqrt(norm));
         }
-        norm = sqrt(norm);
-        if (norm > 1e-10) {
-            for (auto& comp : dir) {
-                comp /= norm;
+        for (auto& dir : pump_dirs_su3_norm) {
+            double norm = norm_max;
+            if (pump_dirs_su3_norm.size() == 1) {
+                norm = 0.0;
+                for (const auto& comp : dir) norm += comp * comp;
+                norm = sqrt(norm);
+            }
+            if (norm > 1e-10) {
+                for (auto& comp : dir) comp /= norm;
             }
         }
     }
@@ -695,6 +705,21 @@ static void apply_su2_gilbert_damping(MixedLattice& lattice, const SpinConfig& c
 }
 
 /**
+ * Optional ablation: evaluate the SU(2) drive torque on the equilibrium spin
+ * configuration, removing the field-mediated magnon-magnon conversion channel.
+ * Call only after the ground state is loaded/annealed and synchronized.
+ */
+static void apply_linear_drive_torque(MixedLattice& lattice, const SpinConfig& config, int rank) {
+    if (config.get_param("linear_drive_torque", 0.0) == 0.0) return;
+    lattice.set_linear_drive_torque_SU2(true);
+    if (rank == 0) {
+        cout << "SU(2) drive torque LINEARIZED about the equilibrium configuration: "
+             << "the field-mediated magnon-magnon conversion channel is removed "
+             << "(ablation, not a physical model)" << endl;
+    }
+}
+
+/**
  * Run 2D coherent spectroscopy (2DCS) for mixed lattice
  */
 void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config, int rank, int size) {
@@ -868,16 +893,26 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         }
     }
     
-    // Normalize all SU3 pump directions
-    for (auto& dir : pump_dirs_su3_norm) {
-        double norm = 0.0;
-        for (const auto& comp : dir) {
-            norm += comp * comp;
+    // Normalize the SU3 pump directions.  A single (broadcast) direction is
+    // normalized to unit length as before.  A per-sublattice list is normalized
+    // by its COMMON maximum norm so that the relative magnitudes (and hence the
+    // sublattice pattern purity) supplied by the user are preserved.
+    {
+        double norm_max = 0.0;
+        for (const auto& dir : pump_dirs_su3_norm) {
+            double norm = 0.0;
+            for (const auto& comp : dir) norm += comp * comp;
+            norm_max = std::max(norm_max, sqrt(norm));
         }
-        norm = sqrt(norm);
-        if (norm > 1e-10) {
-            for (auto& comp : dir) {
-                comp /= norm;
+        for (auto& dir : pump_dirs_su3_norm) {
+            double norm = norm_max;
+            if (pump_dirs_su3_norm.size() == 1) {
+                norm = 0.0;
+                for (const auto& comp : dir) norm += comp * comp;
+                norm = sqrt(norm);
+            }
+            if (norm > 1e-10) {
+                for (auto& comp : dir) comp /= norm;
             }
         }
     }
@@ -1083,6 +1118,7 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         // from the just-synchronized ground state on every rank.
         apply_su2_gilbert_damping(lattice, config, rank);
         apply_su3_bloch_damping(lattice, config, rank);
+        apply_linear_drive_torque(lattice, config, rank);
 
         if (rank == 0) {
             cout << "\n[2/2] Running MPI-parallel pump-probe spectroscopy..." << endl;

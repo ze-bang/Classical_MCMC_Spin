@@ -544,6 +544,27 @@ inline void trilinear_kernel_dyn(const double* __restrict T,
                     dsdt[idx + 1] = H[2] * state[idx + 0] - H[0] * state[idx + 2];
                     dsdt[idx + 2] = H[0] * state[idx + 1] - H[1] * state[idx + 0];
 
+                    // Field-mediated-conversion ablation.  H already carries
+                    // -h(t), so the torque above contains -h x S.  Adding
+                    // h x (S - S0) replaces it by -h x S0, i.e. drops the term
+                    // bilinear in (pulse field, magnon amplitude).  See
+                    // set_linear_drive_torque_SU2().
+                    if (linear_drive_torque_SU2 &&
+                        (su2_f1 != 0.0 || su2_f2 != 0.0)) {
+                        const size_t atom = site % N_atoms_SU2;
+                        const double* __restrict fd0 = field_drive_SU2[0].data() + atom * 3;
+                        const double* __restrict fd1 = field_drive_SU2[1].data() + atom * 3;
+                        const double hx = fd0[0] * su2_f1 + fd1[0] * su2_f2;
+                        const double hy = fd0[1] * su2_f1 + fd1[1] * su2_f2;
+                        const double hz = fd0[2] * su2_f1 + fd1[2] * su2_f2;
+                        const double dx = state[idx + 0] - drive_ref_SU2[idx + 0];
+                        const double dy = state[idx + 1] - drive_ref_SU2[idx + 1];
+                        const double dz = state[idx + 2] - drive_ref_SU2[idx + 2];
+                        dsdt[idx + 0] += hy * dz - hz * dy;
+                        dsdt[idx + 1] += hz * dx - hx * dz;
+                        dsdt[idx + 2] += hx * dy - hy * dx;
+                    }
+
                     // Gilbert damping: dS/dt += (alpha/|S|) * S × (S × H)
                     //   S × (S × H) = S(S·H) - H|S|^2  (BAC-CAB)
                     if (alpha_gilbert != 0.0) {
@@ -600,6 +621,27 @@ inline void trilinear_kernel_dyn(const double* __restrict T,
                     dsdt[idx + 0] = H[1] * state[idx + 2] - H[2] * state[idx + 1];
                     dsdt[idx + 1] = H[2] * state[idx + 0] - H[0] * state[idx + 2];
                     dsdt[idx + 2] = H[0] * state[idx + 1] - H[1] * state[idx + 0];
+
+                    // Field-mediated-conversion ablation.  H already carries
+                    // -h(t), so the torque above contains -h x S.  Adding
+                    // h x (S - S0) replaces it by -h x S0, i.e. drops the term
+                    // bilinear in (pulse field, magnon amplitude).  See
+                    // set_linear_drive_torque_SU2().
+                    if (linear_drive_torque_SU2 &&
+                        (su2_f1 != 0.0 || su2_f2 != 0.0)) {
+                        const size_t atom = site % N_atoms_SU2;
+                        const double* __restrict fd0 = field_drive_SU2[0].data() + atom * 3;
+                        const double* __restrict fd1 = field_drive_SU2[1].data() + atom * 3;
+                        const double hx = fd0[0] * su2_f1 + fd1[0] * su2_f2;
+                        const double hy = fd0[1] * su2_f1 + fd1[1] * su2_f2;
+                        const double hz = fd0[2] * su2_f1 + fd1[2] * su2_f2;
+                        const double dx = state[idx + 0] - drive_ref_SU2[idx + 0];
+                        const double dy = state[idx + 1] - drive_ref_SU2[idx + 1];
+                        const double dz = state[idx + 2] - drive_ref_SU2[idx + 2];
+                        dsdt[idx + 0] += hy * dz - hz * dy;
+                        dsdt[idx + 1] += hz * dx - hx * dz;
+                        dsdt[idx + 2] += hx * dy - hy * dx;
+                    }
                     if (alpha_gilbert != 0.0) {
                         const double Sx = state[idx + 0], Sy = state[idx + 1], Sz = state[idx + 2];
                         const double S2 = Sx*Sx + Sy*Sy + Sz*Sz;
