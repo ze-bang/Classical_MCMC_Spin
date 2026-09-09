@@ -4,6 +4,8 @@
 build/
 build-*/
 build_gpu/
+build_cuda/
+build_fir/
 cmake-build-*/
 out/
 *.o
