@@ -1,0 +1,48 @@
+# BCAO honeycomb ground state -- Halloran et al., PNAS 120, e2215509119 (2023),
+# "Geometrical frustration versus Kitaev interactions in BaCo2(AsO4)2".
+# Parameters are the SI global-coordinate convention (a*, b, c):
+#   J1 bond matrix (phi = 0 bond) = [[J1xy+D, E,       F     ],
+#                                    [E,      J1xy-D,  G     ],
+#                                    [F,      G,       J1z   ]]
+#   other two NN bonds by C3 rotation; J3 = diag(J3xy, J3xy, J3z).
+# This is exactly what build_bcao_honeycomb() implements.
+#
+# Parameter SET 2 (J1xy J1z J3xy J3z D E F G):
+#   -6.556 -2.181 1.607 0.137 0.660 0.816 1.823 -0.771
+#
+# NOTE: build_bcao_honeycomb puts the phi=0 matrix on the bond along the lattice
+# y axis, so in the output files spin x = b, y = a*, z = c.
+# All energies (including T_start/T_end) are meV -- the solver applies no k_B.
+
+system = honeycomb_bcao
+simulation_mode = simulated_annealing
+
+lattice_size = 48,48,1
+spin_length = 0.5
+
+J1xy = -6.556
+J1z  = -2.181
+J3xy =  1.607
+J3z  =  0.137
+D    =  0.660
+E    =  0.816
+F    =  1.823
+G    = -0.771
+
+field_strength = 0.0
+field_direction = 0,1,0
+g_factor = 4.8,4.85,2.5
+
+T_start = 8.0
+T_end   = 0.00001
+annealing_steps = 5000
+overrelaxation_rate = 10
+use_twist_boundary = false
+gaussian_move = false
+cooling_rate = 0.95
+T_zero = true
+n_deterministics = 20000
+
+num_trials = 16
+output_dir = /home/pc_linux/ClassicalSpin_Cpp/output/bcao_pnas_set2_L48
+save_observables = false
