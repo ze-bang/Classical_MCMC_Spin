@@ -1450,10 +1450,18 @@ public:
      * @param save_every       save observables every N steps
      * @param seed             RNG seed; if 0, uses random_device
      */
+    /// @param on_save  optional observer invoked every save_every steps, after the
+    ///                 state has been synced back into spins[]/phonons, so that a
+    ///                 caller can emit arbitrary observables WITHOUT chopping the run
+    ///                 into separate integrate_langevin() calls. Chopping restarts the
+    ///                 noise stream, which truncates its correlations at the chunk
+    ///                 length — fatal for the Bose-coloured thermostat, whose
+    ///                 correlation time is hbar/k_B T (1.9 code units at 6 K).
     void integrate_langevin(double t_start, double t_end, double dt,
                             const string& output_dir = "",
                             size_t save_every = 100,
-                            uint64_t seed = 0);
+                            uint64_t seed = 0,
+                            const std::function<void(double)>& on_save = {});
     
     // ============================================================
     // MONTE CARLO METHODS (consistent with Lattice / StrainPhononLattice)

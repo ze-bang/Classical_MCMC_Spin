@@ -2189,7 +2189,8 @@ struct BoseNoise {
 void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
                                        const string& output_dir,
                                        size_t save_every,
-                                       uint64_t seed) {
+                                       uint64_t seed,
+                                       const std::function<void(double)>& on_save) {
     if (langevin_temperature <= 0.0) {
         std::cerr << "ERROR: integrate_langevin called with langevin_temperature = "
                   << langevin_temperature << " (must be > 0). Aborting." << std::endl;
@@ -2349,6 +2350,12 @@ void PhononLattice::integrate_langevin(double t_start, double t_end, double dt,
         // Save observables BEFORE stepping
         if (step % save_every == 0) {
             sync_back();
+            if (on_save) on_save(t);
+        }
+        // Frames are consumed only when output_dir is set; skip the (expensive,
+        // full-spin-snapshot) bookkeeping otherwise, so that a fine save cadence
+        // driven purely by on_save costs nothing.
+        if (step % save_every == 0 && !output_dir.empty()) {
             Frame f;
             f.t = t;
             f.M = magnetization_local();

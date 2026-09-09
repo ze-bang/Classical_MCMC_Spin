@@ -503,6 +503,23 @@ add_optimized_executable(spin_solver
 # phonon sides, and one-bond C_3 invariance.
 add_optimized_executable(test_e1_phonon_regressions src/apps/test_e1_phonon_regressions.cpp)
 
+# 3Q / zigzag operating point and static magnetoelastic bias: T=0 quench from a
+# seed at frozen E1 amplitude, over a J7 grid.
+add_optimized_executable(ncto_operating_point src/apps/ncto_operating_point.cpp src/apps/runners_phonon.cpp)
+
+# THz pulse scan: does one pulse convert 3Q into zigzag, as a function of J7,
+# field amplitude and polarization?  Reports the M-point order parameters vs time.
+add_optimized_executable(ncto_pulse_scan src/apps/ncto_pulse_scan.cpp src/apps/runners_phonon.cpp)
+
+# Same pulse at FINITE temperature (Langevin). Barrier crossing is impossible in the
+# T=0 deterministic dynamics, so nucleation can only be tested here.
+add_optimized_executable(ncto_pulse_thermal src/apps/ncto_pulse_thermal.cpp src/apps/runners_phonon.cpp)
+
+# Same, but with the Bose-coloured thermostat, an uninterrupted noise stream, and the
+# linear (E-channel) tilt emitted directly as spin_phonon_energy()/N.  Supersedes
+# ncto_pulse_thermal; see the header comment there for why all three matter.
+add_optimized_executable(ncto_pulse_thermal2 src/apps/ncto_pulse_thermal2.cpp src/apps/runners_phonon.cpp)
+
 # Exact PhononLattice energy evaluator for offline reaction-coordinate diagnostics.
 add_optimized_executable(evaluate_phonon_energy_path src/apps/evaluate_phonon_energy_path.cpp src/apps/runners_phonon.cpp)
 
