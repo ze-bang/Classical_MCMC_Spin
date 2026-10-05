@@ -215,7 +215,8 @@ void test_library_integrators() {
     uc.set_field(Eigen::Vector3d(0, 0, h), 0);
     Lattice lat(uc, 1, 1, 1, 1.0f);
     std::vector<SpinVector> no_drive(1, SpinVector::Zero(3));
-    for (const char* method : {"rk4", "dopri5", "rk78", "bulirsch_stoer"}) {
+    for (const char* method : {"rk4", "dopri5", "rk78", "bulirsch_stoer", "spherical_midpoint",
+                               "depondt", "color_split", "color_split4"}) {
         lat.spins[0] = Eigen::Vector3d(1, 0, 0);
         auto traj = lat.single_pulse_drive(no_drive, 0.0, 0.0, 1.0, 0.0, 0.0, 20.0, 0.01,
                                            method, false, false, 1e-10, 1e-10);
@@ -225,9 +226,117 @@ void test_library_integrators() {
             max_err = std::max(max_err, std::hypot(m(0) - std::cos(h * t), m(1) + std::sin(h * t)) +
                                             std::abs(m(2)));
         }
-        check(!traj.empty() && max_err < 1e-6,
+        // Second-order midpoint: phase error ~ (h dt)^2 t / 12 = 1.7e-4 here.
+        const double tol = (std::string(method) == "spherical_midpoint") ? 3e-4 : 1e-6;
+        check(!traj.empty() && max_err < tol,
               std::string(method) + " precession max error " + std::to_string(max_err));
     }
+}
+
+// --------------------------------------------- geometric integrators
+State random_state(Lattice& lat, unsigned seed) {
+    seed_lehman(seed);
+    State x(lat.lattice_size * 3);
+    for (size_t i = 0; i < lat.lattice_size; ++i) {
+        SpinVector s = lat.gen_random_spin(lat.spin_length);
+        for (int d = 0; d < 3; ++d) x[i * 3 + d] = s(d);
+    }
+    return x;
+}
+
+double max_norm_error(const Lattice& lat, const State& x) {
+    double e = 0.0;
+    for (size_t i = 0; i < lat.lattice_size; ++i)
+        e = std::max(e, std::abs(std::sqrt(x[3 * i] * x[3 * i] + x[3 * i + 1] * x[3 * i + 1] +
+                                           x[3 * i + 2] * x[3 * i + 2]) - lat.spin_length));
+    return e;
+}
+
+double integrate_with(Lattice& lat, State x, const std::string& method, double t1, double dt, State* out = nullptr) {
+    auto no_obs = [](const std::vector<double>&, double) {};
+    lat.integrate_geometric(x, 0.0, t1, dt, no_obs, method);
+    if (out) *out = x;
+    return 0.0;
+}
+
+void test_geometric_order() {
+    std::printf("\n== Geometric integrators: convergence order ==\n");
+    // Anisotropic chain with field + on-site term (spherical_midpoint, depondt)
+    // and an isotropic triangular AFM (colour splitting needs a linear local energy).
+    Eigen::Matrix3d J;
+    J << 0.8, 0.3, -0.2, -0.1, 0.5, 0.4, 0.25, -0.35, -0.6;
+    Lattice aniso(chain_cell(J, Eigen::Vector3d(0.3, -0.2, 0.5),
+                             Eigen::Vector3d(0.0, 0.2, -0.9).asDiagonal()), 8, 1, 1, 1.0f);
+    Lattice tri(triangular_heisenberg_cell(1.0), 3, 3, 1, 1.0f);
+    struct Case { Lattice* lat; const char* method; double order; };
+    std::vector<Case> cases = {{&aniso, "spherical_midpoint", 2}, {&aniso, "depondt", 2},
+                               {&tri, "color_split", 2}, {&tri, "color_split4", 4},
+                               {&tri, "spherical_midpoint", 2}};
+    for (auto& c : cases) {
+        State x0 = random_state(*c.lat, 17);
+        State ref = x0;
+        rk4_integrate(*c.lat, ref, 0.0, 2.0, 1e-4);
+        double err[2];
+        for (int k = 0; k < 2; ++k) {
+            State out;
+            integrate_with(*c.lat, x0, c.method, 2.0, k == 0 ? 0.02 : 0.01, &out);
+            double e = 0.0;
+            for (size_t i = 0; i < out.size(); ++i) e = std::max(e, std::abs(out[i] - ref[i]));
+            err[k] = e;
+        }
+        const double p = std::log2(err[0] / err[1]);
+        check(std::abs(p - c.order) < 0.35, std::string(c.method) + " observed order " + std::to_string(p) +
+                                                " (expected " + std::to_string(int(c.order)) + ")");
+    }
+}
+
+void test_geometric_conservation() {
+    std::printf("\n== Geometric integrators: long-time norm and energy ==\n");
+    Lattice tri(triangular_heisenberg_cell(1.0), 6, 6, 1, 1.0f);
+    State x0 = random_state(tri, 23);
+    const double E0 = energy_of(tri, x0) / tri.lattice_size;
+    for (const char* m : {"color_split", "color_split4", "spherical_midpoint", "depondt"}) {
+        State x = x0;
+        double max_dE = 0.0;
+        tri.integrate_geometric(x, 0.0, 200.0, 0.05, [&](const State& s, double) {
+            max_dE = std::max(max_dE, std::abs(energy_of(tri, s) / tri.lattice_size - E0));
+        }, m);
+        const double bound = (std::string(m).rfind("color_split", 0) == 0) ? 1e-11
+                           : (std::string(m) == "spherical_midpoint") ? 2e-3 : 2e-2;
+        check(max_norm_error(tri, x) < 1e-12, std::string(m) + " |S_i| exact after 4000 steps");
+        check(max_dE < bound, std::string(m) + " max |E(t)-E(0)|/N = " + std::to_string(max_dE));
+    }
+}
+
+void test_langevin_fdt() {
+    std::printf("\n== Langevin thermostat samples the Gibbs distribution (FDT) ==\n");
+    // Free spins in a field: <E>/N = -h L(h/T) exactly.
+    const double h = 1.0, T = 0.5;
+    UnitCell uc = simple_cubic_cell(1);
+    uc.set_field(Eigen::Vector3d(0, 0, h), 0);
+    Lattice lat(uc, 16, 16, 1, 1.0f);
+    for (double alpha : {0.3, 1.0}) {
+        for (const char* m : {"spherical_midpoint", "depondt"}) {
+            lat.alpha_gilbert = alpha;
+            lat.langevin_temperature = T;
+            seed_lehman(1234);
+            lat.init_random();
+            std::vector<double> e;
+            const double dt = 0.01;
+            lat.evolve_spins(0.0, 20.0, dt, m);  // thermalise
+            State x = lat.spins_to_state(lat.spins);
+            long k = 0;
+            lat.integrate_geometric(x, 0.0, 400.0, dt, [&](const State& s, double) {
+                if (k++ % 50 == 0) e.push_back(energy_of(lat, s) / lat.lattice_size);
+            }, m);
+            auto r = batch_means(e);
+            const double exact = -h * langevin(h / T);
+            check_stat(r.mean, r.err, exact, std::string(m) + " alpha=" + std::to_string(alpha) +
+                       " <E>/N", 5.0, 0.01 * std::abs(exact));
+        }
+    }
+    lat.langevin_temperature = 0.0;
+    lat.alpha_gilbert = 0.0;
 }
 
 }  // namespace
@@ -243,6 +352,9 @@ int main(int argc, char** argv) {
     test_magnon_dispersion();
     test_damping_dissipates();
     test_library_integrators();
+    test_geometric_order();
+    test_geometric_conservation();
+    test_langevin_fdt();
     const int rc = finish("test_md_exact");
     MPI_Finalize();
     return rc;

@@ -6,6 +6,7 @@
 #include "hdf5_io.h"
 #include "classical_spin/mc/mc_common.h"      // Common MC structs & templates
 #include "classical_spin/lattice/pulse_chunking.h"  // W3 segments + Ingredient XVIII tols
+#include "classical_spin/dynamics/spin_integrators.h"  // geometric / Langevin spin integrators
 #include <vector>
 #include <functional>
 #include <random>
@@ -562,6 +563,12 @@ public:
     // Gilbert damping parameter for LLG dynamics
     double alpha_gilbert = 0.0;       // 0 = undamped (pure LL)
 
+    // Langevin bath temperature for stochastic LLG (k_B = 1). Used by the
+    // geometric integrators (spherical_midpoint, depondt) when > 0 together
+    // with alpha_gilbert > 0; see dynamics/spin_integrators.h for the
+    // fluctuation-dissipation-consistent noise amplitude.
+    double langevin_temperature = 0.0;
+
     // ------------------------------------------------------------------
     // Persistent scratch buffers for cluster-MC sweeps.
     //
@@ -1081,7 +1088,8 @@ public:
           field_drive_amp(other.field_drive_amp),
           field_drive_freq(other.field_drive_freq),
           field_drive_width(other.field_drive_width),
-          alpha_gilbert(other.alpha_gilbert)
+          alpha_gilbert(other.alpha_gilbert),
+          langevin_temperature(other.langevin_temperature)
     {}
 
     // ============================================================
@@ -3824,7 +3832,17 @@ private:
                              bool use_adaptive = false,
                              double abs_tol = 1e-6, double rel_tol = 1e-6) {
         namespace odeint = boost::numeric::odeint;
-        
+
+        if (classical_spin::dynamics::is_geometric_method(method)) {
+            integrate_geometric(state, T_start, T_end, dt_step, observer, method);
+            return;
+        }
+        if (langevin_temperature > 0.0) {
+            throw std::invalid_argument(
+                "Langevin dynamics (langevin_temperature > 0) needs a geometric integrator: "
+                "spherical_midpoint or depondt (got '" + method + "')");
+        }
+
         if (method == "euler") {
             // Explicit Euler method (1st order, simple but inaccurate)
             odeint::integrate_const(
@@ -4092,6 +4110,100 @@ private:
     }
 
 public:
+    /**
+     * Pulse envelopes of the two drive components at time t (amplitude
+     * included): f_k = A exp(-((t - t_k) / 2w)^2) cos(ω (t - t_k)).
+     */
+    void drive_envelopes(double t, double& f1, double& f2) const {
+        f1 = f2 = 0.0;
+        if (field_drive_amp == 0.0) return;
+        const double dt1 = t - t_pulse[0], dt2 = t - t_pulse[1];
+        const double w2 = 2.0 * field_drive_width;
+        f1 = field_drive_amp * std::exp(-(dt1 / w2) * (dt1 / w2)) * std::cos(field_drive_freq * dt1);
+        f2 = field_drive_amp * std::exp(-(dt2 / w2) * (dt2 / w2)) * std::cos(field_drive_freq * dt2);
+    }
+
+    /**
+     * Adapter exposing the lattice to the geometric integrators of
+     * dynamics/spin_integrators.h: effective fields B_i = -∂E/∂S_i (drive
+     * included) and the sublattice colouring.
+     */
+    struct DynamicsModel {
+        const Lattice& lat;
+        mutable double f1 = 0.0, f2 = 0.0;   // drive envelopes cached by set_time
+
+        size_t n_sites() const { return lat.lattice_size; }
+        double spin_length() const { return double(lat.spin_length); }
+        void set_time(double t) const { lat.drive_envelopes(t, f1, f2); }
+        void field_site(const double* x, double, size_t i, double* B) const {
+            double H[MAX_SPIN_DIM];
+            lat.get_local_field_flat(x, i, H);
+            if (lat.field_drive_amp != 0.0) lat.apply_drive_field_flat(i, f1, f2, H);
+            for (size_t d = 0; d < 3; ++d) B[d] = -H[d];
+        }
+        void field_all(const double* x, double t, double* B) const {
+            set_time(t);
+            const size_t N = lat.lattice_size;
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if(N >= 512)
+#endif
+            for (size_t i = 0; i < N; ++i) field_site(x, t, i, B + 3 * i);
+        }
+        size_t n_colors() const { return lat.n_colors; }
+        const size_t* color_sites(size_t c, size_t& count) const {
+            count = lat.sites_by_color_csr_off[c + 1] - lat.sites_by_color_csr_off[c];
+            return lat.sites_by_color_csr.data() + lat.sites_by_color_csr_off[c];
+        }
+        bool energy_linear_in_each_spin() const {
+            for (size_t i = 0; i < lat.lattice_size; ++i)
+                if (!lat.onsite_is_scalar(i)) return false;
+            return true;
+        }
+    };
+
+    /**
+     * Fixed-step integration with a norm-preserving geometric method
+     * (spherical_midpoint, depondt, color_split, color_split4), stochastic
+     * when langevin_temperature > 0. The step is adjusted to divide
+     * [t0, t1] exactly; the observer is called at t0 and after every step,
+     * like odeint::integrate_const.
+     */
+    template<typename Observer>
+    void integrate_geometric(ODEState& state, double t0, double t1, double dt,
+                             Observer observer, const string& method) const {
+        if (spin_dim != 3) {
+            throw std::invalid_argument("geometric spin integrators need spin_dim == 3 (got " +
+                                        std::to_string(spin_dim) + ")");
+        }
+        if (!(dt > 0.0)) throw std::invalid_argument("integrate_geometric: dt must be positive");
+        DynamicsModel model{*this};
+        classical_spin::dynamics::SpinIntegrator<DynamicsModel> integrator(
+            model, classical_spin::dynamics::parse_geometric_method(method),
+            {alpha_gilbert, langevin_temperature});
+        const long n_steps = std::max(0L, std::lround((t1 - t0) / dt));
+        const double h = (n_steps > 0) ? (t1 - t0) / double(n_steps) : 0.0;
+        observer(state, t0);
+        for (long k = 0; k < n_steps; ++k) {
+            integrator.step(state.data(), t0 + double(k) * h, h);
+            observer(state, t0 + double(k + 1) * h);
+        }
+    }
+
+    /**
+     * Evolve the lattice's own spins in place from t0 to t1 (fixed step dt)
+     * with a geometric integrator; `observer(spins_flat, t)` is optional.
+     */
+    template<typename Observer>
+    void evolve_spins(double t0, double t1, double dt, const string& method, Observer observer) {
+        ODEState state = spins_to_state(spins);
+        integrate_geometric(state, t0, t1, dt, observer, method);
+        for (size_t i = 0; i < lattice_size; ++i)
+            for (size_t d = 0; d < spin_dim; ++d) spins[i](d) = state[i * spin_dim + d];
+    }
+    void evolve_spins(double t0, double t1, double dt, const string& method) {
+        evolve_spins(t0, t1, dt, method, [](const ODEState&, double) {});
+    }
+
     /**
      * ODE system function for Boost.Odeint: dx/dt = f(x, t)
      * Zero-allocation version working directly with flat arrays
