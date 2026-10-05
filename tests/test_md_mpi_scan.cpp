@@ -4,6 +4,8 @@
 //     too) writes exactly the file the single-process scan writes: every
 //     dataset bitwise identical, for a stationary ground state (W1 on) and a
 //     non-stationary one (every M1 integrated on the workers).
+//     Rank 0's twisted-boundary state is broadcast with its spins (workers
+//     used to integrate an untwisted Hamiltonian).
 //  2. The scan runs on any communicator: two sub-communicators of
 //     MPI_COMM_WORLD scan concurrently without touching each other.
 //  3. A failure in the middle of the scan (the spherical-midpoint solver
@@ -94,6 +96,35 @@ int main(int argc, char** argv) {
             check(same, std::string(stationary ? "stationary" : "non-stationary") +
                         " ground state: MPI scan file == serial scan file " + why);
         }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    // ---- 1b. rank 0's twisted boundaries reach the workers ----
+    {
+        seed_lehman(91);
+        lat.init_random();
+        if (rank == 0) {   // e.g. left over from rank 0's annealing with use_twist_boundary
+            lat.twist_angles[0] = 0.4;
+            lat.twist_matrices[0] = Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+            lat.sync_twist_state();
+        }
+        const std::string mpi_dir = (root / "mpi_twist").string(), ser_dir = (root / "ser_twist").string();
+        lat.pump_probe_spectroscopy_mpi(field, 0.3, 0.5, 2.0, -3.0, 3.0, 0.5, -6.0, 12.0, 0.05,
+                                        0, 0, 0, false, 0, mpi_dir, "rk4", false, true, 1e-9);
+        if (rank == 0) {
+            lat.pump_probe_spectroscopy(field, 0.3, 0.5, 2.0, -3.0, 3.0, 0.5, -6.0, 12.0, 0.05,
+                                        0, 0, 0, false, 0, ser_dir, "rk4", false, true, 1e-9, 1);
+            std::string why;
+            check(same_file(mpi_dir + "/pump_probe_spectroscopy.h5", ser_dir + "/pump_probe_spectroscopy.h5",
+                            n_tau, why),
+                  "twisted boundaries on rank 0 only: MPI scan == serial scan " + why);
+        }
+        int adopted = lat.twist_active ? 1 : 0, all_adopted = 0;
+        MPI_Allreduce(&adopted, &all_adopted, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+        if (rank == 0) check(all_adopted == 1, "every rank adopted rank 0's twist state");
+        for (auto& tm : lat.twist_matrices) tm = Eigen::Matrix3d::Identity();
+        lat.twist_angles = {0.0, 0.0, 0.0};
+        lat.sync_twist_state();
         MPI_Barrier(MPI_COMM_WORLD);
     }
 

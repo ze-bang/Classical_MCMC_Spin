@@ -579,6 +579,11 @@ public:
     // fluctuation-dissipation-consistent noise amplitude.
     double langevin_temperature = 0.0;
 
+    // Normalisation of the damped equation of motion: Landau-Lifshitz form
+    // (default, damping constant λ = alpha_gilbert) or Gilbert form (the same
+    // divided by 1 + α²); see dynamics/spin_integrators.h.
+    classical_spin::dynamics::DampingForm damping_form = classical_spin::dynamics::DampingForm::LandauLifshitz;
+
     // ------------------------------------------------------------------
     // Persistent scratch buffers for cluster-MC sweeps.
     //
@@ -1144,6 +1149,7 @@ public:
           active_drive(other.active_drive),
           alpha_gilbert(other.alpha_gilbert),
           langevin_temperature(other.langevin_temperature),
+          damping_form(other.damping_form),
           local_update(other.local_update),
           parallel_sweep_min_sites(other.parallel_sweep_min_sites)
     {}
@@ -3845,11 +3851,11 @@ public:
     //
     // Equation of motion (γ = ħ = 1):
     //
-    //   dS_i/dt = S_i × B_i - (α/|S_i|) S_i × (S_i × B_i),
+    //   dS_i/dt = g [S_i × B_i - (α/|S_i|) S_i × (S_i × B_i)],
     //   B_i     = -∂E/∂S_i + B_drive(t, i),
     //
-    // i.e. Gilbert damping in Landau-Lifshitz form with λ = alpha_gilbert
-    // (the Gilbert form differs by rescaling time with 1 + α²). For
+    // with g = 1 (damping_form Landau-Lifshitz, λ = alpha_gilbert, default) or
+    // g = 1/(1 + α²) (Gilbert form). For
     // spin_dim = 8 (SU(3)) × is the structure-constant product
     // (a × b)_i = f_ijk a_j b_k; the damping term keeps its double-bracket
     // form and still dissipates, dE/dt = -(α/|S|) |∂E/∂S × S|² <= 0, while
@@ -3973,9 +3979,8 @@ public:
      * Integrate `state` across `grid`; `observer` is called exactly once per
      * sample, k = 0 .. grid.n - 1, with t = grid[k], and `state` ends at
      * grid.t_end().
-     *   - geometric and fixed-step methods take ceil-free integer sub-steps:
-     *     m = max(1, round(grid.dt / settings.dt)) steps of grid.dt / m per
-     *     sample interval;
+     *   - geometric and fixed-step methods take m = max(1, round(grid.dt /
+     *     settings.dt)) steps of exactly grid.dt / m per sample interval;
      *   - dopri5 / bulirsch_stoer use dense output (steps chosen by the error
      *     controller, samples interpolated at the exact grid times);
      *     cash_karp54 / rkf78 step exactly onto each sample time.
@@ -3989,19 +3994,6 @@ public:
     /** Magnetisation trajectory of the current spins under `drive` on `grid`. */
     PumpProbeTrajectory drive_trajectory(const DriveSchedule& drive, const TimeGrid& grid,
                                          const DynamicsSettings& settings) const;
-
-    /**
-     * Pulse envelopes of the installed two-pulse drive at time t (amplitude
-     * included): f_k = A exp(-((t - t_k) / 2w)^2) cos(ω (t - t_k)).
-     */
-    void drive_envelopes(double t, double& f1, double& f2) const {
-        f1 = f2 = 0.0;
-        if (field_drive_amp == 0.0) return;
-        const double dt1 = t - t_pulse[0], dt2 = t - t_pulse[1];
-        const double w2 = 2.0 * field_drive_width;
-        f1 = field_drive_amp * std::exp(-(dt1 / w2) * (dt1 / w2)) * std::cos(field_drive_freq * dt1);
-        f2 = field_drive_amp * std::exp(-(dt2 / w2) * (dt2 / w2)) * std::cos(field_drive_freq * dt2);
-    }
 
     /**
      * Adapter exposing the lattice to the geometric integrators of
@@ -4062,7 +4054,7 @@ public:
         DynamicsModel model{*this};
         classical_spin::dynamics::SpinIntegrator<DynamicsModel> integrator(
             model, classical_spin::dynamics::parse_geometric_method(method),
-            {alpha_gilbert, langevin_temperature});
+            {alpha_gilbert, langevin_temperature, damping_form});
         const long n_steps = std::max(0L, std::lround((t1 - t0) / dt));
         const double h = (n_steps > 0) ? (t1 - t0) / double(n_steps) : 0.0;
         observer(state, t0);
@@ -4805,6 +4797,11 @@ private:
                                      double abs_tol, double rel_tol) const;
     void run_pump_probe_scan(const PumpProbeScanSpec& spec, MPI_Comm comm, int outer_omp_threads) const;
 
+    /// Copy root's dynamical state (spins, twist matrices and angles, damping,
+    /// bath temperature) to every rank of comm, so all ranks integrate the
+    /// same Hamiltonian from the same state.
+    void broadcast_dynamical_state(MPI_Comm comm, int root);
+
     /**
      * W1 time translation of a reference single-pulse response R (flat, 3 *
      * spin_dim values per sample, sample j at t0 + (ref_j0 + j) dt of the scan
@@ -4838,6 +4835,23 @@ public:
         for (size_t i = 0; i < trilinear_partners.size(); ++i) {
             if (!trilinear_partners[i].empty()) return true;
         }
+        return false;
+    }
+
+    /**
+     * Whether the GPU right-hand side implements the current model. The GPU
+     * kernels have no trilinear term, no damping, no Langevin noise and no
+     * twisted boundaries, and handle spin_dim 3 and 8 only; the dynamics
+     * drivers fall back to the CPU (with a warning naming `reason`) instead of
+     * silently integrating a different equation of motion.
+     */
+    bool gpu_supports_model(string& reason) const {
+        if (spin_dim != 3 && spin_dim != 8) reason = "spin_dim " + std::to_string(spin_dim);
+        else if (has_trilinear_interactions()) reason = "trilinear couplings";
+        else if (alpha_gilbert != 0.0) reason = "Gilbert damping";
+        else if (langevin_temperature != 0.0) reason = "Langevin bath";
+        else if (twist_active) reason = "twisted boundaries";
+        else return true;
         return false;
     }
 

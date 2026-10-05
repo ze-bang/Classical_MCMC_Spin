@@ -142,6 +142,9 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "md_integrator" || key == "integrator") {
                 config.md_integrator = value;
             }
+            else if (key == "damping_form") {
+                config.damping_form = value;
+            }
             else if (key == "md_abs_tol") {
                 config.md_abs_tol = stod(value);
             }
@@ -551,6 +554,7 @@ void SpinConfig::to_file(const string& filename) const {
     file << "md_time_end = " << md_time_end << "\n";
     file << "md_timestep = " << md_timestep << "\n";
     file << "md_integrator = " << md_integrator << "\n";
+    file << "damping_form = " << damping_form << "\n";
     file << "use_gpu = " << (use_gpu ? "true" : "false") << "\n\n";
     
     file << "# Parallel Tempering Parameters\n";
@@ -644,6 +648,12 @@ bool SpinConfig::validate() const {
             classical_spin::dynamics::parse_ode_method(md_integrator);
         } catch (const std::invalid_argument& e) {
             cerr << "Error: md_integrator: " << e.what() << "\n";
+            valid = false;
+        }
+        try {
+            classical_spin::dynamics::parse_damping_form(damping_form);
+        } catch (const std::invalid_argument& e) {
+            cerr << "Error: " << e.what() << "\n";
             valid = false;
         }
         if (!(md_timestep > 0.0)) {

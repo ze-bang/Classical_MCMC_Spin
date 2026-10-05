@@ -265,6 +265,7 @@ namespace {
 void apply_dynamics_config(Lattice& lattice, const SpinConfig& config) {
     lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.0);
     lattice.langevin_temperature = config.get_param("langevin_temperature", 0.0);
+    lattice.damping_form = classical_spin::dynamics::parse_damping_form(config.damping_form);
     if (lattice.alpha_gilbert < 0.0 || lattice.langevin_temperature < 0.0)
         throw invalid_argument("alpha_gilbert and langevin_temperature must be >= 0");
 }
@@ -272,28 +273,31 @@ void apply_dynamics_config(Lattice& lattice, const SpinConfig& config) {
 void report_dynamics_config(const Lattice& lattice, const SpinConfig& config) {
     cout << "Integrator: " << config.md_integrator << ", dt = " << config.md_timestep
          << ", t = " << config.md_time_start << " -> " << config.md_time_end << endl;
-    if (lattice.alpha_gilbert > 0.0) cout << "Damping: alpha = " << lattice.alpha_gilbert << endl;
+    if (lattice.alpha_gilbert > 0.0)
+        cout << "Damping: alpha = " << lattice.alpha_gilbert << " (" << config.damping_form << " form)" << endl;
     if (lattice.langevin_temperature > 0.0)
         cout << "Langevin bath: T = " << lattice.langevin_temperature << endl;
-#ifndef CUDA_ENABLED
-    if (config.use_gpu) cout << "GPU requested but not compiled in (CUDA_ENABLED); using the CPU" << endl;
-#endif
 }
 
+/// The GPU flag handed to the drivers: config.use_gpu only when a device is
+/// actually usable (this rank is then bound to one, round robin), so a
+/// "falling back to the CPU" message is true.
+bool select_gpu(const SpinConfig& config, int rank) {
+    if (!config.use_gpu) return false;
 #ifdef CUDA_ENABLED
-/// Bind this rank to a GPU (round robin over the visible devices).
-void bind_gpu(const SpinConfig& config, int rank) {
-    if (!config.use_gpu) return;
     int device_count = 0;
-    cudaGetDeviceCount(&device_count);
-    if (device_count > 0) {
-        cudaSetDevice(rank % device_count);
-        cout << "[Rank " << rank << "] GPU " << (rank % device_count) << " of " << device_count << endl;
-    } else if (rank == 0) {
-        cout << "Warning: no GPU detected, using the CPU" << endl;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+        if (rank == 0) cout << "Warning: no usable GPU; running on the CPU" << endl;
+        return false;
     }
-}
+    cudaSetDevice(rank % device_count);
+    cout << "[Rank " << rank << "] GPU " << (rank % device_count) << " of " << device_count << endl;
+    return true;
+#else
+    if (rank == 0) cout << "GPU requested but not compiled in (CUDA_ENABLED); running on the CPU" << endl;
+    return false;
 #endif
+}
 
 /**
  * One polarisation per sublattice from a config list of directions: either
@@ -386,9 +390,7 @@ void run_molecular_dynamics(Lattice& lattice, const SpinConfig& config, int rank
         cout << "Running molecular dynamics: " << config.num_trials << " trial(s) on " << size << " rank(s)" << endl;
         report_dynamics_config(lattice, config);
     }
-#ifdef CUDA_ENABLED
-    bind_gpu(config, rank);
-#endif
+    const bool gpu = select_gpu(config, rank);
     const Lattice::SpinConfig start = lattice.spins;
     for_each_trial(config, rank, size, [&](int trial) {
         const string trial_dir = config.output_dir + "/sample_" + to_string(trial);
@@ -397,7 +399,7 @@ void run_molecular_dynamics(Lattice& lattice, const SpinConfig& config, int rank
         lattice.save_spin_config(trial_dir + "/initial_spins.txt");
         lattice.molecular_dynamics(config.md_time_start, config.md_time_end, config.md_timestep,
                                    trial_dir, config.md_save_interval, config.md_integrator,
-                                   config.use_gpu, config.md_abs_tol, config.md_rel_tol);
+                                   gpu, config.md_abs_tol, config.md_rel_tol);
         cout << "[Rank " << rank << "] trial " << trial << " -> " << trial_dir << "/trajectory.h5" << endl;
     });
     if (rank == 0) cout << "Molecular dynamics completed (" << config.num_trials << " trials)." << endl;
@@ -418,10 +420,11 @@ void run_pump_probe(Lattice& lattice, const SpinConfig& config, int rank, int si
     using classical_spin::dynamics::TimeGrid;
     apply_dynamics_config(lattice, config);
     const vector<SpinVector> pump_dirs = pulse_directions(config.pump_directions, lattice, "pump_direction");
-    const vector<SpinVector> probe_dirs = pulse_directions({config.probe_direction}, lattice, "probe_direction");
     const Pulse pump{config.pump_time, config.pump_amplitude, config.pump_width, config.pump_frequency};
     const Pulse probe{config.probe_time, config.probe_amplitude, config.probe_width, config.probe_frequency};
     const bool with_probe = (config.probe_amplitude != 0.0);
+    const vector<SpinVector> probe_dirs =
+        with_probe ? pulse_directions({config.probe_direction}, lattice, "probe_direction") : pump_dirs;
     const bool references = with_probe && lattice.langevin_temperature == 0.0;
     if (rank == 0) {
         cout << "Running pump-probe: " << config.num_trials << " trial(s) on " << size << " rank(s)" << endl;
@@ -434,9 +437,7 @@ void run_pump_probe(Lattice& lattice, const SpinConfig& config, int rank, int si
         else
             cout << "Probe: off (probe_amplitude = 0)" << endl;
     }
-#ifdef CUDA_ENABLED
-    bind_gpu(config, rank);
-#endif
+    const bool gpu = select_gpu(config, rank);
     const TimeGrid grid = TimeGrid::covering(config.md_time_start, config.md_time_end, config.md_timestep,
                                              "pump-probe time grid");
     const Lattice::DynamicsSettings settings{config.md_integrator, config.md_timestep,
@@ -452,7 +453,7 @@ void run_pump_probe(Lattice& lattice, const SpinConfig& config, int rank, int si
         lattice.add_pulse(both, pump_dirs, pump);
         if (with_probe) lattice.add_pulse(both, probe_dirs, probe);
         Lattice::PumpProbeTrajectory M01, M0, M1;
-        if (config.use_gpu && !with_probe) {
+        if (gpu && !with_probe) {
             M01 = lattice.single_pulse_drive(pump_dirs, pump.t_center, pump.amplitude, pump.width,
                                              pump.frequency, config.md_time_start, config.md_time_end,
                                              config.md_timestep, config.md_integrator, true, false,
@@ -500,7 +501,8 @@ void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, int rank,
     apply_dynamics_config(lattice, config);
     const vector<SpinVector> field_dirs = pulse_directions(config.pump_directions, lattice, "pump_direction");
     // GPU batched path: with use_gpu one launch handles every delay, so route
-    // there even on a single rank.
+    // there even on a single rank. The routing depends on the config only, so
+    // every rank takes the same branch.
     const bool use_tau_parallel = (config.num_trials == 1) && config.parallel_tau &&
                                   ((size > 1) || config.use_gpu);
     // A runner called with size == 1 (e.g. one point of a parameter sweep)
@@ -514,9 +516,7 @@ void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, int rank,
         cout << "Pulse: A = " << config.pump_amplitude << ", w = " << config.pump_width
              << ", omega = " << config.pump_frequency << endl;
     }
-#ifdef CUDA_ENABLED
-    bind_gpu(config, rank);
-#endif
+    const bool gpu = select_gpu(config, rank);
     const Lattice::SpinConfig start = lattice.spins;
     auto scan = [&](const string& trial_dir, bool parallel) {
         if (parallel) {
@@ -525,7 +525,7 @@ void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, int rank,
                 config.tau_start, config.tau_end, config.tau_step,
                 config.md_time_start, config.md_time_end, config.md_timestep,
                 config.T_start, config.T_end, config.annealing_steps, config.T_zero, config.n_deterministics,
-                trial_dir, config.md_integrator, config.use_gpu,
+                trial_dir, config.md_integrator, gpu,
                 config.reuse_m0_for_m1, config.stationarity_tol, config.pulse_window_chunking,
                 config.pump_probe_abs_tol, config.pump_probe_rel_tol, comm);
         } else {
@@ -534,7 +534,7 @@ void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, int rank,
                 config.tau_start, config.tau_end, config.tau_step,
                 config.md_time_start, config.md_time_end, config.md_timestep,
                 config.T_start, config.T_end, config.annealing_steps, config.T_zero, config.n_deterministics,
-                trial_dir, config.md_integrator, config.use_gpu,
+                trial_dir, config.md_integrator, gpu,
                 config.reuse_m0_for_m1, config.stationarity_tol, config.pump_probe_omp_threads,
                 config.pulse_window_chunking, config.pump_probe_abs_tol, config.pump_probe_rel_tol);
         }

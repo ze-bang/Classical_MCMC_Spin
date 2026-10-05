@@ -63,6 +63,17 @@ void warn_no_gpu() {
                  "running on the CPU." << std::endl;
 }
 
+#ifdef CUDA_ENABLED
+// use_gpu honoured only when the GPU kernels implement the model.
+bool gpu_usable(const Lattice& lat) {
+    std::string reason;
+    if (lat.gpu_supports_model(reason)) return true;
+    std::cerr << "Warning: the GPU right-hand side does not support " << reason
+              << "; running on the CPU." << std::endl;
+    return false;
+}
+#endif
+
 }  // namespace
 
 // ============================================================
@@ -76,6 +87,8 @@ void Lattice::landau_lifshitz_rhs(const double* x, double* dxdt, double t, const
     drive.envelopes(t, f);
     const bool driven = !drive.empty();
     const double alpha = alpha_gilbert;
+    // Overall prefactor: 1 in Landau-Lifshitz form, 1/(1+α²) in Gilbert form.
+    const double g = classical_spin::dynamics::LangevinParams{alpha, 0.0, damping_form}.prefactor();
     const size_t N = lattice_size;
 
     if (spin_dim == 3) {
@@ -103,9 +116,9 @@ void Lattice::landau_lifshitz_rhs(const double* x, double* dxdt, double t, const
                 const double k = alpha / std::sqrt(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
                 d0 -= k * c0; d1 -= k * c1; d2 -= k * c2;
             }
-            dxdt[3 * i + 0] = d0;
-            dxdt[3 * i + 1] = d1;
-            dxdt[3 * i + 2] = d2;
+            dxdt[3 * i + 0] = g * d0;
+            dxdt[3 * i + 1] = g * d1;
+            dxdt[3 * i + 2] = g * d2;
         }
     } else if (spin_dim == 8) {
         // SU(3): (a × b)_i = f_ijk a_j b_k over the 54 non-zero structure
@@ -133,7 +146,7 @@ void Lattice::landau_lifshitz_rhs(const double* x, double* dxdt, double t, const
                 double n2 = 0.0;
                 for (int d = 0; d < 8; ++d) n2 += S[d] * S[d];
                 const double k = alpha / std::sqrt(n2);
-                for (int d = 0; d < 8; ++d) out[d] -= k * C[d];
+                for (int d = 0; d < 8; ++d) out[d] = g * (out[d] - k * C[d]);
             }
         }
     } else {
@@ -330,7 +343,7 @@ void Lattice::integrate_on_grid(ODEState& state, const TimeGrid& grid, const Dri
                                                 std::to_string(spin_dim) + "); use rk4 or dopri5 for SU(3)");
                 DynamicsModel model{*this, &drive};
                 dyn::SpinIntegrator<DynamicsModel> integrator(model, dyn::to_geometric(method),
-                                                              {alpha_gilbert, langevin_temperature});
+                                                              {alpha_gilbert, langevin_temperature, damping_form});
                 run([&](double t, double dt) { integrator.step(state.data(), t, dt); });
                 break;
             }
@@ -413,8 +426,15 @@ vector<double> Lattice::record_magnetizations(ODEState x0, const TimeGrid& grid,
     const size_t D3 = 3 * spin_dim;
     vector<double> out(grid.n * D3);
     vector<double> scratch(N_atoms * spin_dim);
-    integrate_on_grid(x0, grid, drive, settings, [&](const double* x, size_t k, double) {
-        measure_magnetizations(x, out.data() + k * D3, scratch.data());
+    integrate_on_grid(x0, grid, drive, settings, [&](const double* x, size_t k, double t) {
+        double* m = out.data() + k * D3;
+        measure_magnetizations(x, m, scratch.data());
+        // Every spin enters the sums, so a NaN/Inf anywhere shows up here.
+        for (size_t c = 0; c < D3; ++c) {
+            if (!std::isfinite(m[c]))
+                throw std::runtime_error("spin dynamics diverged (non-finite state at t = " + std::to_string(t) +
+                                         "); reduce the time step or tighten the tolerances");
+        }
         if (on_sample) on_sample();
     });
     return out;
@@ -456,11 +476,23 @@ Lattice::PumpProbeTrajectory Lattice::drive_trajectory(const DriveSchedule& driv
 namespace {
 
 #ifdef HDF5_ENABLED
+// H5::Exception does not derive from std::exception: convert it, so callers
+// (trial loops, MPI error agreement) see every I/O failure.
+template<class F>
+void hdf5_io(const char* what, F&& f) {
+    try {
+        f();
+    } catch (const H5::Exception& e) {
+        throw std::runtime_error(std::string(what) + ": HDF5: " + e.getDetailMsg());
+    }
+}
+
 // Diagnostics and grid metadata appended to the trajectory file written by
 // HDF5MDWriter (which owns the /trajectory datasets it creates).
 void append_md_diagnostics(const std::string& file, const std::vector<double>& energy,
                            const std::vector<double>& norm_err, double dt_save,
-                           double alpha, double temperature, const std::string& method) {
+                           double alpha, double temperature, const std::string& method,
+                           const std::string& damping_form) {
     H5::H5File f(file, H5F_ACC_RDWR);
     H5::Group traj = f.openGroup("/trajectory");
     hsize_t dims[1] = {energy.size()};
@@ -477,8 +509,12 @@ void append_md_diagnostics(const std::string& file, const std::vector<double>& e
     attr("dt_save", dt_save);
     attr("alpha_gilbert", alpha);
     attr("langevin_temperature", temperature);
-    H5::StrType str_type(H5::PredType::C_S1, method.size() + 1);
-    meta.createAttribute("integrator", str_type, scalar).write(str_type, method.c_str());
+    auto str_attr = [&](const char* name, const std::string& v) {
+        H5::StrType str_type(H5::PredType::C_S1, v.size() + 1);
+        meta.createAttribute(name, str_type, scalar).write(str_type, v.c_str());
+    };
+    str_attr("integrator", method);
+    str_attr("damping_form", damping_form);
 }
 #endif
 
@@ -494,8 +530,10 @@ void Lattice::molecular_dynamics(double T_start, double T_end, double dt_initial
     const OdeMethod m = dyn::parse_ode_method(method);
     if (use_gpu) {
 #ifdef CUDA_ENABLED
-        molecular_dynamics_gpu(T_start, T_end, dt_initial, out_dir, save_interval, method);
-        return;
+        if (gpu_usable(*this)) {
+            molecular_dynamics_gpu(T_start, T_end, dt_initial, out_dir, save_interval, method);
+            return;
+        }
 #else
         warn_no_gpu();
 #endif
@@ -523,9 +561,11 @@ void Lattice::molecular_dynamics(double T_start, double T_end, double dt_initial
     const string h5_file = out_dir.empty() ? string() : out_dir + "/trajectory.h5";
     std::unique_ptr<HDF5MDWriter> writer;
     if (!out_dir.empty()) {
-        writer = std::make_unique<HDF5MDWriter>(h5_file, lattice_size, spin_dim, N_atoms, dim1, dim2, dim3,
-                                                method, dt_initial, T_start, T_end, save_interval,
-                                                spin_length, &site_positions, grid.n);
+        hdf5_io("molecular_dynamics: creating the trajectory file", [&] {
+            writer = std::make_unique<HDF5MDWriter>(h5_file, lattice_size, spin_dim, N_atoms, dim1, dim2, dim3,
+                                                    method, dt_initial, T_start, T_end, save_interval,
+                                                    spin_length, &site_positions, grid.n);
+        });
     }
 #endif
     ODEState x = spins_to_state(spins);
@@ -537,6 +577,9 @@ void Lattice::molecular_dynamics(double T_start, double T_end, double dt_initial
     integrate_on_grid(x, grid, active_drive, settings, [&](const double* xs, size_t k, double t) {
         measure_magnetizations(xs, mags.data(), scratch.data());
         energy[k] = total_energy_flat(xs) / double(lattice_size);
+        if (!std::isfinite(energy[k]))
+            throw std::runtime_error("molecular_dynamics diverged (non-finite energy at t = " + std::to_string(t) +
+                                     "); reduce the time step or tighten the tolerances");
         double err = 0.0;
         for (size_t i = 0; i < lattice_size; ++i) {
             double n2 = 0.0;
@@ -547,9 +590,11 @@ void Lattice::molecular_dynamics(double T_start, double T_end, double dt_initial
 #ifdef HDF5_ENABLED
         if (writer) {
             const Eigen::Index Di = Eigen::Index(D);
-            writer->write_flat_step(t, Eigen::Map<const Eigen::VectorXd>(mags.data(), Di),
-                                    Eigen::Map<const Eigen::VectorXd>(mags.data() + D, Di),
-                                    Eigen::Map<const Eigen::VectorXd>(mags.data() + 2 * D, Di), xs);
+            hdf5_io("molecular_dynamics: writing a sample", [&] {
+                writer->write_flat_step(t, Eigen::Map<const Eigen::VectorXd>(mags.data(), Di),
+                                        Eigen::Map<const Eigen::VectorXd>(mags.data() + D, Di),
+                                        Eigen::Map<const Eigen::VectorXd>(mags.data() + 2 * D, Di), xs);
+            });
         }
 #endif
         if (k % report_every == 0 || k + 1 == grid.n) {
@@ -560,10 +605,13 @@ void Lattice::molecular_dynamics(double T_start, double T_end, double dt_initial
 
 #ifdef HDF5_ENABLED
     if (writer) {
-        writer->close();
-        writer.reset();
-        append_md_diagnostics(h5_file, energy, norm_err, grid.dt, alpha_gilbert, langevin_temperature,
-                              dyn::ode_method_name(m));
+        hdf5_io("molecular_dynamics: finishing the trajectory file", [&] {
+            writer->close();
+            writer.reset();
+            append_md_diagnostics(h5_file, energy, norm_err, grid.dt, alpha_gilbert, langevin_temperature,
+                                  dyn::ode_method_name(m),
+                                  damping_form == dyn::DampingForm::Gilbert ? "gilbert" : "landau_lifshitz");
+        });
         cout << "Trajectory written to " << h5_file << " (" << grid.n << " samples)" << endl;
     }
 #endif
@@ -614,8 +662,9 @@ Lattice::PumpProbeTrajectory Lattice::single_pulse_drive(
     double abs_tol, double rel_tol) {
     if (use_gpu) {
 #ifdef CUDA_ENABLED
-        return single_pulse_drive_gpu(field_in, t_B, pulse_amp, pulse_width, pulse_freq,
-                                      T_start, T_end, step_size, method);
+        if (gpu_usable(*this))
+            return single_pulse_drive_gpu(field_in, t_B, pulse_amp, pulse_width, pulse_freq,
+                                          T_start, T_end, step_size, method);
 #else
         warn_no_gpu();
 #endif
@@ -635,9 +684,10 @@ Lattice::PumpProbeTrajectory Lattice::double_pulse_drive(
     double abs_tol, double rel_tol) {
     if (use_gpu) {
 #ifdef CUDA_ENABLED
-        return double_pulse_drive_gpu(field_in_1, t_B_1, field_in_2, t_B_2,
-                                      pulse_amp, pulse_width, pulse_freq,
-                                      T_start, T_end, step_size, method);
+        if (gpu_usable(*this))
+            return double_pulse_drive_gpu(field_in_1, t_B_1, field_in_2, t_B_2,
+                                          pulse_amp, pulse_width, pulse_freq,
+                                          T_start, T_end, step_size, method);
 #else
         warn_no_gpu();
 #endif
@@ -918,20 +968,35 @@ void Lattice::run_pump_probe_scan(const PumpProbeScanSpec& spec, MPI_Comm comm_i
     } catch (const std::exception& e) {
         error = e.what();
     }
+#ifdef HDF5_ENABLED
+    catch (const H5::Exception& e) {
+        error = "HDF5: " + e.getDetailMsg();
+    }
+#endif
     agree_or_throw(comm, error, "pump-probe scan setup");
 
     const size_t D3 = scan->D3;
     std::string failure;   // first failure seen by rank 0 (or by the OpenMP loop)
+    size_t written = 0;
+    // Called by one thread at a time on rank 0. HDF5 errors (not std::exceptions)
+    // are converted so that every caller's handler sees them.
     auto write = [&](size_t i, const double* M1, const double* M01) {
 #ifdef HDF5_ENABLED
         if (writer) {
             const vector<double> m1(M1, M1 + n * D3), m01(M01, M01 + n * D3);
-            writer->write_tau_trajectory(int(i), spec.taus[i], to_trajectory(m1, spec.grid),
-                                         to_trajectory(m01, spec.grid));
+            try {
+                writer->write_tau_trajectory(int(i), spec.taus[i], to_trajectory(m1, spec.grid),
+                                             to_trajectory(m01, spec.grid));
+            } catch (const H5::Exception& e) {
+                throw std::runtime_error("writing delay " + std::to_string(spec.taus[i]) + ": HDF5: " +
+                                         e.getDetailMsg());
+            }
         }
 #else
         (void) i; (void) M1; (void) M01;
 #endif
+        if (++written % std::max<size_t>(1, n_tau / 10) == 0 || written == n_tau)
+            cout << "  delays done: " << written << "/" << n_tau << endl;
     };
 
     if (size == 1) {
@@ -971,12 +1036,7 @@ void Lattice::run_pump_probe_scan(const PumpProbeScanSpec& spec, MPI_Comm comm_i
 #endif
         } else {
             vector<double> M1(n * D3), M01(n * D3);
-            for (size_t i = 0; i < n_tau; ++i) {
-                one(i, M1, M01);
-                if (!failure.empty()) break;
-                if ((i + 1) % std::max<size_t>(1, n_tau / 10) == 0)
-                    cout << "  delays done: " << (i + 1) << "/" << n_tau << endl;
-            }
+            for (size_t i = 0; i < n_tau && failure.empty(); ++i) one(i, M1, M01);
         }
 #ifdef _OPENMP
         omp_set_max_active_levels(saved_levels);
@@ -1098,6 +1158,11 @@ void Lattice::run_pump_probe_scan(const PumpProbeScanSpec& spec, MPI_Comm comm_i
         } catch (const std::exception& e) {
             if (failure.empty()) failure = std::string("closing the output file: ") + e.what();
         }
+#ifdef HDF5_ENABLED
+        catch (const H5::Exception& e) {
+            if (failure.empty()) failure = "closing the output file: HDF5: " + e.getDetailMsg();
+        }
+#endif
     }
     int failed = failure.empty() ? 0 : 1;
     MPI_Bcast(&failed, 1, MPI_INT, 0, comm);
@@ -1108,6 +1173,37 @@ void Lattice::run_pump_probe_scan(const PumpProbeScanSpec& spec, MPI_Comm comm_i
         if (root) msg = failure;
         MPI_Bcast(msg.data(), len, MPI_CHAR, 0, comm);
         throw std::runtime_error("pump-probe scan failed: " + msg);
+    }
+}
+
+void Lattice::broadcast_dynamical_state(MPI_Comm comm, int root) {
+    const size_t D = spin_dim, D2 = D * D;
+    vector<double> buf(lattice_size * D + 3 * D2 + 3 + 2);
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+    if (rank == root) {
+        size_t o = 0;
+        for (size_t i = 0; i < lattice_size; ++i)
+            for (size_t d = 0; d < D; ++d) buf[o++] = spins[i](d);
+        for (size_t a = 0; a < 3; ++a)
+            for (size_t r = 0; r < D; ++r)
+                for (size_t c = 0; c < D; ++c) buf[o++] = twist_matrices[a](r, c);
+        for (size_t a = 0; a < 3; ++a) buf[o++] = twist_angles[a];
+        buf[o++] = alpha_gilbert;
+        buf[o++] = langevin_temperature;
+    }
+    MPI_Bcast(buf.data(), int(buf.size()), MPI_DOUBLE, root, comm);
+    if (rank != root) {
+        size_t o = 0;
+        for (size_t i = 0; i < lattice_size; ++i)
+            for (size_t d = 0; d < D; ++d) spins[i](d) = buf[o++];
+        for (size_t a = 0; a < 3; ++a)
+            for (size_t r = 0; r < D; ++r)
+                for (size_t c = 0; c < D; ++c) twist_matrices[a](r, c) = buf[o++];
+        for (size_t a = 0; a < 3; ++a) twist_angles[a] = buf[o++];
+        alpha_gilbert = buf[o++];
+        langevin_temperature = buf[o++];
+        sync_twist_state();
     }
 }
 
@@ -1127,8 +1223,10 @@ void Lattice::pump_probe_spectroscopy(const vector<SpinVector>& field_in,
         dir_name, method, reuse_m0_for_m1, stationarity_tol, abs_tol, rel_tol);
     if (use_gpu) {
 #ifdef CUDA_ENABLED
-        pump_probe_spectroscopy_gpu_batched(spec);
-        return;
+        if (gpu_usable(*this)) {
+            pump_probe_spectroscopy_gpu_batched(spec);
+            return;
+        }
 #else
         warn_no_gpu();
 #endif
@@ -1148,10 +1246,12 @@ void Lattice::pump_probe_spectroscopy_mpi(const vector<SpinVector>& field_in,
                                           double abs_tol, double rel_tol, MPI_Comm comm) {
     int rank = 0;
     MPI_Comm_rank(comm, &rank);
-    // Rank 0's configuration is the ground state of the scan.
-    vector<double> buf = spins_to_state(spins);
-    MPI_Bcast(buf.data(), int(buf.size()), MPI_DOUBLE, 0, comm);
-    spins = state_to_spins(buf);
+    // Rank 0's configuration (and twist state, damping) defines the scan, and
+    // rank 0 decides the backend (its GPU runs the batched path alone).
+    broadcast_dynamical_state(comm, 0);
+    int gpu_flag = use_gpu ? 1 : 0;
+    MPI_Bcast(&gpu_flag, 1, MPI_INT, 0, comm);
+    use_gpu = (gpu_flag != 0);
 
     PumpProbeScanSpec spec;
     std::string error;
@@ -1167,12 +1267,22 @@ void Lattice::pump_probe_spectroscopy_mpi(const vector<SpinVector>& field_in,
 
     if (use_gpu) {
 #ifdef CUDA_ENABLED
-        // One batched GPU launch on rank 0 replaces the τ distribution.
-        if (!has_trilinear_interactions()) {
+        // One batched GPU launch on rank 0 replaces the τ distribution. The
+        // capability test depends only on broadcast state: every rank agrees.
+        std::string reason;
+        if (!gpu_supports_model(reason)) {
+            if (rank == 0)
+                std::cerr << "Warning: the GPU right-hand side does not support " << reason
+                          << "; running the delay scan on the CPU." << std::endl;
+        } else {
             std::string gpu_error;
             if (rank == 0) {
                 try { pump_probe_spectroscopy_gpu_batched(spec); }
                 catch (const std::exception& e) { gpu_error = e.what(); }
+#ifdef HDF5_ENABLED
+                catch (const H5::Exception& e) { gpu_error = "HDF5: " + e.getDetailMsg(); }
+#endif
+                catch (...) { gpu_error = "unknown error in the GPU batched scan"; }
             }
             int failed = gpu_error.empty() ? 0 : 1;
             MPI_Bcast(&failed, 1, MPI_INT, 0, comm);

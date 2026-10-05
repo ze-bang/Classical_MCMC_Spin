@@ -3,20 +3,24 @@
  * spin_integrators.h — geometric integrators for classical SO(3) spin
  * dynamics, deterministic and stochastic (Langevin).
  *
- * Equation of motion (Landau-Lifshitz form, γ = ħ = 1, |S_i| = s):
+ * Equation of motion (γ = ħ = 1, |S_i| = s):
  *
- *     dS_i/dt = S_i × Ω_i,   Ω_i = b_i - (α/s) S_i × b_i,   b_i = B_i + ξ_i,
+ *     dS_i/dt = S_i × Ω_i,   Ω_i = g [b_i - (α/s) S_i × b_i],   b_i = B_i + ξ_i,
  *
  * with B_i = -∂E/∂S_i the effective field (including any time-dependent
  * drive) and ξ_i Gaussian white noise, <ξ_ia(t) ξ_jb(t')> = 2D δ_ij δ_ab δ(t-t'),
- * entering both the precession and the damping term (Stratonovich). The
- * Fokker-Planck equation of this SDE has the Gibbs state exp(-E/T) as its
- * stationary solution iff
+ * entering both the precession and the damping term (Stratonovich). g = 1 is
+ * the Landau-Lifshitz form (damping constant λ = α); g = 1/(1 + α²) is the
+ * Gilbert form, dS/dt = S × b + (α/s) S × dS/dt solved for dS/dt (precession
+ * slowed by 1 + α²). The Fokker-Planck equation of this SDE has the Gibbs
+ * state exp(-E/T) as its stationary solution iff
  *
- *     D = α T / (s (1 + α²))
+ *     D = α T / (s (1 + α²) g)
  *
- * (García-Palacios & Lázaro, PRB 58, 14937 (1998)); a noise variance of
- * 2αT/s, as commonly written, heats the spins to T (1 + α²).
+ * (García-Palacios & Lázaro, PRB 58, 14937 (1998); rescaling time by g maps
+ * the Gilbert SDE onto the g = 1 one with noise strength g D): D = αT/(s(1+α²))
+ * in Landau-Lifshitz form, D = αT/s in Gilbert form. Using αT/s in
+ * Landau-Lifshitz form, as is often written, heats the spins to T (1 + α²).
  *
  * Methods — every one preserves each |S_i| to round-off, unlike generic
  * Runge-Kutta steppers whose norm drift grows secularly:
@@ -100,9 +104,23 @@ inline const char* method_name(Method m) {
     return "?";
 }
 
+/// Normalisation of the damped equation of motion (see the header comment).
+enum class DampingForm { LandauLifshitz, Gilbert };
+
+inline DampingForm parse_damping_form(std::string_view name) {
+    if (name == "landau_lifshitz" || name == "LL" || name == "ll") return DampingForm::LandauLifshitz;
+    if (name == "gilbert" || name == "LLG" || name == "llg") return DampingForm::Gilbert;
+    throw std::invalid_argument("unknown damping_form '" + std::string(name) +
+                                "' (valid: landau_lifshitz, gilbert)");
+}
+
 struct LangevinParams {
-    double alpha = 0.0;        // Gilbert/LL damping
+    double alpha = 0.0;        // damping constant
     double temperature = 0.0;  // bath temperature (k_B = 1); 0 = deterministic
+    DampingForm form = DampingForm::LandauLifshitz;
+
+    /// Overall prefactor g of the right-hand side.
+    double prefactor() const { return form == DampingForm::Gilbert ? 1.0 / (1.0 + alpha * alpha) : 1.0; }
 };
 
 /// Rotate v (3-vector) for a time dt under dv/dt = v × Ω: angle -|Ω| dt about Ω̂.
@@ -196,7 +214,7 @@ private:
     void draw_noise(double dt) {
         if (!stochastic()) return;
         const double s = m_.spin_length();
-        const double D = lp_.alpha * lp_.temperature / (s * (1.0 + lp_.alpha * lp_.alpha));
+        const double D = lp_.alpha * lp_.temperature / (s * (1.0 + lp_.alpha * lp_.alpha) * lp_.prefactor());
         const double sigma = std::sqrt(2.0 * D / dt);  // piecewise-constant white noise
         const size_t n3 = 3 * n();
 #ifdef _OPENMP
@@ -209,6 +227,7 @@ private:
     void axes_from_fields(const double* S, const std::vector<double>& B, double* Om) const {
         const double s = m_.spin_length();
         const bool noisy = stochastic();
+        const double g = lp_.prefactor();
         const size_t N = n();
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static) if(N >= 512)
@@ -217,6 +236,7 @@ private:
             double b[3] = {B[3 * i], B[3 * i + 1], B[3 * i + 2]};
             if (noisy) for (int d = 0; d < 3; ++d) b[d] += xi_[3 * i + d];
             precession_axis(S + 3 * i, b, lp_.alpha, s, Om + 3 * i);
+            if (g != 1.0) for (int d = 0; d < 3; ++d) Om[3 * i + d] *= g;
         }
     }
 

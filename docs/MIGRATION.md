@@ -98,3 +98,11 @@ dynamics drivers (there is no Lie-algebra cross product for them).
 `/trajectory/max_norm_error` and the attributes `/metadata/dt_save`,
 `alpha_gilbert`, `langevin_temperature`, `integrator`; `final_spins.txt` holds
 the final configuration.
+
+## Lattice dynamics: damping_form (new key)
+
+**What changed.** New config key `damping_form` = `landau_lifshitz` (default,
+unchanged behaviour: `dS/dt = S x B - (α/s) S x (S x B)`) or `gilbert` (the same
+divided by `1 + α²`, i.e. the Gilbert equation solved for `dS/dt`). The Langevin
+noise strength follows the form, `D = αT/(s(1 + α²))` resp. `D = αT/s`, so both
+sample the Gibbs distribution.

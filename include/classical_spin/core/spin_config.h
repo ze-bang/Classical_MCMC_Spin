@@ -106,6 +106,10 @@ struct SpinConfig {
     //   langevin_temperature - stochastic LLG bath temperature (k_B = 1), default 0;
     //                          needs alpha_gilbert > 0 and spherical_midpoint/depondt
     string md_integrator = "dopri5";
+    // Normalisation of the damped equation of motion (Lattice): "landau_lifshitz"
+    // (dS/dt = S x B - (alpha/s) S x (S x B), default) or "gilbert" (the same
+    // divided by 1 + alpha^2).
+    string damping_form = "landau_lifshitz";
     bool use_gpu = false;
 
     // ----------------------------------------------------------------

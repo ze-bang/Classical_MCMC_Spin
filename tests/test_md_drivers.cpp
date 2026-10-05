@@ -14,6 +14,8 @@
 //     diagnostics; geometric integrators conserve both.
 //  6. Langevin MD through the public molecular_dynamics entry point samples
 //     the exact free-spin energy <E>/N = -h L(h/T).
+//     Gilbert and Landau-Lifshitz damping forms both reproduce the analytic
+//     damped precession and (with the matching noise strength) the Gibbs state.
 //  7. 2DCS W1: M1 synthesised by time translation equals the integrated M1
 //     in all three channels, including τ < 0, T_start inside the pump window
 //     and a staggered channel with non-trivial frames and signs.
@@ -80,6 +82,12 @@ bool throws_invalid_argument(F&& f, const std::string& must_contain = "") {
     return false;
 }
 
+std::string sci(double v) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.2e", v);
+    return b;
+}
+
 std::vector<SpinVector> uniform_dir(const Lattice& lat, const Eigen::Vector3d& d) {
     return std::vector<SpinVector>(lat.N_atoms, SpinVector(d));
 }
@@ -122,7 +130,7 @@ void test_exact_grid_and_seams() {
         // spherical_midpoint is second order: phase error ~ (b dt)^2 t / 12 ≈ 1e-3 here.
         const double tol = (std::string(method) == "spherical_midpoint") ? 5e-3 : 1e-6;
         check(grid_ok, std::string(method) + ": every delay gives 4001 samples at T_start + k T_step exactly");
-        check(max_err < tol, std::string(method) + ": max |M - exact| = " + std::to_string(max_err));
+        check(max_err < tol, std::string(method) + ": max |M - exact| = " + sci(max_err));
     }
 }
 
@@ -147,7 +155,7 @@ void test_zero_probe_is_inert() {
             for (int c = 0; c < 3; ++c) worst = std::max(worst, (M01[k].second[c] - M0[k].second[c]).cwiseAbs().maxCoeff());
     }
     check(same_len, "trajectory length independent of the delay");
-    check(worst == 0.0, "M_NL = M01 - M0 vanishes identically (max " + std::to_string(worst) + ")");
+    check(worst == 0.0, "M_NL = M01 - M0 vanishes identically (max " + sci(worst) + ")");
 }
 
 // ------------------------------------------------------- 3. drive frame
@@ -275,8 +283,8 @@ void test_md_output() {
             max_ne = std::max(max_ne, ne[k]);
         }
         check(std::abs(E.front() - E0) < 1e-14, std::string(c.method) + ": first energy sample is E(0)");
-        check(max_dE < c.dE_tol, std::string(c.method) + ": max |E(t) - E(0)|/N = " + std::to_string(max_dE));
-        check(max_ne < c.norm_tol, std::string(c.method) + ": max ||S_i| - s| = " + std::to_string(max_ne));
+        check(max_dE < c.dE_tol, std::string(c.method) + ": max |E(t) - E(0)|/N = " + sci(max_dE));
+        check(max_ne < c.norm_tol, std::string(c.method) + ": max ||S_i| - s| = " + sci(max_ne));
         std::ifstream fin(out + "/final_spins.txt");
         size_t lines = 0;
         for (std::string line; std::getline(fin, line);) ++lines;
@@ -300,13 +308,57 @@ void test_langevin_md_entry_point() {
     lat.langevin_temperature = T;
     seed_lehman(2718);
     lat.init_random();
-    lat.molecular_dynamics(0.0, 320.0, 0.01, dir.string(), 50, "spherical_midpoint");
-    const auto E = h5_read((dir / "trajectory.h5").string(), "/trajectory/energy_density");
-    std::vector<double> e(E.begin() + 40, E.end());   // drop t < 20 (relaxation)
-    const auto r = batch_means(e);
     const double exact = -h * langevin(h / T);
-    check_stat(r.mean, r.err, exact, "spherical_midpoint alpha=0.5 T=0.5 <E>/N", 5.0, 0.01 * std::abs(exact));
+    struct Case { double alpha; classical_spin::dynamics::DampingForm form; const char* label; };
+    // Gilbert form at alpha = 1: the Landau-Lifshitz noise strength would sample T/2.
+    for (const Case& c : {Case{0.5, classical_spin::dynamics::DampingForm::LandauLifshitz, "Landau-Lifshitz alpha=0.5"},
+                          Case{1.0, classical_spin::dynamics::DampingForm::Gilbert, "Gilbert alpha=1"}}) {
+        lat.alpha_gilbert = c.alpha;
+        lat.damping_form = c.form;
+        lat.init_random();
+        lat.molecular_dynamics(0.0, 320.0, 0.01, dir.string(), 50, "spherical_midpoint");
+        const auto E = h5_read((dir / "trajectory.h5").string(), "/trajectory/energy_density");
+        std::vector<double> e(E.begin() + 40, E.end());   // drop t < 20 (relaxation)
+        const auto r = batch_means(e);
+        check_stat(r.mean, r.err, exact, std::string("spherical_midpoint ") + c.label + " T=0.5 <E>/N", 5.0,
+                   0.01 * std::abs(exact));
+    }
     fs::remove_all(dir);
+}
+
+// ------------------------------------- 6b. damping form, analytic relaxation
+void test_damping_forms() {
+    std::printf("\n== Damped precession: Landau-Lifshitz and Gilbert forms ==\n");
+    // One spin in B = h z: dS/dt = g [S x B - alpha S x (S x B)] gives
+    //   S_z(t) = tanh(g alpha h t + atanh S_z(0)),  azimuth phi(t) = phi(0) - g h t,
+    // with g = 1 (Landau-Lifshitz) or 1/(1 + alpha^2) (Gilbert).
+    const double h = 1.3, alpha = 0.4, Sz0 = -0.6;
+    UnitCell uc = simple_cubic_cell(1);
+    uc.set_field(Eigen::Vector3d(0, 0, h), 0);
+    Lattice lat(uc, 1, 1, 1, 1.0f);
+    lat.alpha_gilbert = alpha;
+    using classical_spin::dynamics::DampingForm;
+    for (DampingForm form : {DampingForm::LandauLifshitz, DampingForm::Gilbert}) {
+        lat.damping_form = form;
+        const double g = (form == DampingForm::Gilbert) ? 1.0 / (1.0 + alpha * alpha) : 1.0;
+        for (const char* method : {"rk4", "dopri5", "spherical_midpoint", "depondt"}) {
+            lat.spins[0] = Eigen::Vector3d(std::sqrt(1 - Sz0 * Sz0), 0.0, Sz0);
+            auto traj = lat.drive_trajectory(lat.make_drive(), TimeGrid::covering(0.0, 6.0, 0.05),
+                                             {method, 0.002, 1e-11, 1e-11, 0.0});
+            double err = 0.0;
+            for (const auto& [t, M] : traj) {
+                const double sz = std::tanh(g * alpha * h * t + std::atanh(Sz0));
+                const double r = std::sqrt(1 - sz * sz), phi = -g * h * t;
+                err = std::max(err, (M[1] - Eigen::Vector3d(r * std::cos(phi), r * std::sin(phi), sz)).norm());
+            }
+            const bool second_order = std::string(method) == "spherical_midpoint" || std::string(method) == "depondt";
+            check(err < (second_order ? 2e-5 : 1e-8),
+                  std::string(form == DampingForm::Gilbert ? "Gilbert" : "Landau-Lifshitz") + " form, " + method +
+                      ": max error " + sci(err));
+        }
+    }
+    lat.alpha_gilbert = 0.0;
+    lat.damping_form = DampingForm::LandauLifshitz;
 }
 
 // --------------------------------------------- 7. 2DCS W1 synthesis
@@ -397,7 +449,7 @@ void test_w1_synthesis() {
             worst_m01 = std::max(worst_m01, max_diff(d[0].M01[i], d[1].M01[i]));
         }
         // 1e-9: the drive is truncated where its envelope is 1.6e-9 relative (9 w).
-        check(worst_m1 < 1e-9, tag + "max |M1_synth - M1_integrated| (3 channels) = " + std::to_string(worst_m1));
+        check(worst_m1 < 1e-9, tag + "max |M1_synth - M1_integrated| (3 channels) = " + sci(worst_m1));
         check(worst_m01 == 0.0 && max_diff(d[0].M0, d[1].M0) == 0.0, tag + "M0 and M01 unaffected by W1");
     }
     fs::remove_all(dir);
@@ -438,6 +490,22 @@ void test_su3_damping_and_dims() {
         }
         predicted -= lat.alpha_gilbert / std::sqrt(n2) * p2;
     }
+    // The RHS is only as good as its field: H must be ∂E/∂S also across the
+    // periodic wrap of the chain (boundary bonds once dropped components 3..7).
+    double fd_err = 0.0;
+    for (size_t i = 0; i < lat.lattice_size; ++i) {
+        double H[8];
+        lat.get_local_field_flat(x.data(), i, H);
+        for (int a = 0; a < 8; ++a) {
+            State xp = x, xm = x;
+            const double eps = 1e-6;
+            xp[8 * i + a] += eps;
+            xm[8 * i + a] -= eps;
+            const double fd = (lat.total_energy_flat(xp.data()) - lat.total_energy_flat(xm.data())) / (2 * eps);
+            fd_err = std::max(fd_err, std::abs(fd - H[a]));
+        }
+    }
+    check(fd_err < 1e-7, "SU(3) field = finite-difference gradient incl. wrapped bonds (" + sci(fd_err) + ")");
     check(predicted < -1e-3, "random SU(3) state has a non-zero dissipation rate");
     check_close(dEdt, predicted, 1e-12 * std::abs(predicted) + 1e-14, "dE/dt = -(alpha/|S|) sum |H x S|^2");
     check_close(s_dot, 0.0, 1e-13, "S . dS/dt = 0 (|S| conserved)");
@@ -477,6 +545,7 @@ int main(int argc, char** argv) {
     test_validation();
     test_md_output();
     test_langevin_md_entry_point();
+    test_damping_forms();
     test_w1_synthesis();
     test_su3_damping_and_dims();
     const int rc = finish("test_md_drivers");

@@ -186,7 +186,9 @@ use_gpu = true
   - fixed-step Runge-Kutta: `euler`, `rk2`, `rk4`, `adams_bashforth`, `adams_moulton`
   - error-controlled (`md_timestep` is the initial step, tolerances `md_abs_tol`,
     `md_rel_tol`): `dopri5` (default), `bulirsch_stoer`, `rk5` (Cash-Karp), `rk78`
-- `alpha_gilbert`: damping (Landau-Lifshitz form, λ = α), default 0
+- `alpha_gilbert`: damping constant, default 0
+- `damping_form`: `landau_lifshitz` (default; λ = α) or `gilbert` (precession and
+  damping divided by 1 + α²)
 - `langevin_temperature`: stochastic LLG bath temperature (k_B = 1), default 0; needs
   `alpha_gilbert > 0` and `spherical_midpoint` or `depondt`; samples the Gibbs state
 - Output `sample_<trial>/trajectory.h5`: `/trajectory/{times, magnetization_*, spins,
