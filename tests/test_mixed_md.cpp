@@ -483,6 +483,39 @@ void test_thermal_reservoir_closed_form() {
 }
 
 // ---------------------------------------------------------------------------
+// SU(3) Landau-Lifshitz damping: energy decreases monotonically, both
+// Casimirs are conserved (a pure state stays pure) and a free qutrit relaxes
+// into the lowest CEF level.
+void test_su3_ll_damping() {
+    const double e1 = 0.9, e2 = 2.3;
+    MixedLattice lat = make_dimer(Eigen::Vector3d(0, 0, 0.5), cef_field(e1, e2, false), 2.0, Eigen::MatrixXd());
+    lat.spins_SU2[0] = Eigen::Vector3d(0, 0, 0.5);
+    lat.spins_SU3[0] = to_x(su3::expectations_from_psi(
+        su3::Vector3c(Complex(0.3, 0.1), Complex(0.6, -0.2), Complex(0.5, 0.5)).normalized()));
+    lat.alpha_SU3 = 0.3;
+    std::vector<std::vector<double>> states;
+    const std::vector<SpinVector> none2(1, SpinVector::Zero(3)), none3(1, SpinVector::Zero(8));
+    lat.single_pulse_drive(none2, none3, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                           0.0, 60.0, 0.1, "dopri5", false, &states, true, 1e-11, 1e-11);
+    bool monotone = true;
+    double prev = 1e300, dC2 = 0.0, dC3 = 0.0;
+    for (const auto& s : states) {
+        const double E = lat.total_energy_flat(s.data());
+        monotone = monotone && E <= prev + 1e-12;
+        prev = E;
+        dC2 = std::max(dC2, std::abs(su3::casimir2(&s[3]) - 4.0 / 3.0));
+        dC3 = std::max(dC3, std::abs(su3::casimir3(&s[3]) - 8.0 / 9.0));
+    }
+    const su3::Vector8r ground = su3::expectations_from_psi(su3::Vector3c(1.0, 0.0, 0.0));
+    double dist = 0.0;
+    for (int a = 0; a < 8; ++a) dist = std::max(dist, std::abs(states.back()[3 + a] - ground(a)));
+    check(monotone, "SU(3) LL damping: energy decreases monotonically");
+    check(dC2 < 1e-8 && dC3 < 1e-8, "SU(3) LL damping conserves |n|^2 and d_abc n n n (pure stays pure)");
+    check(dist < 1e-6, "SU(3) LL damping relaxes a free qutrit into the lowest CEF level (dist " +
+                       std::to_string(dist) + ")");
+}
+
+// ---------------------------------------------------------------------------
 void test_su3_implicit_midpoint() {
     // Nonlinear mean-field Hamiltonian H(psi) = H0 + g Σ_a n_a(psi) lambda_a.
     su3::Matrix3c H0;
@@ -612,6 +645,7 @@ int main() {
     test_trilinear_reference_is_one_hamiltonian();
     test_no_phantom_pulse_and_w1();
     test_thermal_reservoir_closed_form();
+    test_su3_ll_damping();
     test_su3_implicit_midpoint();
     test_md_diagnostics_and_nan_guard();
     test_validation();

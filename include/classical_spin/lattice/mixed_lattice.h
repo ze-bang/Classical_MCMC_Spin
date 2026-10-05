@@ -311,6 +311,18 @@ public:
     // cell (UnitCell::poisson_bracket), 1 only under su3_legacy_convention.
     double su3_bracket = classical_spin::su3::kGellMannBracket;
 
+    // SU(3) Landau-Lifshitz damping (Casimir-preserving double bracket; the
+    // Bloch-vector form of the SU(N) LL damping of Dahlbom et al.,
+    // PRB 106, 235154 (2022)):
+    //     dn/dt += -(alpha_SU3 / |n|) c f(n, P),   P = c f(H, n) the precession,
+    // the direct analogue of the SU(2) Gilbert term -(alpha/|S|) S x (H x S).
+    // dE/dt = -(alpha_SU3/|n|) |P|^2 <= 0 and, because the update is an
+    // adjoint action, |n|^2 and d_abc n^a n^b n^c are conserved: a pure state
+    // stays pure and relaxes towards the ground state of its local field
+    // (unlike the Bloch relaxation below, which targets a fixed n_eq and can
+    // leave the physical state space for non-uniform rates).
+    double alpha_SU3 = 0.0;
+
     // SU(3) Bloch damping/relaxation (tmfeo3_notes.tex Eq. blochdampedfull)
     // dn^a/dt = c f_{abc} h^b n^c  −  Γ_a (n^a − n^a_eq)
     // damping_rates_SU3[a]: phenomenological relaxation rates Γ_a for each Gell-Mann channel
@@ -4003,7 +4015,8 @@ public:
     /**
      * Equations of motion, a pure function of (state, t) and the current drive:
      *   SU(2):  dS/dt = H × S + (α/|S|) S × (S × H)            (LL-Gilbert)
-     *   SU(3):  dn^a/dt = c f_{abc} H^b n^c − Γ_a (n^a − n^a_eq), c = su3_bracket
+     *   SU(3):  dn^a/dt = P^a − (α_SU3/|n|) c f_{abc} n^b P^c − Γ_a (n^a − n^a_eq),
+     *           P^a = c f_{abc} H^b n^c,  c = su3_bracket
      *   E_dep:  dE_dep/dt = P(n) − thermal_cool E_dep           (thermal reservoir)
      * with H = ∂E/∂S (∂E/∂n) the local field including the pulse drive.
      * State layout: [SU2 site0 .. SU2 siteN | SU3 site0 .. SU3 siteM | E_dep?];

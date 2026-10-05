@@ -485,6 +485,17 @@ void validate_pulse_shape(double amp, double width, double freq, const char* wha
                                               d.env_E, d.env_B, d.env_Bx, d.env_By, d.env_Bz);
                 su3_torque(H, &state[idx], c3, &dsdt[idx]);
 
+                // Casimir-preserving LL damping -(alpha/|n|) c f(n, P), P = torque.
+                if (alpha_SU3 != 0.0) {
+                    const double* n = &state[idx];
+                    double C[8];
+                    su3_torque(n, &dsdt[idx], c3, C);
+                    double n2 = 0.0;
+                    for (int a = 0; a < 8; ++a) n2 += n[a] * n[a];
+                    const double k = (n2 > 0.0) ? alpha_SU3 / std::sqrt(n2) : 0.0;
+                    for (int a = 0; a < 8; ++a) dsdt[idx + a] -= k * C[a];
+                }
+
                 // Bloch relaxation -Gamma_a (n^a - n^a_eq); the lambda3 target
                 // follows the thermal reservoir. The dissipation proxy P omits
                 // the population channels lambda3, lambda8 (see the header).
@@ -716,6 +727,7 @@ void validate_pulse_shape(double amp, double width, double freq, const char* wha
             add("mixed SU(2)-SU(2)-SU(3) trilinear couplings");
         if (has_mixed_bilinear_drive) add("field-assisted Fe-Tm exchange");
         if (alpha_gilbert != 0.0) add("SU(2) Gilbert damping");
+        if (alpha_SU3 != 0.0) add("SU(3) Landau-Lifshitz damping");
         if (damping_rates_SU3.size() > 0 && damping_rates_SU3.cwiseAbs().maxCoeff() > 0.0)
             add("SU(3) Bloch damping");
         if (thermal_heat != 0.0) add("thermal reservoir");

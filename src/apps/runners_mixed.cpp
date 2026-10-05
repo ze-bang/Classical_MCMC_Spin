@@ -693,6 +693,7 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
  * place, so MD, pump-probe and 2DCS see the same physics:
  *
  *   alpha_gilbert          SU(2) Gilbert damping (default 0)
+ *   alpha_su3              SU(3) Landau-Lifshitz damping (default 0, see mixed_lattice.h)
  *   gamma_su3              uniform SU(3) Bloch relaxation rate (default 0)
  *   gamma_su3_lambda{1..8} per-generator override
  *       dn^a/dt += -Gamma_a (n^a - n^a_eq), with n_eq = the current state, so
@@ -732,6 +733,11 @@ static void configure_dynamics(MixedLattice& lattice, const SpinConfig& config, 
     lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.0);
     if (rank == 0 && lattice.alpha_gilbert != 0.0) {
         cout << "SU(2) Gilbert damping alpha = " << lattice.alpha_gilbert << endl;
+    }
+    lattice.alpha_SU3 = config.get_param("alpha_su3", 0.0);
+    if (rank == 0 && lattice.alpha_SU3 != 0.0) {
+        cout << "SU(3) Landau-Lifshitz damping alpha_su3 = " << lattice.alpha_SU3
+             << " (Casimir-preserving; relaxes to the instantaneous local field)" << endl;
     }
 
     const double gamma_uniform = config.get_param("gamma_su3", 0.0);

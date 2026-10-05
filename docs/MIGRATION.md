@@ -115,6 +115,11 @@ implicit midpoint (`su3::implicit_midpoint_step`, Cayley form).
   `2 tau_steps + ...` tags exceeded MPI_TAG_UB), chunked large messages, and
   errors on any rank are propagated to all ranks (no zero padding of
   mismatched trajectories, no deadlock).
+- New option `alpha_su3`: Casimir-preserving SU(3) Landau-Lifshitz damping
+  `dn/dt += -(alpha/|n|) c f(n, P)`, P the precession (Bloch-vector form of the
+  SU(N) LL damping of Dahlbom et al., PRB 106, 235154 (2022)). It relaxes
+  towards the instantaneous local field and keeps pure states pure, unlike
+  the fixed-target Bloch relaxation `gamma_su3*` (still available).
 - The staggered SU(3) observable uses the unit cell's AFM signs and frames
   (TmFeO3: (+,-,+,-), identical to the old site-parity rule for that cell).
 - GPU: `check_gpu_supported()` throws instead of silently dropping trilinear
