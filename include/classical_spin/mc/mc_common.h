@@ -335,7 +335,8 @@ inline ThermodynamicObservables compute_thermodynamic_observables(
 
     // Specific heat via jackknife
     {
-        double N2 = double(lattice_size) * double(lattice_size);
+        // c = Var(E_total) / (N T^2): energy fluctuations are extensive.
+        const double N_sites = double(lattice_size);
         if (n_samples < 2) {
             obs.specific_heat = Observable(0.0, 0.0);
         } else {
@@ -347,7 +348,7 @@ inline ThermodynamicObservables compute_thermodynamic_observables(
                 double d = energies[i] - E_mean; var_E += d * d;
             }
             var_E /= n_samples;
-            obs.specific_heat.value = std::max(0.0, var_E) / (T * T * N2);
+            obs.specific_heat.value = std::max(0.0, var_E) / (T * T * N_sites);
 
             size_t n_jack = std::min(n_samples, size_t(100));
             n_jack = std::max(n_jack, size_t(2));
@@ -367,7 +368,7 @@ inline ThermodynamicObservables compute_thermodynamic_observables(
                 for (size_t i = 0; i < n_samples; ++i)
                     if (i < bs || i >= be) { double d = energies[i] - Ej; vj += d * d; }
                 vj /= cnt;
-                C_jack[j] = std::max(0.0, vj) / (T * T * N2);
+                C_jack[j] = std::max(0.0, vj) / (T * T * N_sites);
             }
             double C_mean = 0.0;
             for (double c : C_jack) C_mean += c;

@@ -395,18 +395,12 @@
                                    size_t swap_rate, size_t overrelaxation_rate,
                                    size_t probe_rate, MPI_Comm comm) {
         // Compute local heat capacity per site using binning analysis
-        // c_V = Var(E) / (T² N²) = Var(E/N) / T²
-        double E_mean = std::accumulate(energies.begin(), energies.end(), 0.0) / energies.size();
-        double E2_mean = 0.0;
-        for (double E : energies) {
-            E2_mean += E * E;
-        }
-        E2_mean /= energies.size();
-        double var_E = E2_mean - E_mean * E_mean;
-        
-        double N2 = double(lattice_size) * double(lattice_size);
-        double curr_heat_capacity = var_E / (curr_Temp * curr_Temp * N2);
-        double curr_dHeat = std::sqrt(var_E) / (curr_Temp * curr_Temp * N2);
+        // c_V = Var(E) / (N T²) (energy fluctuations are extensive), with a
+        // block-jackknife error from compute_thermodynamic_observables.
+        ThermodynamicObservables c_obs = mc::compute_thermodynamic_observables(
+            energies, vector<vector<SpinVector>>{}, curr_Temp, lattice_size);
+        double curr_heat_capacity = c_obs.specific_heat.value;
+        double curr_dHeat = c_obs.specific_heat.error;
         
         // Gather to root using the caller-provided communicator (was previously
         // hardcoded to MPI_COMM_WORLD, which broke parallel-tempering inside a

@@ -70,7 +70,7 @@
         // 2. Specific heat per site with jackknife error estimation
         //    c_V = Var(E) / (T² N²) = Var(E/N) / T²
         {
-            double N2 = double(total_sites) * double(total_sites);
+            const double N_sites = double(total_sites);  // c = Var(E)/(N T^2)
             
             // Extract energies for easier access
             vector<double> E_total(n_samples);
@@ -101,7 +101,7 @@
                 
                 // Ensure non-negative variance (numerical protection)
                 var_E = std::max(0.0, var_E);
-                obs.specific_heat.value = var_E / (T * T * N2);
+                obs.specific_heat.value = var_E / (T * T * N_sites);
                 
                 // Jackknife error estimation
                 // Use at most 100 jackknife blocks, at least 2
@@ -146,7 +146,7 @@
                     var_j /= count;
                     var_j = std::max(0.0, var_j);  // Numerical protection
                     
-                    C_jack[j] = var_j / (T * T * N2);
+                    C_jack[j] = var_j / (T * T * N_sites);
                 }
                 
                 // Compute jackknife error estimate
@@ -645,12 +645,10 @@
         double E_mean = std::accumulate(energies.begin(), energies.end(), 0.0) / energies.size();
         
         // Energy variance
-        double E2_mean = 0.0;
-        for (double E : energies) {
-            E2_mean += E * E;
-        }
-        E2_mean /= energies.size();
-        double var_E = E2_mean - E_mean * E_mean;
+        // Two-pass variance (E2 - E^2 cancels catastrophically for large N).
+        double var_E = 0.0;
+        for (double E : energies) var_E += (E - E_mean) * (E - E_mean);
+        var_E /= energies.size();
         
         // Specific heat (per total site)
         size_t total_sites = lattice_size_SU2 + lattice_size_SU3;

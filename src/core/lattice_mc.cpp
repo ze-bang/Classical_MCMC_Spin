@@ -436,12 +436,10 @@
         double E_mean = std::accumulate(energies.begin(), energies.end(), 0.0) / energies.size();
         
         // Energy variance
-        double E2_mean = 0.0;
-        for (double E : energies) {
-            E2_mean += E * E;
-        }
-        E2_mean /= energies.size();
-        double var_E = E2_mean - E_mean * E_mean;
+        // Two-pass variance (E2 - E^2 cancels catastrophically for large N).
+        double var_E = 0.0;
+        for (double E : energies) var_E += (E - E_mean) * (E - E_mean);
+        var_E /= energies.size();
         
         // Specific heat
         double C_V = var_E / (T * T * lattice_size);

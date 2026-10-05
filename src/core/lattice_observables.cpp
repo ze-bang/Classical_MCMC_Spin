@@ -141,11 +141,11 @@
             }
         }
         
-        // 2. Specific heat per site: c_V = Var(E) / (T² N²) = Var(E/N) / T²
-        //    Since E is extensive (E ~ N), Var(E) ~ N², so c_V ~ O(1)
+        // 2. Specific heat per site: c_V = Var(E) / (N T²) = N Var(E/N) / T².
+        //    Energy fluctuations are extensive (Var(E) ~ N), so c_V ~ O(1).
         //    Error propagation via jackknife on binned data
         {
-            double N2 = double(lattice_size) * double(lattice_size);
+            const double N_sites = double(lattice_size);
             
             // Handle edge case: need at least 2 samples for variance
             if (n_samples < 2) {
@@ -170,7 +170,7 @@
                 
                 // Ensure non-negative variance (numerical protection)
                 var_E = std::max(0.0, var_E);
-                obs.specific_heat.value = var_E / (T * T * N2);
+                obs.specific_heat.value = var_E / (T * T * N_sites);
                 
                 // Jackknife error estimation for specific heat
                 // Use at most 100 jackknife blocks, at least 2
@@ -215,7 +215,7 @@
                     var_j /= count;
                     var_j = std::max(0.0, var_j);  // Numerical protection
                     
-                    C_jack[j] = var_j / (T * T * N2);
+                    C_jack[j] = var_j / (T * T * N_sites);
                 }
                 
                 // Compute jackknife error estimate

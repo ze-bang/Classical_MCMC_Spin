@@ -127,6 +127,15 @@ void test_heisenberg_ring() {
             }
             auto rc = batch_means(cb, nb);
             check_stat(rc.mean, rc.err, c_exact, std::string(k.name) + " c" + tag, kSigma, 0.02);
+            if (std::string(k.name) == "metropolis") {
+                // The library's estimator must agree (it divided by N^2 before).
+                auto obs = mc::compute_thermodynamic_observables(
+                    e, std::vector<std::vector<SpinVector>>{}, T, lat.lattice_size);
+                check_stat(obs.energy.value, obs.energy.error, u_exact,
+                           "mc::compute_thermodynamic_observables u" + tag, kSigma);
+                check_stat(obs.specific_heat.value, obs.specific_heat.error, c_exact,
+                           "mc::compute_thermodynamic_observables c" + tag, kSigma, 0.02);
+            }
         }
         set_threads(1);
     }
