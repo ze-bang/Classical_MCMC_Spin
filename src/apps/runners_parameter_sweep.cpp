@@ -312,6 +312,7 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                               sweep_config.lattice_size[2],
                               sweep_config.spin_length);
                 lattice.lattice_type = system_type_to_string(sweep_config.system);
+                lattice.local_update = Lattice::parse_local_update(sweep_config.local_update);
                 
                 // Initialize spins
                 if (sweep_config.use_ferromagnetic_init) {
@@ -545,6 +546,7 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                           sweep_config.lattice_size[2],
                           sweep_config.spin_length);
             lattice.lattice_type = system_type_to_string(sweep_config.system);
+            lattice.local_update = Lattice::parse_local_update(sweep_config.local_update);
             
             // Initialize spins
             if (sweep_config.use_ferromagnetic_init) {

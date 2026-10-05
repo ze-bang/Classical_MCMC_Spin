@@ -278,6 +278,61 @@ inline AutocorrelationResult compute_autocorrelation(
 }
 
 /**
+ * Geometric annealing schedule T_k = T_start r^k, truncated at T_end, which
+ * is always the last entry (the previous `while (T > T_end)` loops never
+ * simulated T_end itself). Throws on invalid input instead of looping
+ * forever (r >= 1) or dividing by zero (T <= 0).
+ */
+inline vector<double> annealing_schedule(double T_start, double T_end, double cooling_rate,
+                                         size_t max_steps = 1000000) {
+    if (!(T_start > 0.0) || !(T_end > 0.0) || !std::isfinite(T_start) || !std::isfinite(T_end))
+        throw std::invalid_argument("annealing: temperatures must be positive and finite");
+    if (T_end > T_start)
+        throw std::invalid_argument("annealing: T_end must not exceed T_start");
+    vector<double> schedule;
+    if (T_start == T_end) return {T_end};
+    if (!(cooling_rate > 0.0 && cooling_rate < 1.0))
+        throw std::invalid_argument("annealing: cooling_rate must lie in (0, 1)");
+    const double n_est = std::log(T_end / T_start) / std::log(cooling_rate);
+    if (n_est > double(max_steps))
+        throw std::invalid_argument("annealing: schedule would need more than " +
+                                    std::to_string(max_steps) + " temperatures");
+    for (double T = T_start; T > T_end * (1.0 + 1e-12); T *= cooling_rate) schedule.push_back(T);
+    schedule.push_back(T_end);
+    return schedule;
+}
+
+/**
+ * Robbins-Monro controller for the width σ of local Gaussian proposals:
+ *     log σ ← log σ + γ_k (A_k - A*),   γ_k = (k + 5)^-0.6,
+ * steering the acceptance A toward A* (≈ 0.4-0.5 for continuous spins;
+ * Alzate-Cardona et al., JPCM 31, 095802 (2019)). Adapt only during
+ * equilibration and freeze σ while measuring, so the sampling chain stays
+ * time-homogeneous (detailed balance holds for any fixed σ).
+ */
+class StepSizeController {
+public:
+    explicit StepSizeController(double sigma0 = 2.0, double target = 0.45,
+                                double sigma_min = 1e-4, double sigma_max = 10.0)
+        : log_sigma_(std::log(sigma0)), target_(target),
+          log_min_(std::log(sigma_min)), log_max_(std::log(sigma_max)) {}
+
+    double sigma() const { return std::exp(log_sigma_); }
+    double target() const { return target_; }
+    /// Restart the gain sequence (e.g. at a new temperature); σ is kept.
+    void restart() { k_ = 0; }
+    void update(double acceptance) {
+        const double gain = std::pow(double(k_) + 5.0, -0.6);
+        log_sigma_ = std::clamp(log_sigma_ + gain * (acceptance - target_), log_min_, log_max_);
+        ++k_;
+    }
+
+private:
+    double log_sigma_, target_, log_min_, log_max_;
+    size_t k_ = 0;
+};
+
+/**
  * Geometrically-spaced temperature ladder.
  */
 inline vector<double> generate_geometric_temperature_ladder(

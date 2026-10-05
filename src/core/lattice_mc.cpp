@@ -202,6 +202,15 @@
     }
 
 // ---- Lattice::simulated_annealing ----
+//
+// Geometric schedule ending exactly at T_end; at every temperature the
+// first half of the sweeps adapts the Gaussian proposal width (Robbins-
+// Monro toward 45% acceptance) when Gaussian moves are in use, the second
+// half samples with σ frozen. The local update follows `local_update`
+// (metropolis / gaussian / heat_bath) and switches to the coloured OpenMP
+// kernels for large lattices. The optional T = 0 stage is a monotone
+// block-coordinate descent run to convergence (exact single-site minimiser,
+// interleaved with twist-angle relaxation).
     void Lattice::simulated_annealing(double T_start, double T_end, size_t n_anneal,
                             size_t overrelaxation_rate,
                             bool boundary_update,
@@ -212,109 +221,116 @@
                             bool T_zero,
                             size_t n_deterministics,
                             size_t twist_sweep_count) {
-        
-        // Setup output directory
         if (!out_dir.empty()) {
             std::filesystem::create_directories(out_dir);
         }
-        
+        // Restore the caller's stream formatting on exit.
+        struct FormatGuard {
+            std::ios_base::fmtflags f = cout.flags();
+            std::streamsize p = cout.precision();
+            ~FormatGuard() { cout.flags(f); cout.precision(p); }
+        } format_guard;
         // No reseeding here: the stream continues from the process seed so
         // that a run is reproducible from its `seed`.
-        
-        double T = T_start;
-        double sigma = 1000.0;
-        
-        cout << "Starting simulated annealing: T=" << T_start << " → " << T_end << endl;
+        const vector<double> schedule = mc::annealing_schedule(T_start, T_end, cooling_rate);
+        const bool adaptive = gaussian_move || local_update == LocalUpdate::Gaussian;
+        const bool heat_bath_moves = local_update == LocalUpdate::HeatBath && spin_dim == 3;
+        mc::StepSizeController step_size(/*sigma0=*/2.0, /*target=*/0.45);
+        double sigma = step_size.sigma();
+        // One adaptation block contains exactly one local-update sweep.
+        const size_t block = std::max<size_t>(1, overrelaxation_rate);
+
+        cout << "Starting simulated annealing: T=" << T_start << " → " << T_end
+             << " in " << schedule.size() << " temperature steps of " << n_anneal << " sweeps ("
+             << (heat_bath_moves ? "heat-bath" : adaptive ? "adaptive Gaussian Metropolis"
+                                                          : "uniform Metropolis")
+             << (use_parallel_sweeps() ? ", coloured OpenMP sweeps" : "") << ")" << endl;
         if (T_zero) {
-            cout << "T=0 mode enabled: will perform " << n_deterministics << " deterministic sweeps at T=0" << endl;
+            cout << "T=0 stage: up to " << n_deterministics << " descent sweeps" << endl;
         }
         if (boundary_update) {
             cout << "Twist boundary updates enabled: " << twist_sweep_count << " twist sweeps per MC sweep" << endl;
         }
-        
-        size_t temp_step = 0;
-        while (T > T_end) {
-            // Perform sweeps at this temperature
-            double acc_sum = perform_mc_sweeps(n_anneal, T, gaussian_move, sigma, 
-                                              overrelaxation_rate, boundary_update, twist_sweep_count);
-            
-            // Calculate acceptance rate (normalize differently if overrelaxation is used)
-            double acceptance = (overrelaxation_rate > 0) ? 
-                acc_sum / double(n_anneal) * overrelaxation_rate : 
-                acc_sum / double(n_anneal);
-            
-            // Progress report
-            if (temp_step % 10 == 0 || T <= T_end * 1.5) {
-                double E = energy_density();
-                cout << "T=" << std::scientific << T << ", E/N=" << E 
+
+        for (size_t k = 0; k < schedule.size(); ++k) {
+            const double T = schedule[k];
+            double acceptance = 0.0;
+            if (adaptive && !heat_bath_moves && n_anneal >= 2 * block) {
+                step_size.restart();
+                const size_t n_adapt = (n_anneal / 2) / block;
+                for (size_t b = 0; b < n_adapt; ++b) {
+                    step_size.update(perform_mc_sweeps(block, T, true, sigma, overrelaxation_rate));
+                    sigma = step_size.sigma();
+                }
+                acceptance = perform_mc_sweeps(n_anneal - n_adapt * block, T, gaussian_move, sigma,
+                                               overrelaxation_rate, boundary_update, twist_sweep_count);
+            } else {
+                acceptance = perform_mc_sweeps(n_anneal, T, gaussian_move, sigma,
+                                               overrelaxation_rate, boundary_update, twist_sweep_count);
+            }
+
+            if (k % 10 == 0 || k + 1 == schedule.size()) {
+                cout << "T=" << std::scientific << T << ", E/N=" << energy_density()
                      << ", acc=" << std::fixed << acceptance;
-                if (gaussian_move) cout << ", σ=" << sigma;
+                if (adaptive && !heat_bath_moves) cout << ", σ=" << sigma;
                 cout << endl;
             }
-            
-            // Adaptive sigma adjustment for gaussian moves (match original logic)
-            if (gaussian_move && acceptance < 0.5) {
-                sigma = sigma * 0.5 / (1.0 - acceptance);
-                if (temp_step % 10 == 0 || T <= T_end * 1.5) {
-                    cout << "Sigma adjusted to " << sigma << endl;
-                }
-            }
-            
-            // Cool down
-            T *= cooling_rate;
-            ++temp_step;
         }
-        
+
         cout << "Final energy density: " << energy_density() << endl;
-        
-        // Save spin config after annealing (before deterministic sweeps)
+
+        // Save spin config after annealing (before the T = 0 stage)
         if (!out_dir.empty()) {
-            save_spin_config(out_dir + "/spins_T=" + std::to_string(T) + ".txt");
+            save_spin_config(out_dir + "/spins_T=" + std::to_string(T_end) + ".txt");
             save_positions(out_dir + "/positions.txt");
             if (boundary_update) {
-                save_twist_angles(out_dir + "/twist_angles_T=" + std::to_string(T) + ".txt");
+                save_twist_angles(out_dir + "/twist_angles_T=" + std::to_string(T_end) + ".txt");
             }
         }
-        
-        // Final measurements if requested (before deterministic sweeps)
+
         if (save_observables && !out_dir.empty()) {
-            perform_final_measurements(T_end, sigma, gaussian_move, 
+            perform_final_measurements(T_end, sigma, gaussian_move,
                                       overrelaxation_rate, out_dir);
         }
-        
-        // T=0 deterministic sweeps if requested
+
         if (T_zero && n_deterministics > 0) {
-            cout << "\nPerforming " << n_deterministics << " deterministic sweeps at T=0..." << endl;
-            // SOTA: at T=0 the boundary-bond energy is a smooth 1-D
-            // function of θ_d, so we replace the (frozen) Metropolis
-            // twist update with a golden-section line minimization.
-            // Interleave it with the spin quench every twist_relax_every
-            // sweeps so spins and twist co-relax to the true minimum.
+            cout << "\nT=0 descent (at most " << n_deterministics << " sweeps)..." << endl;
+            // At T=0 the boundary-bond energy is a smooth 1-D function of θ_d:
+            // golden-section line minimisation replaces the frozen Metropolis
+            // twist update, interleaved so spins and twists co-relax.
             const size_t twist_relax_every = boundary_update
                 ? std::max<size_t>(1, n_deterministics / 50)
                 : 0;
-            for (size_t sweep = 0; sweep < n_deterministics; ++sweep) {
-                deterministic_sweep(1);
-
+            const double s = double(spin_length);
+            double E_prev = total_energy();
+            size_t sweep = 0;
+            bool converged = false;
+            for (; sweep < n_deterministics; ++sweep) {
+                const double max_change = deterministic_sweep(1);
                 if (twist_relax_every > 0 && (sweep % twist_relax_every == 0)) {
                     relax_twist_angles(/*n_passes=*/2);
                 }
-
-                if (sweep % 100 == 0 || sweep == n_deterministics - 1) {
-                    double E = energy_density();
-                    cout << "Deterministic sweep " << sweep << "/" << n_deterministics 
-                         << ", E/N=" << E << endl;
+                const double E = total_energy();
+                if (sweep % 100 == 0) {
+                    cout << "Descent sweep " << sweep << ", E/N=" << std::setprecision(12)
+                         << E / lattice_size << endl;
                 }
+                if (max_change < 1e-10 * s && std::abs(E - E_prev) <= 1e-14 * (std::abs(E) + 1.0)) {
+                    converged = true;
+                    ++sweep;
+                    break;
+                }
+                E_prev = E;
             }
-            // One last high-accuracy twist refinement.
             if (boundary_update) {
                 relax_twist_angles(/*n_passes=*/4, /*tol=*/1e-12);
                 cout << "Final twist angles (rad): θ = ("
                      << twist_angles[0] << ", " << twist_angles[1] << ", " << twist_angles[2]
                      << ")" << endl;
             }
-            cout << "Deterministic sweeps completed. Final energy: " << energy_density() << endl;
-            // Save final configuration
+            cout << "T=0 descent " << (converged ? "converged" : "stopped (not converged)")
+                 << " after " << sweep << " sweeps. Final E/N = " << std::setprecision(15)
+                 << energy_density() << std::setprecision(6) << endl;
             if (!out_dir.empty()) {
                 save_spin_config(out_dir + "/spins_T=0.txt");
                 if (boundary_update) {
@@ -337,10 +353,7 @@
         prelim_energies.reserve(prelim_samples / prelim_interval);
         
         for (size_t i = 0; i < prelim_samples; ++i) {
-            metropolis(T_final, gaussian_move, sigma);
-            if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                overrelaxation(T_final);
-            }
+            perform_mc_sweeps(1, T_final, gaussian_move, sigma, overrelaxation_rate);
             if (i % prelim_interval == 0) {
                 prelim_energies.push_back(total_energy(spins));
             }
@@ -369,11 +382,8 @@
         sublattice_mags.reserve(n_samples);
         
         for (size_t i = 0; i < n_measure; ++i) {
-            metropolis(T_final, gaussian_move, sigma);
-            if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                overrelaxation(T_final);
-            }
-            
+            perform_mc_sweeps(1, T_final, gaussian_move, sigma, overrelaxation_rate);
+
             if (i % acf.sampling_interval == 0) {
                 energies.push_back(total_energy(spins));
                 magnetizations.push_back(magnetization_global());
@@ -526,7 +536,12 @@
                             bool boundary_update,
                             size_t twist_sweep_count,
                             size_t* twist_acc_ptr) {
+        // Each iteration: with overrelaxation_rate = k > 0, one
+        // overrelaxation sweep, plus a local-update sweep every k-th
+        // iteration (k OR sweeps per local sweep); with k = 0, one
+        // local-update sweep. Returns the mean acceptance of the local sweeps.
         double acc_sum = 0.0;
+        size_t n_local = 0;
         size_t total_twist_accepted = 0;
         size_t total_twist_attempted = 0;
 
@@ -538,15 +553,16 @@
             twist_interval = std::max<size_t>(1, n_sweeps / twist_sweep_count);
         }
 
-        // Perform MC sweeps with interleaved twist updates
         for (size_t i = 0; i < n_sweeps; ++i) {
             if (overrelaxation_rate > 0) {
-                overrelaxation(T);
+                overrelaxation_sweep(T);
                 if (i % overrelaxation_rate == 0) {
-                    acc_sum += metropolis(T, gaussian_move, sigma);
+                    acc_sum += local_sweep(T, gaussian_move, sigma);
+                    ++n_local;
                 }
             } else {
-                acc_sum += metropolis(T, gaussian_move, sigma);
+                acc_sum += local_sweep(T, gaussian_move, sigma);
+                ++n_local;
             }
 
             if (twist_interval > 0 && (i % twist_interval == 0)) {
@@ -556,9 +572,12 @@
                 total_twist_attempted += n_dims;
             }
         }
+        const double mean_acceptance = (n_local > 0) ? acc_sum / double(n_local) : 0.0;
 
-        // Diagnostics
+        // Diagnostics (stream formatting restored afterwards)
         if (boundary_update && total_twist_attempted > 0) {
+            const std::ios_base::fmtflags saved_flags = cout.flags();
+            const std::streamsize saved_precision = cout.precision();
             double twist_acc_rate = double(total_twist_accepted) / double(total_twist_attempted);
             cout << "  [Twist BC: " << total_twist_accepted << "/" << total_twist_attempted 
                  << " accepted (" << std::fixed << std::setprecision(3) << twist_acc_rate * 100.0 
@@ -573,13 +592,15 @@
                 if (d < 2) cout << ", ";
             }
             cout << ")]" << endl;
+            cout.flags(saved_flags);
+            cout.precision(saved_precision);
         }
 
         if (twist_acc_ptr) {
             *twist_acc_ptr = total_twist_accepted;
         }
 
-        return acc_sum;
+        return mean_acceptance;
     }
 
 // ---- Lattice::save_observables ----

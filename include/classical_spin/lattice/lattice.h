@@ -1089,7 +1089,9 @@ public:
           field_drive_freq(other.field_drive_freq),
           field_drive_width(other.field_drive_width),
           alpha_gilbert(other.alpha_gilbert),
-          langevin_temperature(other.langevin_temperature)
+          langevin_temperature(other.langevin_temperature),
+          local_update(other.local_update),
+          parallel_sweep_min_sites(other.parallel_sweep_min_sites)
     {}
 
     // ============================================================
@@ -2620,6 +2622,144 @@ public:
         size_t accepted = 0;
         for (auto& a : per_thread_accepted) accepted += a.v;
         return double(accepted) / double(lattice_size);
+    }
+
+    // ------------------------------------------------------------------
+    // Heat-bath update (Miyatake et al., J. Phys. C 19, 2539 (1986)).
+    //
+    // For a local energy g·S_i (all terms linear in S_i), the conditional
+    // distribution is P(S_i) ∝ exp(-β g·S_i): with u = cos∠(S_i, -ĝ) and
+    // b = β|g|s it is P(u) ∝ exp(b u) on [-1, 1], sampled exactly by
+    //     u = 1 + log1p(ξ expm1(-2b)) / b,   φ uniform.
+    // Rejection-free, and far more efficient than uniform Metropolis at low
+    // T. With an anisotropic on-site term the heat-bath draw of the linear
+    // part is an independence proposal; Metropolis-Hastings then accepts it
+    // with min(1, exp(-β ΔE_onsite)), which is exact. Only SO(3) spins;
+    // other spin dimensions fall back to Metropolis.
+    // ------------------------------------------------------------------
+    inline bool heat_bath_site(size_t site, double beta) {
+        double g[MAX_SPIN_DIM];
+        linear_field(site, spins_view(), g);
+        const double s = double(spin_length);
+        const double gn = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+        double S_new[3];
+        if (gn * beta * s < 1e-12) {
+            random_point_on_sphere(S_new, 3, s);
+        } else {
+            const double b = beta * gn * s;
+            const double xi = random_double_lehman(0.0, 1.0);
+            double u = 1.0 + std::log1p(xi * std::expm1(-2.0 * b)) / b;
+            u = std::clamp(u, -1.0, 1.0);
+            const double phi = random_double_lehman(0.0, 2.0 * M_PI);
+            const double n[3] = {-g[0] / gn, -g[1] / gn, -g[2] / gn};
+            // Orthonormal basis (e1, e2) of the plane normal to n.
+            double e1[3];
+            if (std::abs(n[0]) < 0.9) { e1[0] = 0.0; e1[1] = -n[2]; e1[2] = n[1]; }
+            else                      { e1[0] = n[2]; e1[1] = 0.0; e1[2] = -n[0]; }
+            const double e1n = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+            for (double& c : e1) c /= e1n;
+            const double e2[3] = {n[1] * e1[2] - n[2] * e1[1], n[2] * e1[0] - n[0] * e1[2],
+                                  n[0] * e1[1] - n[1] * e1[0]};
+            const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+            const double c = std::cos(phi), sn = std::sin(phi);
+            for (int d = 0; d < 3; ++d) S_new[d] = s * (u * n[d] + r * (c * e1[d] + sn * e2[d]));
+        }
+        double* S = spins[site].data();
+        if (!onsite_is_scalar(site)) {
+            const double dE = onsite_energy(site, S_new) - onsite_energy(site, S);
+            if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE)) return false;
+        }
+        S[0] = S_new[0]; S[1] = S_new[1]; S[2] = S_new[2];
+        return true;
+    }
+
+    /// Heat-bath sweep in natural site order; returns the acceptance ratio
+    /// (1 unless anisotropic on-site terms reject some draws).
+    double heat_bath(double T) {
+        if (T <= 0.0) return 0.0;
+        if (spin_dim != 3) return metropolis(T);
+        const double beta = 1.0 / T;
+        size_t accepted = 0;
+        for (size_t site = 0; site < lattice_size; ++site) accepted += heat_bath_site(site, beta);
+        return double(accepted) / double(lattice_size);
+    }
+
+    /// Coloured, race-free OpenMP heat-bath sweep (see metropolis_parallel).
+    double heat_bath_parallel(double T) {
+        if (T <= 0.0) return 0.0;
+        if (spin_dim != 3) return metropolis_parallel(T);
+#ifdef _OPENMP
+        if (n_colors == 0 || omp_get_max_threads() <= 1) return heat_bath(T);
+#else
+        return heat_bath(T);
+#endif
+        const double beta = 1.0 / T;
+        size_t accepted = 0;
+#ifdef _OPENMP
+        #pragma omp parallel reduction(+:accepted)
+#endif
+        {
+            for (size_t c = 0; c < n_colors; ++c) {
+                const size_t off_lo = sites_by_color_csr_off[c];
+                const size_t off_hi = sites_by_color_csr_off[c + 1];
+#ifdef _OPENMP
+                #pragma omp for schedule(static) nowait
+#endif
+                for (size_t off = off_lo; off < off_hi; ++off)
+                    accepted += heat_bath_site(sites_by_color_csr[off], beta);
+#ifdef _OPENMP
+                #pragma omp barrier
+#endif
+            }
+        }
+        return double(accepted) / double(lattice_size);
+    }
+
+    // ------------------------------------------------------------------
+    // Local-update policy used by the SA / PT / measurement drivers.
+    // ------------------------------------------------------------------
+    enum class LocalUpdate { Metropolis, Gaussian, HeatBath };
+
+    // Kernel selection for local_sweep(): heat_bath / metropolis with uniform
+    // or Gaussian (σ) proposals; the coloured OpenMP kernels are used when
+    // more than one thread is available and the lattice has at least
+    // parallel_sweep_min_sites sites (reproducible for a fixed thread count).
+    LocalUpdate local_update = LocalUpdate::Metropolis;
+    size_t parallel_sweep_min_sites = 4096;
+
+    static LocalUpdate parse_local_update(const string& name) {
+        if (name == "metropolis" || name == "uniform") return LocalUpdate::Metropolis;
+        if (name == "gaussian" || name == "adaptive") return LocalUpdate::Gaussian;
+        if (name == "heat_bath" || name == "heatbath") return LocalUpdate::HeatBath;
+        throw std::invalid_argument("unknown local update '" + name +
+                                    "' (valid: metropolis, gaussian, heat_bath)");
+    }
+
+    bool use_parallel_sweeps() const {
+#ifdef _OPENMP
+        return n_colors > 0 && lattice_size >= parallel_sweep_min_sites && omp_get_max_threads() > 1;
+#else
+        return false;
+#endif
+    }
+
+    /**
+     * One local-update sweep at temperature T with the configured policy.
+     * `gaussian_move` (legacy flag) selects Gaussian proposals of width σ
+     * when the policy is Metropolis. Returns the acceptance ratio.
+     */
+    double local_sweep(double T, bool gaussian_move, double sigma) {
+        const bool par = use_parallel_sweeps();
+        if (local_update == LocalUpdate::HeatBath && spin_dim == 3)
+            return par ? heat_bath_parallel(T) : heat_bath(T);
+        const bool gauss = gaussian_move || local_update == LocalUpdate::Gaussian;
+        return par ? metropolis_parallel(T, gauss, sigma) : metropolis(T, gauss, sigma);
+    }
+
+    /// Overrelaxation sweep through the same serial/parallel selection.
+    void overrelaxation_sweep(double T) {
+        if (use_parallel_sweeps()) overrelaxation_parallel(T);
+        else overrelaxation(T);
     }
 
     /**

@@ -330,6 +330,7 @@ int main(int argc, char** argv) {
                           config.lattice_size[2],
                           config.spin_length);
             lattice.lattice_type = system_type_to_string(config.system);
+            lattice.local_update = Lattice::parse_local_update(config.local_update);
             
             // Initialize spins
             if (config.use_ferromagnetic_init) {

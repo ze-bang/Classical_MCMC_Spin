@@ -71,6 +71,9 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "seed") {
                 config.seed = std::stoull(value);
             }
+            else if (key == "local_update") {
+                config.local_update = value;
+            }
             else if (key == "output_dir") {
                 config.output_dir = value;
             }
@@ -532,6 +535,7 @@ void SpinConfig::to_file(const string& filename) const {
     file << "\n";
     file << "num_trials = " << num_trials << "\n";
     file << "seed = " << seed << "\n";
+    file << "local_update = " << local_update << "\n";
     file << "output_dir = " << output_dir << "\n\n";
     
     file << "# Temperature Parameters\n";

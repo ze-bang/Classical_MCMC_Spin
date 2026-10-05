@@ -36,6 +36,28 @@ void test_pyrochlore() {
     check_close(lat.energy_density(), -1.0, 1e-6, "pyrochlore AFM E/N = -1");
 }
 
+void test_heat_bath_anneal() {
+    std::printf("\n== Heat-bath annealing (pyrochlore AFM, L = 3) ==\n");
+    Lattice lat(pyrochlore_heisenberg_cell(1.0), 3, 3, 3, 1.0f);
+    lat.local_update = Lattice::LocalUpdate::HeatBath;
+    seed_lehman(5);
+    lat.simulated_annealing(3.0, 0.005, 200, 0, false, false, 0.85, "", false, true, 5000);
+    check_close(lat.energy_density(), -1.0, 1e-6, "heat-bath SA reaches E/N = -1");
+}
+
+void test_schedule_validation() {
+    std::printf("\n== Schedule validation ==\n");
+    auto sched = mc::annealing_schedule(2.0, 0.3, 0.5);
+    check(!sched.empty() && sched.back() == 0.3 && sched.front() == 2.0,
+          "schedule starts at T_start and ends exactly at T_end");
+    bool threw = false;
+    try { mc::annealing_schedule(1.0, 0.1, 1.0); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "cooling_rate >= 1 rejected (no infinite loop)");
+    threw = false;
+    try { mc::annealing_schedule(1.0, 0.0, 0.9); } catch (const std::invalid_argument&) { threw = true; }
+    check(threw, "T_end <= 0 rejected");
+}
+
 void test_easy_plane_field() {
     std::printf("\n== Easy-plane anisotropy + tilted field (quench with on-site terms) ==\n");
     // Decoupled spins: E = D Sz^2 - h.S with D = 1, h = (0.5, 0, 0.8).
@@ -66,6 +88,8 @@ int main(int argc, char** argv) {
     test_triangular();
     test_pyrochlore();
     test_easy_plane_field();
+    test_heat_bath_anneal();
+    test_schedule_validation();
     const int rc = finish("test_sa_ground_state");
     MPI_Finalize();
     return rc;

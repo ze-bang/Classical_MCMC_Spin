@@ -49,6 +49,9 @@ void test_free_spins() {
             r = sample_energy_density(lat, 500, 6000, [&] { lat.overrelaxation(); lat.metropolis(T); });
             check_stat(r.mean, r.err, exact, "metropolis+overrelaxation S=" + std::to_string(S) +
                        " T=" + std::to_string(T), kSigma);
+            r = sample_energy_density(lat, 500, 6000, [&] { lat.heat_bath(T); });
+            check_stat(r.mean, r.err, exact, "heat_bath S=" + std::to_string(S) +
+                       " T=" + std::to_string(T), kSigma);
         }
     }
 }
@@ -96,6 +99,9 @@ void test_heisenberg_ring() {
             {"metropolis_parallel", [&] { lat.metropolis_parallel(T); }},
             {"overrelaxation_parallel+metropolis_parallel",
              [&] { lat.overrelaxation_parallel(); lat.metropolis_parallel(T); }},
+            {"heat_bath", [&] { lat.heat_bath(T); }},
+            {"heat_bath_parallel+overrelaxation_parallel",
+             [&] { lat.heat_bath_parallel(T); lat.overrelaxation_parallel(); }},
             {"wolff+metropolis", [&] { lat.wolff_sweep(T, 4); lat.metropolis(T); }},
             {"swendsen_wang+metropolis", [&] { lat.swendsen_wang_sweep(T); lat.metropolis(T); }},
         };
@@ -244,6 +250,8 @@ void run_two_site_case(const TwoSiteModel& m, const std::string& label, bool or_
         double sig = 0.5;
         r = sample_energy_density(lat, 2000, 200000, [&] { lat.metropolis(T, true, sig); });
         check_stat(r.mean, r.err, exact, "metropolis(gaussian) " + tag, kSigma, 1e-4);
+        r = sample_energy_density(lat, 2000, 200000, [&] { lat.heat_bath(T); });
+        check_stat(r.mean, r.err, exact, "heat_bath " + tag, kSigma, 1e-4);
         if (or_valid) {
             r = sample_energy_density(lat, 2000, 200000, [&] { lat.overrelaxation(); lat.metropolis(T); });
             check_stat(r.mean, r.err, exact, "metropolis+overrelaxation " + tag, kSigma, 1e-4);
@@ -370,6 +378,8 @@ void test_three_site_trilinear() {
         r = sample_energy_density(lat, 2000, 150000, [&] { lat.overrelaxation(); lat.metropolis(T); });
         check_stat(r.mean, r.err, exact, "trilinear metropolis+overrelaxation T=" + std::to_string(T),
                    kSigma, 2e-4);
+        r = sample_energy_density(lat, 2000, 150000, [&] { lat.heat_bath(T); });
+        check_stat(r.mean, r.err, exact, "trilinear heat_bath T=" + std::to_string(T), kSigma, 2e-4);
         r = sample_energy_density(lat, 2000, 150000, [&] { lat.wolff_update(T); lat.metropolis(T); });
         check_stat(r.mean, r.err, exact, "trilinear wolff+metropolis T=" + std::to_string(T), kSigma, 2e-4);
     }
