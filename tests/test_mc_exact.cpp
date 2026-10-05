@@ -385,6 +385,79 @@ void test_three_site_trilinear() {
     }
 }
 
+// ------------------------------------------------------- twisted boundaries
+void test_twisted_boundaries() {
+    std::printf("\n== Twisted boundary conditions with anisotropic exchange ==\n");
+    Eigen::Matrix3d J;
+    J << 0.8, 0.3, -0.2, -0.1, 0.5, 0.4, 0.25, -0.35, -0.6;
+    const size_t L = 4;
+    Lattice lat(chain_cell(J, Eigen::Vector3d(0.1, 0.0, 0.2)), L, 1, 1, 1.0f);
+    array<SpinVector, 3> axes;
+    for (auto& a : axes) a = Eigen::Vector3d(0.3, -0.2, 1.0).normalized();
+    lat.set_twist_axes(axes);
+    const double theta = 0.7;
+    lat.twist_matrices[0] = Lattice::rotation_from_axis_angle(axes[0], theta);
+    lat.twist_angles[0] = theta;
+    lat.sync_twist_state();
+    const Eigen::Matrix3d R = lat.twist_matrices[0];
+
+    auto energy = [&](const std::vector<Eigen::Vector3d>& S) {
+        double E = 0.0;
+        for (size_t i = 0; i < L; ++i) {
+            const Eigen::Matrix3d M = (i + 1 == L) ? R : Eigen::Matrix3d::Identity();
+            E += S[i].dot(J * M * S[(i + 1) % L]) - Eigen::Vector3d(0.1, 0.0, 0.2).dot(S[i]);
+        }
+        return E;
+    };
+    auto as_vec = [&] {
+        std::vector<Eigen::Vector3d> S(L);
+        for (size_t i = 0; i < L; ++i) S[i] = lat.spins[i];
+        return S;
+    };
+    seed_lehman(77);
+    double e_err = 0.0, de_err = 0.0, g_err = 0.0;
+    for (int t = 0; t < 20; ++t) {
+        lat.init_random();
+        auto S = as_vec();
+        e_err = std::max(e_err, std::abs(lat.total_energy() - energy(S)));
+        const size_t site = t % L;
+        SpinVector nw = lat.gen_random_spin(1.0f);
+        auto S2 = S;
+        S2[site] = nw;
+        de_err = std::max(de_err, std::abs(lat.site_energy_diff_flat(nw.data(), lat.spins[site].data(), site) -
+                                           (energy(S2) - energy(S))));
+        SpinVector H = lat.get_local_field(site);
+        for (int d = 0; d < 3; ++d) {
+            auto Sp = S, Sm = S;
+            Sp[site](d) += 1e-6;
+            Sm[site](d) -= 1e-6;
+            g_err = std::max(g_err, std::abs(H(d) - (energy(Sp) - energy(Sm)) / 2e-6));
+        }
+    }
+    check_close(e_err, 0.0, 1e-12, "twisted total_energy matches closed form");
+    check_close(de_err, 0.0, 1e-12, "twisted site_energy_diff_flat matches closed form");
+    check_close(g_err, 0.0, 1e-6, "twisted local field == dE/dS (finite difference)");
+
+    // Hamiltonian flow with a twisted anisotropic bond conserves the energy.
+    Lattice::ODEState x = lat.spins_to_state(lat.spins);
+    const double E0 = lat.total_energy_flat(x.data());
+    lat.integrate_geometric(x, 0.0, 20.0, 0.01, [](const Lattice::ODEState&, double) {}, "spherical_midpoint");
+    const double E1 = lat.total_energy_flat(x.data());
+    check(std::abs(E1 - E0) < 1e-3, "twisted spherical-midpoint energy error " + std::to_string(E1 - E0));
+
+    // T = 0 twist relaxation lands on a minimum of the total energy in theta.
+    lat.relax_twist_angles(4, 1e-12);
+    const double th0 = lat.twist_angles[0];
+    const double E_min = lat.total_energy();
+    bool is_min = true;
+    for (double dth : {-1e-3, 1e-3}) {
+        lat.twist_matrices[0] = Lattice::rotation_from_axis_angle(axes[0], th0 + dth);
+        lat.sync_twist_state();
+        if (lat.total_energy() < E_min - 1e-12) is_min = false;
+    }
+    check(is_min, "relax_twist_angles finds a minimum of E(theta)");
+}
+
 // -------------------------------------------------------- colour partition
 void check_colouring(const Lattice& lat, const std::string& label) {
     bool ok = lat.n_colors > 0;
@@ -421,6 +494,7 @@ int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     set_threads(1);
     test_colouring();
+    test_twisted_boundaries();
     test_free_spins();
     test_free_spins_s7();
     test_heisenberg_ring();

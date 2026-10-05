@@ -511,8 +511,17 @@ public:
     vector<size_t>             bi_flat_offset;
     vector<size_t>             bi_flat_partner;
     vector<double>             bi_flat_J;
-    vector<uint8_t>            bi_flat_needs_twist;
+    vector<uint8_t>            bi_flat_needs_twist;   // wrapped bond of an SO(3) lattice
     vector<array<int8_t, 3>>   bi_flat_wrap;
+    // Twisted boundaries are folded into the bond matrices: bi_flat_J holds
+    // the effective matrix (J0 M(w) for the forward entry of a bond,
+    // (J0 M(w))^T for its reverse entry, M(w) the product of twist
+    // rotations crossed by the bond) and bi_flat_J0 the untwisted one.
+    // refresh_twisted_bonds() recomputes the wrapped entries whenever a
+    // twist angle changes, so the hot kernels never branch on twists and
+    // the local field is the exact gradient of the energy.
+    vector<double>             bi_flat_J0;
+    vector<uint8_t>            bi_flat_forward;
     size_t                     bi_flat_D2 = 0;   // = spin_dim * spin_dim, cached
 
     // ------------------------------------------------------------------
@@ -543,6 +552,7 @@ public:
     array<SpinVector, 3> rotation_axis;                  // Rotation axes
     array<double, 3> twist_angles;                       // Current twist angles (radians)
     vector<vector<array<int8_t, 3>>> bilinear_wrap_dir;  // Wrap direction per neighbor
+    vector<vector<uint8_t>> bilinear_forward;            // 1 = forward entry of the bond, 0 = reverse
     array<vector<size_t>, 3> boundary_sites_per_dim;     // Sites near boundaries
     array<size_t, 3> boundary_thickness;                 // Layers affected by twist
 
@@ -600,9 +610,40 @@ public:
     void sync_twist_state() {
         cluster_exact_cache = -1;
         twist_active = false;
-        if (spin_dim != 3) return;
-        for (size_t d = 0; d < 3; ++d)
-            if (!twist_matrices[d].isIdentity(1e-15)) twist_active = true;
+        if (spin_dim == 3)
+            for (size_t d = 0; d < 3; ++d)
+                if (!twist_matrices[d].isIdentity(1e-15)) twist_active = true;
+        refresh_twisted_bonds();
+    }
+
+    /// M(w) = R_2^{w_2} R_1^{w_1} R_0^{w_0} (R^{-1} = R^T): the rotation a
+    /// partner spin picks up when the bond crosses the boundaries w.
+    Eigen::Matrix3d twist_product(const array<int8_t, 3>& wrap) const {
+        Eigen::Matrix3d M = Eigen::Matrix3d::Identity();
+        for (size_t d = 0; d < 3; ++d) {
+            if (wrap[d] == 0) continue;
+            const Eigen::Matrix3d R = twist_matrices[d].topLeftCorner<3, 3>();
+            M = ((wrap[d] > 0) ? R : Eigen::Matrix3d(R.transpose())) * M;
+        }
+        return M;
+    }
+
+    /// Recompute the effective matrices of all wrapped bonds from J0 and
+    /// the current twists. O(#wrapped bonds).
+    void refresh_twisted_bonds() {
+        if (spin_dim != 3 || bi_flat_J0.empty()) return;
+        for (size_t k = 0; k < bi_flat_partner.size(); ++k) {
+            if (!bi_flat_needs_twist[k]) continue;
+            const Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> J0(&bi_flat_J0[9 * k]);
+            Eigen::Map<Eigen::Matrix<double, 3, 3, Eigen::RowMajor>> J(&bi_flat_J[9 * k]);
+            if (bi_flat_forward[k]) {
+                J = J0 * twist_product(bi_flat_wrap[k]);
+            } else {
+                const array<int8_t, 3>& w = bi_flat_wrap[k];
+                const array<int8_t, 3> w_fwd = {int8_t(-w[0]), int8_t(-w[1]), int8_t(-w[2])};
+                J = twist_product(w_fwd).transpose() * J0;
+            }
+        }
     }
 
     /**
@@ -643,6 +684,7 @@ public:
         bilinear_partners.resize(lattice_size);
         trilinear_partners.resize(lattice_size);
         bilinear_wrap_dir.resize(lattice_size);
+        bilinear_forward.resize(lattice_size);
         sublattice_frames.resize(N_atoms);
         
         // Copy sublattice frames from unit cell
@@ -824,6 +866,7 @@ public:
                             bilinear_interaction[site_idx].push_back(bi.interaction);
                             bilinear_partners[site_idx].push_back(partner_idx);
                             bilinear_wrap_dir[site_idx].push_back(wrap);
+                            bilinear_forward[site_idx].push_back(1);
                             
                             // Add reverse interaction: partner_idx -> site_idx with J^T
                             array<int8_t, 3> wrap_reverse = {
@@ -834,6 +877,7 @@ public:
                             bilinear_interaction[partner_idx].push_back(bi.interaction.transpose());
                             bilinear_partners[partner_idx].push_back(site_idx);
                             bilinear_wrap_dir[partner_idx].push_back(wrap_reverse);
+                            bilinear_forward[partner_idx].push_back(0);
                         }
 
                         // Build trilinear interactions (forward and two permutations)
@@ -919,6 +963,7 @@ public:
         bi_flat_J.assign(total_bonds * bi_flat_D2, 0.0);
         bi_flat_needs_twist.assign(total_bonds, 0);
         bi_flat_wrap.assign(total_bonds, std::array<int8_t, 3>{0, 0, 0});
+        bi_flat_forward.assign(total_bonds, 1);
 
         for (size_t i = 0; i < lattice_size; ++i) {
             const size_t base = bi_flat_offset[i];
@@ -937,11 +982,15 @@ public:
 
                 const auto& wrap = bilinear_wrap_dir[i][n];
                 bi_flat_wrap[k] = wrap;
+                if (n < bilinear_forward[i].size()) bi_flat_forward[k] = bilinear_forward[i][n];
                 // Twists are SO(3) rotations: only spin_dim == 3 bonds can carry one.
                 bi_flat_needs_twist[k] =
                     (spin_dim == 3 && (wrap[0] != 0 || wrap[1] != 0 || wrap[2] != 0))
                         ? uint8_t(1) : uint8_t(0);
             }
+        bi_flat_J0 = bi_flat_J;
+        refresh_twisted_bonds();
+
         }
     }
 
@@ -1071,6 +1120,8 @@ public:
           bi_flat_J(other.bi_flat_J),
           bi_flat_needs_twist(other.bi_flat_needs_twist),
           bi_flat_wrap(other.bi_flat_wrap),
+          bi_flat_J0(other.bi_flat_J0),
+          bi_flat_forward(other.bi_flat_forward),
           bi_flat_D2(other.bi_flat_D2),
           color_of_site(other.color_of_site),
           sites_by_color_csr_off(other.sites_by_color_csr_off),
@@ -1080,6 +1131,7 @@ public:
           rotation_axis(other.rotation_axis),
           twist_angles(other.twist_angles),
           bilinear_wrap_dir(other.bilinear_wrap_dir),
+          bilinear_forward(other.bilinear_forward),
           twist_active(other.twist_active),
           boundary_sites_per_dim(other.boundary_sites_per_dim),
           boundary_thickness(other.boundary_thickness),
@@ -1178,22 +1230,6 @@ public:
     }
 
     /**
-     * Apply twist matrix to partner spin crossing boundary
-     */
-    inline SpinVector apply_twist_to_partner_spin(const SpinVector& partner_spin,
-                                                   const array<int8_t, 3>& wrap) const {
-        SpinVector result = partner_spin;
-        for (size_t d = 0; d < 3; ++d) {
-            if (wrap[d] == +1) {
-                result = twist_matrices[d] * result;
-            } else if (wrap[d] == -1) {
-                result = twist_matrices[d].transpose() * result;
-            }
-        }
-        return result;
-    }
-
-    /**
      * Set twist rotation axes
      */
     void set_twist_axes(const array<SpinVector, 3>& axes) {
@@ -1238,34 +1274,12 @@ public:
      * Compute energy of a single site
      */
     double site_energy(const SpinVector& spin_here, size_t site_index) const {
-        double E = 0.0;
-        
-        // Zeeman energy: -B · S
-        E -= spin_here.dot(field[site_index]);
-        
-        // On-site anisotropy: S^T A S
-        E += spin_here.dot(onsite_interaction[site_index] * spin_here);
-        
-        // Bilinear interactions: S_i^T J S_j
-        size_t n_bi = bilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_bi; ++n) {
-            size_t partner = bilinear_partners[site_index][n];
-            SpinVector partner_spin = apply_twist_to_partner_spin(
-                spins[partner], bilinear_wrap_dir[site_index][n]);
-            E += spin_here.dot(bilinear_interaction[site_index][n] * partner_spin);
-        }
-        
-        // Trilinear interactions: contract(T, S_i, S_j, S_k)
-        size_t n_tri = trilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_tri; ++n) {
-            size_t p1 = trilinear_partners[site_index][n][0];
-            size_t p2 = trilinear_partners[site_index][n][1];
-            E += contract_trilinear(trilinear_interaction[site_index][n],
-                                   spin_here, 
-                                   spins[p1], 
-                                   spins[p2]);
-        }
-        
+        // -B·S + S^T A S + S·(Σ J_eff S_j + trilinear): every term involving
+        // the site, each counted once from this site's side.
+        double g[MAX_SPIN_DIM];
+        linear_field(site_index, spins_view(), g);
+        double E = onsite_energy(site_index, spin_here.data());
+        for (size_t d = 0; d < spin_dim; ++d) E += spin_here(d) * g[d];
         return E;
     }
 
@@ -1307,31 +1321,9 @@ public:
     FlatView flat_view(const double* x) const { return FlatView{x, spin_dim}; }
 
     /**
-     * Partner spin seen across a twisted periodic boundary: R_d for a +1
-     * wrap, R_d^T for a -1 wrap, applied dimension by dimension. Twists are
-     * SO(3) rotations, so only spin_dim == 3 bonds are ever flagged.
-     */
-    inline void twist_partner_spin_flat(const double* P, const array<int8_t, 3>& wrap,
-                                        double* out) const {
-        double v[3] = {P[0], P[1], P[2]};
-        for (size_t dim = 0; dim < 3; ++dim) {
-            if (wrap[dim] == 0) continue;
-            const auto& R = twist_matrices[dim];
-            double t[3];
-            if (wrap[dim] > 0) {
-                for (size_t d = 0; d < 3; ++d) t[d] = R(d, 0) * v[0] + R(d, 1) * v[1] + R(d, 2) * v[2];
-            } else {
-                for (size_t d = 0; d < 3; ++d) t[d] = R(0, d) * v[0] + R(1, d) * v[1] + R(2, d) * v[2];
-            }
-            v[0] = t[0]; v[1] = t[1]; v[2] = t[2];
-        }
-        out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
-    }
-
-    /**
      * H_out += Σ_n J_n S_{p(n)} + Σ_t T_t : (S_{p1(t)} ⊗ S_{p2(t)}),
-     * the gradient ∂E/∂S_i of every term LINEAR in S_i (bilinear exchange,
-     * twisted at wrapped bonds when a twist is active, and trilinear
+     * the gradient ∂E/∂S_i of every term LINEAR in S_i (bilinear exchange
+     * with twists folded into the effective bond matrices, and trilinear
      * couplings). Zeeman (-B) and the quadratic on-site term (2 A S_i) are
      * added by the callers that need them.
      */
@@ -1341,12 +1333,7 @@ public:
         const size_t D = spin_dim;
         const size_t bi_end = bi_flat_offset[site + 1];
         for (size_t k = bi_flat_offset[site]; k < bi_end; ++k) {
-            const double* P = spin_of(bi_flat_partner[k]);
-            double tw[3];
-            if (__builtin_expect(twist_active && bi_flat_needs_twist[k], 0)) {
-                twist_partner_spin_flat(P, bi_flat_wrap[k], tw);
-                P = tw;
-            }
+            const double* __restrict P = spin_of(bi_flat_partner[k]);
             const double* __restrict J = &bi_flat_J[k * bi_flat_D2];
             for (size_t a = 0; a < D; ++a) {
                 double row = 0.0;
@@ -1546,11 +1533,6 @@ public:
                 const size_t j = bi_flat_partner[k];
                 if (j <= i) continue;
                 const double* P = spin_of(j);
-                double tw[3];
-                if (__builtin_expect(twist_active && bi_flat_needs_twist[k], 0)) {
-                    twist_partner_spin_flat(P, bi_flat_wrap[k], tw);
-                    P = tw;
-                }
                 const double* J = &bi_flat_J[k * bi_flat_D2];
                 for (size_t a = 0; a < D; ++a) {
                     double row = 0.0;
@@ -2900,7 +2882,6 @@ public:
     /// K = r^T J r for bond slot k, or 0 for bonds that cannot be embedded
     /// exactly (twisted boundary bonds when a twist is active).
     inline double embedded_coupling(size_t k, const double* r) const {
-        if (twist_active && bi_flat_needs_twist[k]) return 0.0;
         const double* J = &bi_flat_J[k * bi_flat_D2];
         double K = 0.0;
         for (size_t a = 0; a < spin_dim; ++a) {
@@ -2955,7 +2936,7 @@ public:
             for (size_t d = 0; d < D; ++d) out[d] = S[d] - 2.0 * proj[j] * r[d];
         };
         double dE_true = 0.0, dE_emb = 0.0;
-        double Si_new[MAX_SPIN_DIM], Pj[MAX_SPIN_DIM], Pj_new[MAX_SPIN_DIM], tmp[MAX_SPIN_DIM];
+        double Si_new[MAX_SPIN_DIM], Pj[MAX_SPIN_DIM], Pj_new[MAX_SPIN_DIM];
         for (size_t i : members) {
             const double* Si = spins[i].data();
             reflected(i, Si_new);
@@ -2969,11 +2950,8 @@ public:
             const size_t bi_end = bi_flat_offset[i + 1];
             for (size_t k = bi_flat_offset[i]; k < bi_end; ++k) {
                 const size_t j = bi_flat_partner[k];
-                const bool twisted = twist_active && bi_flat_needs_twist[k];
                 const double* J = &bi_flat_J[k * bi_flat_D2];
-                const double* Sj = spins[j].data();
-                if (twisted) twist_partner_spin_flat(Sj, bi_flat_wrap[k], Pj);
-                else std::memcpy(Pj, Sj, D * sizeof(double));
+                std::memcpy(Pj, spins[j].data(), D * sizeof(double));
                 if (!in_cluster[j]) {
                     // Boundary bond: (S_i' - S_i)^T J P_j = -2 s_i r^T J P_j.
                     double rJP = 0.0, sj_t = 0.0;
@@ -2987,9 +2965,7 @@ public:
                     dE_emb += -2.0 * embedded_coupling(k, r) * proj[i] * sj_t;
                 } else {
                     // Internal bond, visited from both ends: half each time.
-                    reflected(j, tmp);
-                    if (twisted) twist_partner_spin_flat(tmp, bi_flat_wrap[k], Pj_new);
-                    else std::memcpy(Pj_new, tmp, D * sizeof(double));
+                    reflected(j, Pj_new);
                     double e_new = 0.0, e_old = 0.0;
                     for (size_t a = 0; a < D; ++a) {
                         double rn = 0.0, ro = 0.0;
