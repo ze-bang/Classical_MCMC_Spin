@@ -3310,7 +3310,9 @@ public:
                         double beta_cold = beta[partner_rank];
                         double E_hot = my_E;
                         double E_cold = partner_E;
-                        double delta = (beta_cold - beta_hot) * (E_hot - E_cold);
+                        // Swap acceptance min(1, exp((β_i - β_j)(E_i - E_j))) — symmetric
+                        // in the labels; the previous sign was inverted.
+                        double delta = (beta_hot - beta_cold) * (E_hot - E_cold);
                         bool accept = (delta >= 0) || (random_double_lehman(0.0, 1.0) < std::exp(delta));
                         accept_int = accept ? 1 : 0;
                         ++local_attempts;
@@ -4267,7 +4269,7 @@ private:
      */
     static void ensure_directory_exists(const string& dir_path) {
         if (!dir_path.empty()) {
-            ensure_directory_exists(dir_path);
+            std::filesystem::create_directories(dir_path);  // (was infinite self-recursion)
         }
     }
 
