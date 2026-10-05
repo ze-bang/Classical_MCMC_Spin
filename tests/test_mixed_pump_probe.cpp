@@ -18,6 +18,7 @@
 
 #include <H5Cpp.h>
 #include <mpi.h>
+#include <unistd.h>
 
 #include <filesystem>
 
@@ -141,8 +142,11 @@ int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &g_size);
+    // One scratch directory per run, named after rank 0's pid.
+    long pid = static_cast<long>(::getpid());
+    MPI_Bcast(&pid, 1, MPI_LONG, 0, MPI_COMM_WORLD);
     const std::string root = (std::filesystem::temp_directory_path() /
-                              ("classical_spin_mixed_pp_test_np" + std::to_string(g_size))).string();
+                              ("classical_spin_mixed_pp_test_" + std::to_string(pid))).string();
     const Scan scan;
     MixedLattice lat = make_lattice();
     const size_t n_tau = 4;

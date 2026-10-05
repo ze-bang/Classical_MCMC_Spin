@@ -27,6 +27,7 @@
 #include "classical_spin/lattice/mixed_lattice.h"
 
 #include <H5Cpp.h>
+#include <unistd.h>
 
 #include <complex>
 #include <filesystem>
@@ -573,7 +574,8 @@ std::vector<double> read_h5(const std::string& file, const std::string& path) {
 
 void test_md_diagnostics_and_nan_guard() {
     MixedLattice lat = make_tmfeo3(2);
-    const std::string dir = (std::filesystem::temp_directory_path() / "classical_spin_mixed_md_diag").string();
+    const std::string dir = (std::filesystem::temp_directory_path() /
+                             ("classical_spin_mixed_md_diag_" + std::to_string(::getpid()))).string();
     std::filesystem::remove_all(dir);
     lat.molecular_dynamics(0.0, 1.0, 0.01, dir, 5, "dopri5", false, 1e-10, 1e-10);
     const std::string file = dir + "/trajectory.h5";
