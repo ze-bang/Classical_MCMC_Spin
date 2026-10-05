@@ -1327,14 +1327,19 @@ public:
      * couplings). Zeeman (-B) and the quadratic on-site term (2 A S_i) are
      * added by the callers that need them.
      */
-    template<typename SpinOf>
-    inline void accumulate_exchange_field(size_t site, const SpinOf& spin_of,
-                                          double* __restrict H_out) const {
-        const size_t D = spin_dim;
+    // The kernels below are written once with a compile-time spin dimension
+    // DC (DC = 0: runtime spin_dim); the public entry points dispatch to the
+    // DC = 3 (SO(3)) and DC = 8 (SU(3)) instantiations so the hot loops are
+    // fully unrolled for the production cases.
+    template<int DC, typename SpinOf>
+    inline void accumulate_exchange_field_d(size_t site, const SpinOf& spin_of,
+                                            double* __restrict H_out) const {
+        const size_t D = (DC > 0) ? size_t(DC) : spin_dim;
+        const size_t D2 = D * D;
         const size_t bi_end = bi_flat_offset[site + 1];
         for (size_t k = bi_flat_offset[site]; k < bi_end; ++k) {
             const double* __restrict P = spin_of(bi_flat_partner[k]);
-            const double* __restrict J = &bi_flat_J[k * bi_flat_D2];
+            const double* __restrict J = &bi_flat_J[k * D2];
             for (size_t a = 0; a < D; ++a) {
                 double row = 0.0;
                 for (size_t b = 0; b < D; ++b) row += J[a * D + b] * P[b];
@@ -1359,24 +1364,54 @@ public:
         }
     }
 
+    template<typename SpinOf>
+    inline void accumulate_exchange_field(size_t site, const SpinOf& spin_of,
+                                          double* __restrict H_out) const {
+        switch (spin_dim) {
+            case 3:  accumulate_exchange_field_d<3>(site, spin_of, H_out); break;
+            case 8:  accumulate_exchange_field_d<8>(site, spin_of, H_out); break;
+            default: accumulate_exchange_field_d<0>(site, spin_of, H_out); break;
+        }
+    }
+
     /// g = -B_i + Σ J S_j + trilinear: the S_i-independent part of ∂E/∂S_i.
+    template<int DC, typename SpinOf>
+    inline void linear_field_d(size_t site, const SpinOf& spin_of, double* g) const {
+        const size_t D = (DC > 0) ? size_t(DC) : spin_dim;
+        const double* B = field[site].data();
+        for (size_t d = 0; d < D; ++d) g[d] = -B[d];
+        accumulate_exchange_field_d<DC>(site, spin_of, g);
+    }
+
     template<typename SpinOf>
     inline void linear_field(size_t site, const SpinOf& spin_of, double* g) const {
-        const double* B = field[site].data();
-        for (size_t d = 0; d < spin_dim; ++d) g[d] = -B[d];
-        accumulate_exchange_field(site, spin_of, g);
+        switch (spin_dim) {
+            case 3:  linear_field_d<3>(site, spin_of, g); break;
+            case 8:  linear_field_d<8>(site, spin_of, g); break;
+            default: linear_field_d<0>(site, spin_of, g); break;
+        }
     }
 
     /// S^T A S for the on-site matrix of `site`.
-    inline double onsite_energy(size_t site, const double* S) const {
-        const auto& A = onsite_interaction[site];
+    template<int DC>
+    inline double onsite_energy_d(size_t site, const double* S) const {
+        const size_t D = (DC > 0) ? size_t(DC) : spin_dim;
+        const double* A = onsite_interaction[site].data();  // column-major
         double e = 0.0;
-        for (size_t a = 0; a < spin_dim; ++a) {
-            double row = 0.0;
-            for (size_t b = 0; b < spin_dim; ++b) row += A(a, b) * S[b];
-            e += S[a] * row;
+        for (size_t b = 0; b < D; ++b) {
+            double col = 0.0;
+            for (size_t a = 0; a < D; ++a) col += S[a] * A[b * D + a];
+            e += col * S[b];
         }
         return e;
+    }
+
+    inline double onsite_energy(size_t site, const double* S) const {
+        switch (spin_dim) {
+            case 3:  return onsite_energy_d<3>(site, S);
+            case 8:  return onsite_energy_d<8>(site, S);
+            default: return onsite_energy_d<0>(site, S);
+        }
     }
 
     /**
@@ -1501,14 +1536,27 @@ public:
      * the Metropolis loop and `spins[site].data()`). Exact for every term:
      * ΔE = δ·g + (new^T A new - old^T A old) with g the linear field.
      */
+    template<int DC>
+    inline double site_energy_diff_d(const double* __restrict new_spin_buf,
+                                     const double* __restrict old_spin_buf,
+                                     size_t site_index) const {
+        const size_t D = (DC > 0) ? size_t(DC) : spin_dim;
+        double g[MAX_SPIN_DIM];
+        linear_field_d<DC>(site_index, spins_view(), g);
+        double dE = 0.0;
+        for (size_t d = 0; d < D; ++d) dE += (new_spin_buf[d] - old_spin_buf[d]) * g[d];
+        return dE + onsite_energy_d<DC>(site_index, new_spin_buf)
+                  - onsite_energy_d<DC>(site_index, old_spin_buf);
+    }
+
     double site_energy_diff_flat(const double* __restrict new_spin_buf,
                                  const double* __restrict old_spin_buf,
                                  size_t site_index) const {
-        double g[MAX_SPIN_DIM];
-        linear_field(site_index, spins_view(), g);
-        double dE = 0.0;
-        for (size_t d = 0; d < spin_dim; ++d) dE += (new_spin_buf[d] - old_spin_buf[d]) * g[d];
-        return dE + onsite_energy(site_index, new_spin_buf) - onsite_energy(site_index, old_spin_buf);
+        switch (spin_dim) {
+            case 3:  return site_energy_diff_d<3>(new_spin_buf, old_spin_buf, site_index);
+            case 8:  return site_energy_diff_d<8>(new_spin_buf, old_spin_buf, site_index);
+            default: return site_energy_diff_d<0>(new_spin_buf, old_spin_buf, site_index);
+        }
     }
 
     /**
