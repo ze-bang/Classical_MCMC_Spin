@@ -102,7 +102,9 @@
                 dsdt_flat[idx + 2] = dSz;
             }
         } else if (spin_dim == 8) {
-            // SU(3): structure-constant contraction dS_i/dt = sum_{jk} f_{ijk} H_j S_k
+            // SU(3): Lie-Poisson equation dn_i/dt = c sum_{jk} f_{ijk} H_j n_k with
+            // c = unit_cell.poisson_bracket (2 for n = <lambda>, since
+            // [lambda_a, lambda_b] = 2i f_abc lambda_c; see core/su3_coherent_state.h).
             //
             // The structure constants f_{ijk} are the antisymmetric Gell-Mann
             // constants — extremely sparse, with only 9 unique non-zero
@@ -111,6 +113,7 @@
             // hand-rolled `cross_prod_SU3_flat` evaluates only the 54 non-zero
             // entries directly, fully inlined, with no Eigen alloc; on the
             // SU(3) RHS this is roughly an order of magnitude faster.
+            const double su3_bracket = unit_cell.poisson_bracket;
 #ifdef _OPENMP
             #pragma omp parallel for schedule(static) if(lattice_size >= 64)
 #endif
@@ -124,6 +127,7 @@
                 }
 
                 const double* S = &state_flat[idx];
+                for (int a = 0; a < 8; ++a) H[a] *= su3_bracket;
                 cross_prod_SU3_flat(H, S, &dsdt_flat[idx], /*accumulate=*/false);
             }
         } else {

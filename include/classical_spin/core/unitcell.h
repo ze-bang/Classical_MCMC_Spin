@@ -111,6 +111,13 @@ public:
     
     vector<SpinVector> field;  // External field per atom
     vector<SpinMatrix> onsite_interaction;  // On-site interactions per atom
+
+    // Coefficient c of the spin Poisson bracket, dS_a/dt = c f_abc (dE/dS_b) S_c:
+    // 1 for SU(2) spins S = <S_op> ([S_a, S_b] = i eps_abc S_c), 2 for SU(3)
+    // Gell-Mann expectations n = <lambda> ([lambda_a, lambda_b] = 2i f_abc lambda_c).
+    // Part of the model definition because it fixes how the couplings of the
+    // unit cell act in the dynamics (see core/su3_coherent_state.h).
+    double poisson_bracket = 1.0;
     
     multimap<int, Bilinear> bilinear_interaction;
     multimap<int, Trilinear> trilinear_interaction;
@@ -134,6 +141,7 @@ public:
         onsite_interaction.resize(N_atoms, SpinMatrix::Zero(N, N));
         sublattice_frames.resize(N_atoms, SpinMatrix::Identity(N, N));
         afm_sublattice_signs.resize(N_atoms, 1.0);
+        poisson_bracket = (N == 8) ? 2.0 : 1.0;
     }
     
     UnitCell(size_t spin_dim, size_t num_atoms)
@@ -144,6 +152,7 @@ public:
         onsite_interaction.resize(N_atoms, SpinMatrix::Zero(N, N));
         sublattice_frames.resize(N_atoms, SpinMatrix::Identity(N, N));
         afm_sublattice_signs.resize(N_atoms, 1.0);
+        poisson_bracket = (N == 8) ? 2.0 : 1.0;
     }
     
     // Setters

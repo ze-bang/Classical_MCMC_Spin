@@ -1,24 +1,27 @@
 /**
  * @file mixed_lattice_md.cpp
- * @brief MixedLattice molecular dynamics + pulse / pump-probe drivers.
+ * @brief MixedLattice (SU(2) + SU(3)) dynamics: equations of motion, pulse
+ *        drives, molecular dynamics and pump-probe / 2DCS spectroscopy.
  *
- * Hosts the Landau–Lifshitz / Gell-Mann RHS for the SU(2)+SU(3) system,
- * the ODE system glue, pulse field logic, and the full pump-probe
- * spectroscopy drivers (single-process and MPI-parallel).
- *
- * Kept in the header (NOT moved here):
- *   - `integrate_ode_system<System, Observer>` — templated, must be
- *     visible at instantiation points.
- *   - All CUDA-guarded `*_gpu` stubs — they live in paired
- *     `#ifdef CUDA_ENABLED` / `#else` blocks that are awkward to split.
- *   - Small inline helpers (`set_damping_SU3`, `set_equilibrium_SU3`,
- *     `reset_pulse`, …) so hot setup paths stay inlineable.
+ * Conventions (see core/su3_coherent_state.h for the derivation):
+ *   E = <psi|H|psi> for every term, local field H = dE/dS (dE/dn),
+ *   SU(2):  dS/dt = H x S                         (+ LL-Gilbert damping)
+ *   SU(3):  dn^a/dt = c f_abc H^b n^c,  c = su3_bracket = 2   (+ Bloch relaxation)
+ * All trajectories are sampled on exact integer-indexed grids
+ * (dynamics/time_grid.h, dynamics/grid_integrate.h).
  */
 
 #include "classical_spin/lattice/mixed_lattice.h"
 
+#include "classical_spin/dynamics/grid_integrate.h"
+#include "classical_spin/dynamics/time_grid.h"
+
 #include <algorithm>
+#include <atomic>
+#include <climits>
 #include <cmath>
+#include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -26,28 +29,24 @@
 #include <limits>
 #include <memory>
 #include <sstream>
-
-#include <boost/numeric/odeint.hpp>
+#include <stdexcept>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 namespace {
+
+namespace dyn = classical_spin::dynamics;
+
 // =============================================================
-// Specialized inner kernels for MixedLattice MD local field.
-// Operate on flat row-major packed buffers (see
-// MixedLattice::build_packed_interaction_buffers).
-//
-//   bilinear_kernel<Da,Db>(J, s, H):
-//       H[a] += sum_{b=0..Db-1} J[a*Db + b] * s[b],   for a=0..Da-1
-//
+// Inner kernels of the MD local field, on the flat row-major packed buffers
+// of MixedLattice::build_packed_interaction_buffers():
+//   bilinear_kernel<Da,Db>(J, s, H):      H[a] += sum_b J[a*Db + b] s[b]
 //   trilinear_kernel<Da,Db,Dc>(T, s1, s2, H):
-//       H[a] += sum_{b,c} T[(a*Db+b)*Dc + c] * s1[b] * s2[c]
-//
-// Compile-time dimensions let the compiler fully unroll and vectorize
-// the canonical 3x3 / 3x8 / 8x8 / 3x3x3 / 3x3x8 / 8x3x3 / 8x8x8 cases.
-// Generic-dim fallbacks at the bottom handle non-standard SU(N).
+//                                         H[a] += sum_{b,c} T[(a*Db+b)*Dc + c] s1[b] s2[c]
+// Compile-time sizes (3x3, 3x8, 8x8, 3x3x3, 3x3x8, 8x3x3, 8x8x8) let the
+// compiler unroll and vectorise; MixedLattice only admits (3, 8) spins.
 // =============================================================
 template <size_t Da, size_t Db>
 inline void bilinear_kernel(const double* __restrict J,
@@ -61,15 +60,24 @@ inline void bilinear_kernel(const double* __restrict J,
     }
 }
 
+template <size_t Da, size_t Db>
+inline void scaled_bilinear_kernel(const double* __restrict J,
+                                   const double* __restrict s,
+                                   double scale, double* __restrict H) {
+    for (size_t a = 0; a < Da; ++a) {
+        double acc = 0.0;
+        const double* __restrict Ja = J + a * Db;
+        for (size_t b = 0; b < Db; ++b) acc += Ja[b] * s[b];
+        H[a] += scale * acc;
+    }
+}
+
 template <size_t Da, size_t Db, size_t Dc>
 inline void trilinear_kernel(const double* __restrict T,
                              const double* __restrict s1,
                              const double* __restrict s2,
                              double* __restrict H) {
-    // Loop nest: a outer, b middle, c inner-most.
-    //   - inner stride is unit (T row-major in c)
-    //   - s1[b] is hoisted out of the c loop as a scalar
-    //   - s2[c] is reused across b for fixed a (cache-friendly)
+    // a outer, b middle, c inner: unit stride in c, s1[b] hoisted.
     for (size_t a = 0; a < Da; ++a) {
         double acc = 0.0;
         for (size_t b = 0; b < Db; ++b) {
@@ -81,331 +89,258 @@ inline void trilinear_kernel(const double* __restrict T,
     }
 }
 
-inline void bilinear_kernel_dyn(const double* __restrict J,
-                                const double* __restrict s,
-                                double* __restrict H,
-                                size_t da, size_t db) {
-    for (size_t a = 0; a < da; ++a) {
-        double acc = 0.0;
-        const double* Ja = J + a * db;
-        for (size_t b = 0; b < db; ++b) acc += Ja[b] * s[b];
-        H[a] += acc;
+// Lie-Poisson SU(3) torque out^a = c f_abc H^b n^c (sparse Gell-Mann f).
+inline void su3_torque(const double* H, const double* n, double c, double* out) {
+    double Hc[8];
+    for (int a = 0; a < 8; ++a) Hc[a] = c * H[a];
+    cross_prod_SU3_flat(Hc, n, out, /*accumulate=*/false);
+}
+
+inline void require_finite(const std::vector<double>& x, double t, const char* who) {
+    for (double v : x) {
+        if (!std::isfinite(v)) {
+            std::ostringstream os;
+            os << who << ": non-finite state at t = " << t
+               << " (integration diverged; reduce the time step or tolerances)";
+            throw std::runtime_error(os.str());
+        }
     }
 }
 
-inline void trilinear_kernel_dyn(const double* __restrict T,
-                                 const double* __restrict s1,
-                                 const double* __restrict s2,
-                                 double* __restrict H,
-                                 size_t da, size_t db, size_t dc) {
-    for (size_t a = 0; a < da; ++a) {
-        double acc = 0.0;
-        for (size_t b = 0; b < db; ++b) {
-            const double s1b = s1[b];
-            const double* Tab = T + (a * db + b) * dc;
-            for (size_t c = 0; c < dc; ++c) acc += Tab[c] * s1b * s2[c];
+// The Gaussian pulse shape used by every driver: exp(-(dt / 2w)^2).
+inline double gaussian_envelope(double dt, double width) {
+    const double u = dt / (2.0 * width);
+    return std::exp(-u * u);
+}
+
+void validate_pulse_directions(const std::vector<SpinVector>& field, size_t n_atoms, size_t dim,
+                               const char* what) {
+    if (field.empty()) return;  // empty = zero direction
+    if (field.size() < n_atoms) {
+        throw std::invalid_argument(std::string(what) + ": need at least " + std::to_string(n_atoms) +
+                                    " direction vectors (one per atom of the unit cell), got " +
+                                    std::to_string(field.size()));
+    }
+    for (size_t a = 0; a < n_atoms; ++a) {
+        if (field[a].size() != static_cast<Eigen::Index>(dim)) {
+            throw std::invalid_argument(std::string(what) + ": direction vectors must have " +
+                                        std::to_string(dim) + " components");
         }
-        H[a] += acc;
+        if (!field[a].allFinite()) {
+            throw std::invalid_argument(std::string(what) + ": non-finite direction vector");
+        }
     }
 }
+
+void validate_pulse_shape(double amp, double width, double freq, const char* what) {
+    if (!std::isfinite(amp) || !std::isfinite(width) || !std::isfinite(freq)) {
+        throw std::invalid_argument(std::string(what) + ": non-finite pulse amplitude, width or frequency");
+    }
+    if (amp != 0.0 && !(width > 0.0)) {
+        throw std::invalid_argument(std::string(what) + ": pulse width must be > 0 (got " +
+                                    std::to_string(width) + ")");
+    }
+}
+
 }  // namespace
+
+// =============================================================
+// Pulse configuration
+// =============================================================
 
 // ---- MixedLattice::set_pulse_SU2 ----
     void MixedLattice::set_pulse_SU2(const vector<SpinVector>& field_in1, double t_B1,
                       const vector<SpinVector>& field_in2, double t_B2,
                       double amp, double width, double freq) {
-        // Pack field vectors, transforming to local frame: B_local = R * B_global
-        field_drive_SU2[0] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
-        field_drive_SU2[1] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
-        
-        // Guard MPI_Comm_rank with MPI_Initialized so that non-MPI
-        // callers (regression tests, single-rank drivers compiled
-        // without mpirun) do not abort at MPI_Comm_rank's "called
-        // before MPI_INIT" check. When MPI was never initialised we
-        // are by definition rank 0 in a 1-process world.
-        int mpi_rank = 0;
-        int mpi_inited = 0;
-        MPI_Initialized(&mpi_inited);
-        if (mpi_inited) MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-        
-        for (size_t atom = 0; atom < N_atoms_SU2; ++atom) {
-            // B_local = F^T * B_global (field transforms covariantly: B^(i) = F_i^T B^(0))
-            // For symmetric frames (e.g. diagonal sign matrices), F^T = F
-            SpinVector local_field1 = sublattice_frames_SU2[atom].transpose() * field_in1[atom];
-            SpinVector local_field2 = sublattice_frames_SU2[atom].transpose() * field_in2[atom];
-            field_drive_SU2[0].segment(atom * spin_dim_SU2, spin_dim_SU2) = local_field1;
-            field_drive_SU2[1].segment(atom * spin_dim_SU2, spin_dim_SU2) = local_field2;
+        validate_pulse_directions(field_in1, N_atoms_SU2, spin_dim_SU2, "set_pulse_SU2 (pulse 1)");
+        validate_pulse_directions(field_in2, N_atoms_SU2, spin_dim_SU2, "set_pulse_SU2 (pulse 2)");
+        validate_pulse_shape(amp, width, freq, "set_pulse_SU2");
+        if (!std::isfinite(t_B1) || !std::isfinite(t_B2)) {
+            throw std::invalid_argument("set_pulse_SU2: non-finite pulse time");
         }
-        
-        if (mpi_rank == 0) {
-            cout << "\n========== SU(2) Pulse Configuration ==========" << endl;
-            cout << "Pulse 1: t_center = " << t_B1 << ", Pulse 2: t_center = " << t_B2 << endl;
-            cout << "Amplitude = " << amp << ", Width = " << width << ", Frequency = " << freq << endl;
-            cout << "------------------------------------------------" << endl;
-            
-            for (size_t atom = 0; atom < N_atoms_SU2; ++atom) {
-                SpinVector local_field1 = field_drive_SU2[0].segment(atom * spin_dim_SU2, spin_dim_SU2);
-                SpinVector local_field2 = field_drive_SU2[1].segment(atom * spin_dim_SU2, spin_dim_SU2);
-                
-                cout << "SU(2) Atom " << atom << ":" << endl;
-                cout << "  Pulse 1 - Global: [";
-                for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << field_in1[atom](d);
-                    if (d < spin_dim_SU2 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
-                cout << "           Local:  [";
-                for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << local_field1(d);
-                    if (d < spin_dim_SU2 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
-                cout << "  Pulse 2 - Global: [";
-                for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << field_in2[atom](d);
-                    if (d < spin_dim_SU2 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
-                cout << "           Local:  [";
-                for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << local_field2(d);
-                    if (d < spin_dim_SU2 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
+        const vector<SpinVector>* in[2] = {&field_in1, &field_in2};
+        for (int k = 0; k < 2; ++k) {
+            field_drive_SU2[k] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
+            if (in[k]->empty()) {
+                field_drive_global_SU2[k] = SpinVector::Zero(spin_dim_SU2);
+                continue;
             }
-            cout << "================================================\n" << endl;
+            // B_local = F^T B_global (the field transforms covariantly).
+            for (size_t atom = 0; atom < N_atoms_SU2; ++atom) {
+                field_drive_SU2[k].segment(atom * spin_dim_SU2, spin_dim_SU2) =
+                    sublattice_frames_SU2[atom].transpose() * (*in[k])[atom];
+            }
+            // Lab-frame representative for the polarisation-resolved gates
+            // B_x/B_y/B_z(t): the THz pump is a uniform plane wave.
+            field_drive_global_SU2[k] = (*in[k])[0];
         }
-        
-        // Keep a lab-frame (pre-local-transform) representative of each pulse
-        // vector for the polarization-resolved magnetic gates B_x/B_y/B_z(t).
-        // The THz pump is a uniform plane wave, so atom 0 represents all atoms.
-        field_drive_global_SU2[0] = field_in1.empty()
-            ? SpinVector::Zero(spin_dim_SU2) : field_in1[0];
-        field_drive_global_SU2[1] = field_in2.empty()
-            ? SpinVector::Zero(spin_dim_SU2) : field_in2[0];
-
-        t_pulse_SU2[0] = t_B1;
-        t_pulse_SU2[1] = t_B2;
+        t_pulse_SU2 = {t_B1, t_B2};
         field_drive_amp_SU2 = amp;
         field_drive_width_SU2 = width;
         field_drive_freq_SU2 = freq;
+        n_active_pulses = 2;
     }
 
 // ---- MixedLattice::set_pulse_SU3 ----
     void MixedLattice::set_pulse_SU3(const vector<SpinVector>& field_in1, double t_B1,
                       const vector<SpinVector>& field_in2, double t_B2,
                       double amp, double width, double freq) {
-        // Pack field vectors, transforming to local frame: B_local = R * B_global
-        field_drive_SU3[0] = SpinVector::Zero(N_atoms_SU3 * spin_dim_SU3);
-        field_drive_SU3[1] = SpinVector::Zero(N_atoms_SU3 * spin_dim_SU3);
-        
-        // See set_pulse_SU2: guard MPI rank query with MPI_Initialized
-        // so non-MPI callers (regression tests, plain single-rank
-        // execution without mpirun) work without aborting.
-        int mpi_rank = 0;
-        int mpi_inited = 0;
-        MPI_Initialized(&mpi_inited);
-        if (mpi_inited) MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-        
-        for (size_t atom = 0; atom < N_atoms_SU3; ++atom) {
-            // B_local = F^T * B_global (field transforms covariantly: B^(i) = F_i^T B^(0))
-            // Derivation: B^(i) = χ^T D_i h = (χ^{-1} D_i χ)^T χ^T h = F_i^T B^(0)
-            SpinVector local_field1 = sublattice_frames_SU3[atom].transpose() * field_in1[atom];
-            SpinVector local_field2 = sublattice_frames_SU3[atom].transpose() * field_in2[atom];
-            field_drive_SU3[0].segment(atom * spin_dim_SU3, spin_dim_SU3) = local_field1;
-            field_drive_SU3[1].segment(atom * spin_dim_SU3, spin_dim_SU3) = local_field2;
+        validate_pulse_directions(field_in1, N_atoms_SU3, spin_dim_SU3, "set_pulse_SU3 (pulse 1)");
+        validate_pulse_directions(field_in2, N_atoms_SU3, spin_dim_SU3, "set_pulse_SU3 (pulse 2)");
+        validate_pulse_shape(amp, width, freq, "set_pulse_SU3");
+        if (!std::isfinite(t_B1) || !std::isfinite(t_B2)) {
+            throw std::invalid_argument("set_pulse_SU3: non-finite pulse time");
         }
-        
-        if (mpi_rank == 0) {
-            cout << "\n========== SU(3) Pulse Configuration ==========" << endl;
-            cout << "Pulse 1: t_center = " << t_B1 << ", Pulse 2: t_center = " << t_B2 << endl;
-            cout << "Amplitude = " << amp << ", Width = " << width << ", Frequency = " << freq << endl;
-            cout << "------------------------------------------------" << endl;
-            
+        const vector<SpinVector>* in[2] = {&field_in1, &field_in2};
+        for (int k = 0; k < 2; ++k) {
+            field_drive_SU3[k] = SpinVector::Zero(N_atoms_SU3 * spin_dim_SU3);
+            if (in[k]->empty()) continue;
+            // B^(i) = chi^T D_i h = F_i^T B^(0)
             for (size_t atom = 0; atom < N_atoms_SU3; ++atom) {
-                SpinVector local_field1 = field_drive_SU3[0].segment(atom * spin_dim_SU3, spin_dim_SU3);
-                SpinVector local_field2 = field_drive_SU3[1].segment(atom * spin_dim_SU3, spin_dim_SU3);
-                
-                cout << "SU(3) Atom " << atom << ":" << endl;
-                cout << "  Pulse 1 - Global: [";
-                for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << field_in1[atom](d);
-                    if (d < spin_dim_SU3 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
-                cout << "           Local:  [";
-                for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << local_field1(d);
-                    if (d < spin_dim_SU3 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
-                cout << "  Pulse 2 - Global: [";
-                for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << field_in2[atom](d);
-                    if (d < spin_dim_SU3 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
-                cout << "           Local:  [";
-                for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                    cout << std::setw(10) << std::setprecision(6) << local_field2(d);
-                    if (d < spin_dim_SU3 - 1) cout << ", ";
-                }
-                cout << "]" << endl;
+                field_drive_SU3[k].segment(atom * spin_dim_SU3, spin_dim_SU3) =
+                    sublattice_frames_SU3[atom].transpose() * (*in[k])[atom];
             }
-            cout << "================================================\n" << endl;
         }
-        
-        t_pulse_SU3[0] = t_B1;
-        t_pulse_SU3[1] = t_B2;
+        t_pulse_SU3 = {t_B1, t_B2};
         field_drive_amp_SU3 = amp;
         field_drive_width_SU3 = width;
         field_drive_freq_SU3 = freq;
+        n_active_pulses = 2;
+    }
+
+// ---- MixedLattice::configure_pulse_train ----
+    void MixedLattice::configure_pulse_train(size_t n_pulses,
+                               const vector<SpinVector>& field1_SU2, const vector<SpinVector>& field1_SU3,
+                               double t1,
+                               const vector<SpinVector>& field2_SU2, const vector<SpinVector>& field2_SU3,
+                               double t2,
+                               double amp_SU2, double width_SU2, double freq_SU2,
+                               double amp_SU3, double width_SU3, double freq_SU3) {
+        if (n_pulses < 1 || n_pulses > 2) {
+            throw std::invalid_argument("configure_pulse_train: 1 or 2 pulses supported");
+        }
+        static const vector<SpinVector> none;
+        set_pulse_SU2(field1_SU2, t1, n_pulses == 2 ? field2_SU2 : none, n_pulses == 2 ? t2 : t1,
+                      amp_SU2, width_SU2, freq_SU2);
+        set_pulse_SU3(field1_SU3, t1, n_pulses == 2 ? field2_SU3 : none, n_pulses == 2 ? t2 : t1,
+                      amp_SU3, width_SU3, freq_SU3);
+        n_active_pulses = n_pulses;
     }
 
 // ---- MixedLattice::drive_envelopes_SU2 ----
-    // Compute the two pulse envelope factors at time `t` (no per-site work).
-    // Hoisted out of the per-site loop so that the two exp + cos calls
-    // happen once per RHS evaluation instead of once per site.
+    // The two pulse factors amp * envelope * carrier at time t; pulse slots
+    // k >= n_active_pulses are zero (no phantom second pulse).
     void MixedLattice::drive_envelopes_SU2(double t, double& factor1, double& factor2) const {
-        if (!tabulated_pulse_times.empty()) {
-            // Tabulated mode: linear interpolation, returns 0 outside data range
-            const double dt1 = t - t_pulse_SU2[0];
-            const double dt2 = t - t_pulse_SU2[1];
-            factor1 = field_drive_amp_SU2 * interp_tabulated_pulse(dt1);
-            factor2 = field_drive_amp_SU2 * interp_tabulated_pulse(dt2);
-        } else {
-            const double dt1 = t - t_pulse_SU2[0];
-            const double dt2 = t - t_pulse_SU2[1];
-            factor1 = field_drive_amp_SU2 *
-                      std::exp(-std::pow(dt1 / (2.0 * field_drive_width_SU2), 2)) *
-                      std::cos(field_drive_freq_SU2 * dt1);
-            factor2 = field_drive_amp_SU2 *
-                      std::exp(-std::pow(dt2 / (2.0 * field_drive_width_SU2), 2)) *
-                      std::cos(field_drive_freq_SU2 * dt2);
+        factor1 = factor2 = 0.0;
+        if (n_active_pulses == 0 || field_drive_amp_SU2 == 0.0) return;
+        double f[2] = {0.0, 0.0};
+        for (size_t k = 0; k < std::min<size_t>(n_active_pulses, 2); ++k) {
+            const double dt = t - t_pulse_SU2[k];
+            f[k] = tabulated_pulse_times.empty()
+                 ? field_drive_amp_SU2 * gaussian_envelope(dt, field_drive_width_SU2)
+                       * std::cos(field_drive_freq_SU2 * dt)
+                 : field_drive_amp_SU2 * interp_tabulated_pulse(dt);
         }
+        factor1 = f[0];
+        factor2 = f[1];
     }
 
 // ---- MixedLattice::drive_envelopes_SU3 ----
     void MixedLattice::drive_envelopes_SU3(double t, double& factor1, double& factor2) const {
-        if (!tabulated_pulse_times.empty()) {
-            // Tabulated mode: same table shared with SU2 (same physical pulse)
-            const double dt1 = t - t_pulse_SU3[0];
-            const double dt2 = t - t_pulse_SU3[1];
-            factor1 = field_drive_amp_SU3 * interp_tabulated_pulse(dt1);
-            factor2 = field_drive_amp_SU3 * interp_tabulated_pulse(dt2);
-        } else {
-            const double dt1 = t - t_pulse_SU3[0];
-            const double dt2 = t - t_pulse_SU3[1];
-            const double env1 = std::exp(-std::pow(dt1 / (2.0 * field_drive_width_SU3), 2));
-            const double env2 = std::exp(-std::pow(dt2 / (2.0 * field_drive_width_SU3), 2));
-            // Two-color carrier when field_drive_freq_SU3_2 != 0: drives two CEF
-            // lines under one Gaussian so the f_257 Raman product (E13 x E23)
-            // lands on E12 = E13 - E23 resonantly.
-            double carrier1 = std::cos(field_drive_freq_SU3 * dt1);
-            double carrier2 = std::cos(field_drive_freq_SU3 * dt2);
-            if (field_drive_freq_SU3_2 != 0.0) {
-                carrier1 += std::cos(field_drive_freq_SU3_2 * dt1);
-                carrier2 += std::cos(field_drive_freq_SU3_2 * dt2);
+        factor1 = factor2 = 0.0;
+        if (n_active_pulses == 0 || field_drive_amp_SU3 == 0.0) return;
+        double f[2] = {0.0, 0.0};
+        for (size_t k = 0; k < std::min<size_t>(n_active_pulses, 2); ++k) {
+            const double dt = t - t_pulse_SU3[k];
+            if (!tabulated_pulse_times.empty()) {
+                // Same physical pulse as the SU(2) drive: shared table.
+                f[k] = field_drive_amp_SU3 * interp_tabulated_pulse(dt);
+                continue;
             }
-            factor1 = field_drive_amp_SU3 * env1 * carrier1;
-            factor2 = field_drive_amp_SU3 * env2 * carrier2;
+            // Two-colour carrier when field_drive_freq_SU3_2 != 0: one Gaussian
+            // drives two CEF lines, so the f_257 Raman product (E13 x E23)
+            // lands on E12 = E13 - E23 resonantly.
+            double carrier = std::cos(field_drive_freq_SU3 * dt);
+            if (field_drive_freq_SU3_2 != 0.0) carrier += std::cos(field_drive_freq_SU3_2 * dt);
+            f[k] = field_drive_amp_SU3 * gaussian_envelope(dt, field_drive_width_SU3) * carrier;
         }
+        factor1 = f[0];
+        factor2 = f[1];
     }
 
 // ---- MixedLattice::interp_tabulated_pulse (private helper) ----
-    // Linear interpolation of the normalized tabulated pulse at offset `dt`
-    // from the pulse center.  Returns 0 outside the data range.
+    // Linear interpolation of the normalised tabulated pulse at offset dt from
+    // the pulse centre; 0 outside the data range.
     double MixedLattice::interp_tabulated_pulse(double dt) const {
         if (tabulated_pulse_times.empty()) return 0.0;
         if (dt <= tabulated_pulse_times.front() || dt >= tabulated_pulse_times.back()) return 0.0;
-        // Binary search for the bracketing interval
         auto it = std::lower_bound(tabulated_pulse_times.begin(), tabulated_pulse_times.end(), dt);
-        size_t idx = static_cast<size_t>(it - tabulated_pulse_times.begin());
+        const size_t idx = static_cast<size_t>(it - tabulated_pulse_times.begin());
         const double t0 = tabulated_pulse_times[idx - 1];
         const double t1 = tabulated_pulse_times[idx];
         const double v0 = tabulated_pulse_values[idx - 1];
         const double v1 = tabulated_pulse_values[idx];
-        return v0 + (v1 - v0) * (dt - t0) / (t1 - t0);
+        return v0 + (v1 - v0) * (dt - t0) / (t1 - t0);  // t1 > t0 (validated at load)
     }
 
 // ---- MixedLattice::load_tabulated_pulse ----
     void MixedLattice::load_tabulated_pulse(const std::string& filename) {
-        tabulated_pulse_times.clear();
-        tabulated_pulse_values.clear();
-        tabulated_pulse_sigma = 0.0;
-
         std::ifstream f(filename);
         if (!f.is_open()) {
             throw std::runtime_error("load_tabulated_pulse: cannot open \"" + filename + "\"");
         }
-
+        std::vector<double> times, values;
         std::string line;
         while (std::getline(f, line)) {
-            // Strip comments and blank lines
             const auto comment_pos = line.find('#');
             if (comment_pos != std::string::npos) line.erase(comment_pos);
             if (line.empty()) continue;
-            // Accept comma- or whitespace-separated columns
-            for (char& c : line) { if (c == ',') c = ' '; }
+            for (char& c : line) { if (c == ',') c = ' '; }   // comma- or space-separated
             std::istringstream ss(line);
             double t_val, e_val;
             if (ss >> t_val >> e_val) {
-                tabulated_pulse_times.push_back(t_val);
-                tabulated_pulse_values.push_back(e_val);
+                times.push_back(t_val);
+                values.push_back(e_val);
             }
         }
-
-        if (tabulated_pulse_times.size() < 2) {
+        if (times.size() < 2) {
             throw std::runtime_error("load_tabulated_pulse: fewer than 2 data points in \"" + filename + "\"");
         }
-
-        // Center time axis at the peak (same convention as Efield_plot.py)
         double e_max = 0.0;
         size_t idx_peak = 0;
-        for (size_t i = 0; i < tabulated_pulse_values.size(); ++i) {
-            if (std::abs(tabulated_pulse_values[i]) > e_max) {
-                e_max = std::abs(tabulated_pulse_values[i]);
+        for (size_t i = 0; i < times.size(); ++i) {
+            if (!std::isfinite(times[i]) || !std::isfinite(values[i])) {
+                throw std::runtime_error("load_tabulated_pulse: non-finite entry in \"" + filename + "\"");
+            }
+            if (i > 0 && !(times[i] > times[i - 1])) {
+                throw std::runtime_error("load_tabulated_pulse: times must be strictly increasing in \"" +
+                                         filename + "\"");
+            }
+            if (std::abs(values[i]) > e_max) {
+                e_max = std::abs(values[i]);
                 idx_peak = i;
             }
         }
-        const double t_peak = tabulated_pulse_times[idx_peak];
-        for (double& tv : tabulated_pulse_times) tv -= t_peak;
-
-        // Normalize so max|E| = 1 (amplitude scaling is then handled by field_drive_amp_SU2/SU3)
-        for (double& ev : tabulated_pulse_values) ev /= e_max;
-
-        // Compute effective σ for pulse-window chunking.
-        // We use: σ = max|dt| / kPulseWindowSigmas so that
-        // kPulseWindowSigmas * σ exactly covers the full data range.
-        constexpr double kPulseWindowSigmas = 9.0;
-        const double max_extent = std::max(
-            std::abs(tabulated_pulse_times.front()),
-            std::abs(tabulated_pulse_times.back()));
-        tabulated_pulse_sigma = max_extent / kPulseWindowSigmas;
-
-        int mpi_rank = 0;
-        int mpi_inited = 0;
-        MPI_Initialized(&mpi_inited);
-        if (mpi_inited) MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-
-        if (mpi_rank == 0) {
-            std::cout << "Tabulated pulse loaded: " << filename << "\n"
-                      << "  Points: " << tabulated_pulse_times.size()
-                      << "  t range: [" << tabulated_pulse_times.front()
-                      << ", " << tabulated_pulse_times.back() << "] ps\n"
-                      << "  Effective sigma: " << tabulated_pulse_sigma << " ps" << std::endl;
+        if (!(e_max > 0.0)) {
+            throw std::runtime_error("load_tabulated_pulse: the pulse is identically zero in \"" + filename + "\"");
         }
+        // Centre the time axis at the peak and normalise to max|E| = 1
+        // (amplitudes are applied by field_drive_amp_SU2/SU3).
+        const double t_peak = times[idx_peak];
+        for (double& tv : times) tv -= t_peak;
+        for (double& ev : values) ev /= e_max;
+        tabulated_pulse_times = std::move(times);
+        tabulated_pulse_values = std::move(values);
+        // Gaussian-equivalent width such that kPulseWindowSigmas * width
+        // covers the whole table (used for the pulse window of the drivers).
+        const double max_extent = std::max(std::abs(tabulated_pulse_times.front()),
+                                           std::abs(tabulated_pulse_times.back()));
+        tabulated_pulse_sigma = max_extent / classical_spin_pulse_chunking::kPulseWindowSigmas;
     }
 
 // ---- MixedLattice::drive_field_SU2_at_time ----
     SpinVector MixedLattice::drive_field_SU2_at_time(double t, size_t site_index) const {
-        // Public/legacy entry point: still returns an Eigen vector. Hot LLG
-        // path uses the hoisted (factor1, factor2) form via
-        // `drive_envelopes_SU2` + an in-place subtract.
         const size_t atom = site_index % N_atoms_SU2;
-        if (field_drive_amp_SU2 == 0.0) {
-            return SpinVector::Zero(spin_dim_SU2);
-        }
         double factor1, factor2;
         drive_envelopes_SU2(t, factor1, factor2);
         return factor1 * field_drive_SU2[0].segment(atom * spin_dim_SU2, spin_dim_SU2) +
@@ -415,775 +350,638 @@ inline void trilinear_kernel_dyn(const double* __restrict T,
 // ---- MixedLattice::drive_field_SU3_at_time ----
     SpinVector MixedLattice::drive_field_SU3_at_time(double t, size_t site_index) const {
         const size_t atom = site_index % N_atoms_SU3;
-        if (field_drive_amp_SU3 == 0.0) {
-            return SpinVector::Zero(spin_dim_SU3);
-        }
         double factor1, factor2;
         drive_envelopes_SU3(t, factor1, factor2);
         return factor1 * field_drive_SU3[0].segment(atom * spin_dim_SU3, spin_dim_SU3) +
                factor2 * field_drive_SU3[1].segment(atom * spin_dim_SU3, spin_dim_SU3);
     }
 
+// =============================================================
+// Equations of motion
+// =============================================================
+
+// ---- MixedLattice::drive_factors ----
+    MixedLattice::DriveFactors MixedLattice::drive_factors(double t) const {
+        DriveFactors d;
+        drive_envelopes_SU2(t, d.su2[0], d.su2[1]);
+        drive_envelopes_SU3(t, d.su3[0], d.su3[1]);
+        if (has_mixed_bilinear_drive) {
+            // Field-assisted Fe-Tm exchange: H_{E chi} follows the SU(3)
+            // (electric) envelope, H_{B chi} the SU(2) (magnetic) one; only
+            // active pulses contribute (the factors of inactive slots are 0).
+            d.env_E = d.su3[0] + d.su3[1];
+            d.env_B = d.su2[0] + d.su2[1];
+            // Polarisation-resolved gates: lab-frame B_eta(t) = sum_k dir_k,eta f_k.
+            // A B_z-gated vertex is identically zero for an H||a pump.
+            const auto& g0 = field_drive_global_SU2[0];
+            const auto& g1 = field_drive_global_SU2[1];
+            if (g0.size() >= 3 && g1.size() >= 3) {
+                d.env_Bx = g0(0) * d.su2[0] + g1(0) * d.su2[1];
+                d.env_By = g0(1) * d.su2[0] + g1(1) * d.su2[1];
+                d.env_Bz = g0(2) * d.su2[0] + g1(2) * d.su2[1];
+            }
+        }
+        return d;
+    }
+
 // ---- MixedLattice::ode_system ----
-    void MixedLattice::ode_system(const ODEState& x, ODEState& dxdt, double t) {
-        landau_lifshitz(x, dxdt, t);
+    void MixedLattice::ode_system(const ODEState& x, ODEState& dxdt, double t) const {
+        evaluate_rhs(x, dxdt, drive_factors(t));
     }
 
 // ---- MixedLattice::landau_lifshitz ----
-    void MixedLattice::landau_lifshitz(const ODEState& state, ODEState& dsdt, double t) {
-        const size_t offset_SU3 = lattice_size_SU2 * spin_dim_SU2;
+    void MixedLattice::landau_lifshitz(const ODEState& state, ODEState& dsdt, double t) const {
+        evaluate_rhs(state, dsdt, drive_factors(t));
+    }
 
-        // Hoist the time-dependent drive envelopes out of the per-site loop.
-        // Each pulse contributes a (factor1, factor2) computed from one
-        // `exp + cos` per pulse, and these are the same for every site.
-        // Without the hoist we paid 4 transcendentals (× lattice_size) per
-        // RHS call; with it we pay 4 in total per RHS call.
-        double su2_f1 = 0.0, su2_f2 = 0.0;
-        if (field_drive_amp_SU2 != 0.0) {
-            drive_envelopes_SU2(t, su2_f1, su2_f2);
+// ---- MixedLattice::evaluate_rhs ----
+    void MixedLattice::evaluate_rhs(const ODEState& state, ODEState& dsdt, const DriveFactors& d) const {
+        const size_t n_spin = spin_state_size();
+        const bool reservoir = (state.size() == n_spin + 1);
+        if (!reservoir && state.size() != n_spin) {
+            throw std::invalid_argument("MixedLattice::landau_lifshitz: state has " + std::to_string(state.size()) +
+                                        " entries, expected " + std::to_string(n_spin) + " (spins) or " +
+                                        std::to_string(n_spin + 1) + " (spins + thermal reservoir)");
         }
-        double su3_f1 = 0.0, su3_f2 = 0.0;
-        if (field_drive_amp_SU3 != 0.0) {
-            drive_envelopes_SU3(t, su3_f1, su3_f2);
+        if (dsdt.size() != state.size()) dsdt.resize(state.size());
+        const size_t offset_SU3 = lattice_size_SU2 * 3;
+
+        // Thermal reservoir: E_dep is the last state entry (0 when absent).
+        const double E_dep = reservoir ? state[n_spin] : 0.0;
+        double eq3_shift = thermal_heat * E_dep;
+        if (eq3_shift > thermal_cap) eq3_shift = thermal_cap;
+        const bool accumulate_power = reservoir && thermal_heat != 0.0;
+
+        // Per-channel Bloch relaxation rates, hoisted out of the site loop.
+        double gamma[8];
+        bool any_gamma = false;
+        for (int a = 0; a < 8; ++a) {
+            gamma[a] = damping_rates_SU3.size() == 8 ? damping_rates_SU3(a) : 0.0;
+            any_gamma = any_gamma || gamma[a] != 0.0;
         }
+        const bool linear_torque = linear_drive_torque_SU2 && (d.su2[0] != 0.0 || d.su2[1] != 0.0);
+        const double c3 = su3_bracket;
 
-        // Thermal repopulation accumulator: E_dep(t) = ∫ Σ_i (f1'·v1 + f2'·v2)·λ_i dt.
-        // Slow variable, updated per RHS stage with time-monotonic guards
-        // (fixed-step RK4: stages at t, t+h/2, t+h/2, t+h). Resets on a
-        // backward time jump (start of a new trajectory).
-        if (thermal_heat != 0.0) {
-            if (t < thermal_last_t) {           // new trajectory begins
-                thermal_Edep = 0.0;
-                thermal_last_t = -1.0e300;
-                thermal_last_P = 0.0;
-            }
-            if (t > thermal_last_t) {
-                // Heat source = the DISSIPATED energy (what the bath actually
-                // receives): P_diss = Σ_sites Σ_a Γ_a (λ_a − λ_a_eq)².
-                // Positive-definite and monotone; the M01 trajectory's
-                // coherence products carry the pump-FID × probe interference,
-                // so the τ label survives the M_NL subtraction.
-                double P = 0.0;
-                for (size_t site = 0; site < lattice_size_SU3; ++site) {
-                    const size_t idx = offset_SU3 + site * spin_dim_SU3;
-                    for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                        if (a == 2 || a == 7) continue;   // populations: their
-                        // relaxation returns energy to the bath and must not
-                        // re-heat (closes a runaway feedback loop otherwise)
-                        const double g = damping_rates_SU3(a);
-                        if (g != 0.0) {
-                            const double d = state[idx + a] - equilibrium_SU3[site](a);
-                            P += g * d * d;
-                        }
-                    }
-                }
-                const double dtt = t - thermal_last_t;
-                if (dtt < 1.0) {                // skip the fresh-trajectory jump
-                    if (thermal_cool > 0.0) {
-                        thermal_Edep *= std::exp(-thermal_cool * dtt);
-                    }
-                    thermal_Edep += 0.5 * (P + thermal_last_P) * dtt;
-                }
-                thermal_last_t = t;
-                thermal_last_P = P;
-            }
-        }
-        double thermal_eq3_shift = thermal_heat * thermal_Edep;
-        if (thermal_eq3_shift > thermal_cap) thermal_eq3_shift = thermal_cap;
-
-        // Combined pulse-envelope scalars for the field-assisted Fe-Tm
-        // exchange (H_{E chi} uses the SU(3)/electric envelope, H_{B chi}
-        // uses the SU(2)/magnetic envelope).  Zero when the matching pulse is
-        // inactive, so the assisted-exchange branch is skipped entirely.
-        const double env_E = has_mixed_bilinear_drive ? (su3_f1 + su3_f2) : 0.0;
-        const double env_B = has_mixed_bilinear_drive ? (su2_f1 + su2_f2) : 0.0;
-
-        // Polarization-resolved magnetic gates: the actual lab-frame field
-        // components B_eta(t) = dir1_eta * f1 + dir2_eta * f2, atom-independent
-        // for a uniform pump.  A B_z-gated kappaB vertex (tag 4) is then
-        // identically zero for an H||a pump (B along x) and active for H||c,
-        // so one Hamiltonian self-selects by measurement geometry.
-        double env_Bx = 0.0, env_By = 0.0, env_Bz = 0.0;
-        if (has_mixed_bilinear_drive && field_drive_amp_SU2 != 0.0 &&
-            field_drive_global_SU2[0].size() >= 3) {
-            const auto& g0 = field_drive_global_SU2[0];
-            const auto& g1 = field_drive_global_SU2[1];
-            env_Bx = g0(0) * su2_f1 + g1(0) * su2_f2;
-            env_By = g0(1) * su2_f1 + g1(1) * su2_f2;
-            env_Bz = g0(2) * su2_f1 + g1(2) * su2_f2;
-        }
-
-        const bool fast_su2 = (spin_dim_SU2 == 3);
-        const bool fast_su3 = (spin_dim_SU3 == 8);
-
-        // -------------------- Hot path: both species standard --------------------
-        // Single persistent OpenMP team per RHS call wrapping both SU(2) and
-        // SU(3) site loops (writes to disjoint dsdt slices, reads only state).
-        // Saves one team start-up and one barrier per RHS vs the previous
-        // two-region layout. `nowait` on the SU(2) loop lets faster threads
-        // start the SU(3) work while stragglers finish SU(2). See
-        // optimization_notes.tex Ingredient XVI.
-        if (fast_su2 && fast_su3) {
-            const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
+        double power = 0.0;
+        const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
+        // One OpenMP team per RHS for both species (disjoint dsdt slices,
+        // read-only state); `nowait` lets threads move on to SU(3) sites.
 #ifdef _OPENMP
-            #pragma omp parallel if(total_sites >= 64)
+        #pragma omp parallel if(total_sites >= 64) reduction(+:power)
 #endif
-            {
+        {
 #ifdef _OPENMP
-                #pragma omp for schedule(static) nowait
+            #pragma omp for schedule(static) nowait
 #endif
-                for (size_t site = 0; site < lattice_size_SU2; ++site) {
-                    const size_t idx = site * 3;
+            for (size_t site = 0; site < lattice_size_SU2; ++site) {
+                const size_t idx = site * 3;
+                double H[3];
+                get_local_field_SU2_flat_into(site, state, offset_SU3, d.su2[0], d.su2[1], H,
+                                              d.env_E, d.env_B, d.env_Bx, d.env_By, d.env_Bz);
+                const double Sx = state[idx + 0], Sy = state[idx + 1], Sz = state[idx + 2];
+                double* out = &dsdt[idx];
+                out[0] = H[1] * Sz - H[2] * Sy;
+                out[1] = H[2] * Sx - H[0] * Sz;
+                out[2] = H[0] * Sy - H[1] * Sx;
 
-                    double H[3];
-                    get_local_field_SU2_flat_into(site, state, offset_SU3,
-                                                  su2_f1, su2_f2, H, env_E, env_B,
-                                                  env_Bx, env_By, env_Bz);
-
-                    dsdt[idx + 0] = H[1] * state[idx + 2] - H[2] * state[idx + 1];
-                    dsdt[idx + 1] = H[2] * state[idx + 0] - H[0] * state[idx + 2];
-                    dsdt[idx + 2] = H[0] * state[idx + 1] - H[1] * state[idx + 0];
-
-                    // Field-mediated-conversion ablation.  H already carries
-                    // -h(t), so the torque above contains -h x S.  Adding
-                    // h x (S - S0) replaces it by -h x S0, i.e. drops the term
-                    // bilinear in (pulse field, magnon amplitude).  See
-                    // set_linear_drive_torque_SU2().
-                    if (linear_drive_torque_SU2 &&
-                        (su2_f1 != 0.0 || su2_f2 != 0.0)) {
-                        const size_t atom = site % N_atoms_SU2;
-                        const double* __restrict fd0 = field_drive_SU2[0].data() + atom * 3;
-                        const double* __restrict fd1 = field_drive_SU2[1].data() + atom * 3;
-                        const double hx = fd0[0] * su2_f1 + fd1[0] * su2_f2;
-                        const double hy = fd0[1] * su2_f1 + fd1[1] * su2_f2;
-                        const double hz = fd0[2] * su2_f1 + fd1[2] * su2_f2;
-                        const double dx = state[idx + 0] - drive_ref_SU2[idx + 0];
-                        const double dy = state[idx + 1] - drive_ref_SU2[idx + 1];
-                        const double dz = state[idx + 2] - drive_ref_SU2[idx + 2];
-                        dsdt[idx + 0] += hy * dz - hz * dy;
-                        dsdt[idx + 1] += hz * dx - hx * dz;
-                        dsdt[idx + 2] += hx * dy - hy * dx;
-                    }
-
-                    // Gilbert damping: dS/dt += (alpha/|S|) * S × (S × H)
-                    //   S × (S × H) = S(S·H) - H|S|^2  (BAC-CAB)
-                    if (alpha_gilbert != 0.0) {
-                        const double Sx = state[idx + 0], Sy = state[idx + 1], Sz = state[idx + 2];
-                        const double S2 = Sx*Sx + Sy*Sy + Sz*Sz;
-                        const double SdotH = Sx*H[0] + Sy*H[1] + Sz*H[2];
-                        const double inv_S = (S2 > 0.0) ? alpha_gilbert / std::sqrt(S2) : 0.0;
-                        dsdt[idx + 0] += inv_S * (Sx * SdotH - H[0] * S2);
-                        dsdt[idx + 1] += inv_S * (Sy * SdotH - H[1] * S2);
-                        dsdt[idx + 2] += inv_S * (Sz * SdotH - H[2] * S2);
-                    }
+                // Field-mediated-conversion ablation: H carries -h(t), so the
+                // torque contains -h x S; adding h x (S - S0) leaves -h x S0,
+                // dropping the term bilinear in (pulse field, magnon amplitude).
+                // See set_linear_drive_torque_SU2().
+                if (linear_torque) {
+                    const size_t atom = site % N_atoms_SU2;
+                    const double* __restrict fd0 = field_drive_SU2[0].data() + atom * 3;
+                    const double* __restrict fd1 = field_drive_SU2[1].data() + atom * 3;
+                    const double hx = fd0[0] * d.su2[0] + fd1[0] * d.su2[1];
+                    const double hy = fd0[1] * d.su2[0] + fd1[1] * d.su2[1];
+                    const double hz = fd0[2] * d.su2[0] + fd1[2] * d.su2[1];
+                    const double dx = Sx - drive_ref_SU2[idx + 0];
+                    const double dy = Sy - drive_ref_SU2[idx + 1];
+                    const double dz = Sz - drive_ref_SU2[idx + 2];
+                    out[0] += hy * dz - hz * dy;
+                    out[1] += hz * dx - hx * dz;
+                    out[2] += hx * dy - hy * dx;
                 }
 
-#ifdef _OPENMP
-                #pragma omp for schedule(static)
-#endif
-                for (size_t site = 0; site < lattice_size_SU3; ++site) {
-                    const size_t idx = offset_SU3 + site * 8;
-
-                    double H[8];
-                    get_local_field_SU3_flat_into(site, state, offset_SU3,
-                                                  su3_f1, su3_f2, H, env_E, env_B,
-                                                  env_Bx, env_By, env_Bz);
-
-                    // SU(3) dynamics use sparse Gell-Mann f-symbols (only 9
-                    // non-zero (a<b<c) triples instead of 8^3 = 512 entries).
-                    cross_prod_SU3_flat(H, &state[idx], &dsdt[idx], /*accumulate=*/false);
-
-                    // Bloch damping: −Γ_i (n^i − n^i_eq).  λ3 (i==2) chases the
-                    // thermally shifted equilibrium (τ-labeled heating).
-                    for (size_t i = 0; i < 8; ++i) {
-                        if (damping_rates_SU3(i) != 0.0) {
-                            double eq = equilibrium_SU3[site](i);
-                            if (i == 2) eq -= thermal_eq3_shift;
-                            dsdt[idx + i] -= damping_rates_SU3(i) *
-                                (state[idx + i] - eq);
-                        }
-                    }
-                }
-            } // end omp parallel
-        } else {
-            // -------------------- Generic / fallback paths --------------------
-            // Used only for non-standard SU(N) dimensions; not in the hot path.
-            if (fast_su2) {
-#ifdef _OPENMP
-                #pragma omp parallel for schedule(static) if(lattice_size_SU2 >= 64)
-#endif
-                for (size_t site = 0; site < lattice_size_SU2; ++site) {
-                    const size_t idx = site * 3;
-                    double H[3];
-                    get_local_field_SU2_flat_into(site, state, offset_SU3,
-                                                  su2_f1, su2_f2, H, env_E, env_B,
-                                                  env_Bx, env_By, env_Bz);
-                    dsdt[idx + 0] = H[1] * state[idx + 2] - H[2] * state[idx + 1];
-                    dsdt[idx + 1] = H[2] * state[idx + 0] - H[0] * state[idx + 2];
-                    dsdt[idx + 2] = H[0] * state[idx + 1] - H[1] * state[idx + 0];
-
-                    // Field-mediated-conversion ablation.  H already carries
-                    // -h(t), so the torque above contains -h x S.  Adding
-                    // h x (S - S0) replaces it by -h x S0, i.e. drops the term
-                    // bilinear in (pulse field, magnon amplitude).  See
-                    // set_linear_drive_torque_SU2().
-                    if (linear_drive_torque_SU2 &&
-                        (su2_f1 != 0.0 || su2_f2 != 0.0)) {
-                        const size_t atom = site % N_atoms_SU2;
-                        const double* __restrict fd0 = field_drive_SU2[0].data() + atom * 3;
-                        const double* __restrict fd1 = field_drive_SU2[1].data() + atom * 3;
-                        const double hx = fd0[0] * su2_f1 + fd1[0] * su2_f2;
-                        const double hy = fd0[1] * su2_f1 + fd1[1] * su2_f2;
-                        const double hz = fd0[2] * su2_f1 + fd1[2] * su2_f2;
-                        const double dx = state[idx + 0] - drive_ref_SU2[idx + 0];
-                        const double dy = state[idx + 1] - drive_ref_SU2[idx + 1];
-                        const double dz = state[idx + 2] - drive_ref_SU2[idx + 2];
-                        dsdt[idx + 0] += hy * dz - hz * dy;
-                        dsdt[idx + 1] += hz * dx - hx * dz;
-                        dsdt[idx + 2] += hx * dy - hy * dx;
-                    }
-                    if (alpha_gilbert != 0.0) {
-                        const double Sx = state[idx + 0], Sy = state[idx + 1], Sz = state[idx + 2];
-                        const double S2 = Sx*Sx + Sy*Sy + Sz*Sz;
-                        const double SdotH = Sx*H[0] + Sy*H[1] + Sz*H[2];
-                        const double inv_S = (S2 > 0.0) ? alpha_gilbert / std::sqrt(S2) : 0.0;
-                        dsdt[idx + 0] += inv_S * (Sx * SdotH - H[0] * S2);
-                        dsdt[idx + 1] += inv_S * (Sy * SdotH - H[1] * S2);
-                        dsdt[idx + 2] += inv_S * (Sz * SdotH - H[2] * S2);
-                    }
-                }
-            } else {
-                for (size_t site = 0; site < lattice_size_SU2; ++site) {
-                    const size_t idx = site * spin_dim_SU2;
-                    for (size_t j = 0; j < spin_dim_SU2; ++j) dsdt[idx + j] = 0.0;
+                // Gilbert damping (LL form): dS/dt += (alpha/|S|) S x (S x H),
+                // S x (S x H) = S (S.H) - H |S|^2.
+                if (alpha_gilbert != 0.0) {
+                    const double S2 = Sx * Sx + Sy * Sy + Sz * Sz;
+                    const double SdotH = Sx * H[0] + Sy * H[1] + Sz * H[2];
+                    const double a_S = (S2 > 0.0) ? alpha_gilbert / std::sqrt(S2) : 0.0;
+                    out[0] += a_S * (Sx * SdotH - H[0] * S2);
+                    out[1] += a_S * (Sy * SdotH - H[1] * S2);
+                    out[2] += a_S * (Sz * SdotH - H[2] * S2);
                 }
             }
 
-            if (fast_su3) {
 #ifdef _OPENMP
-                #pragma omp parallel for schedule(static) if(lattice_size_SU3 >= 64)
+            #pragma omp for schedule(static)
 #endif
-                for (size_t site = 0; site < lattice_size_SU3; ++site) {
-                    const size_t idx = offset_SU3 + site * 8;
-                    double H[8];
-                    get_local_field_SU3_flat_into(site, state, offset_SU3,
-                                                  su3_f1, su3_f2, H, env_E, env_B,
-                                                  env_Bx, env_By, env_Bz);
-                    cross_prod_SU3_flat(H, &state[idx], &dsdt[idx], /*accumulate=*/false);
-                    for (size_t i = 0; i < 8; ++i) {
-                        if (damping_rates_SU3(i) != 0.0) {
-                            double eq = equilibrium_SU3[site](i);
-                            if (i == 2) eq -= thermal_eq3_shift;
-                            dsdt[idx + i] -= damping_rates_SU3(i) *
-                                (state[idx + i] - eq);
+            for (size_t site = 0; site < lattice_size_SU3; ++site) {
+                const size_t idx = offset_SU3 + site * 8;
+                double H[8];
+                get_local_field_SU3_flat_into(site, state, offset_SU3, d.su3[0], d.su3[1], H,
+                                              d.env_E, d.env_B, d.env_Bx, d.env_By, d.env_Bz);
+                su3_torque(H, &state[idx], c3, &dsdt[idx]);
+
+                // Bloch relaxation -Gamma_a (n^a - n^a_eq); the lambda3 target
+                // follows the thermal reservoir. The dissipation proxy P omits
+                // the population channels lambda3, lambda8 (see the header).
+                if (any_gamma) {
+                    const SpinVector& eq = equilibrium_SU3[site];
+                    for (int a = 0; a < 8; ++a) {
+                        if (gamma[a] == 0.0) continue;
+                        const double target = (a == 2) ? eq(a) - eq3_shift : eq(a);
+                        dsdt[idx + a] -= gamma[a] * (state[idx + a] - target);
+                        if (accumulate_power && a != 2 && a != 7) {
+                            const double dev = state[idx + a] - eq(a);
+                            power += gamma[a] * dev * dev;
                         }
-                    }
-                }
-            } else {
-                const auto& f = get_SU3_structure();
-                for (size_t site = 0; site < lattice_size_SU3; ++site) {
-                    const size_t idx = offset_SU3 + site * spin_dim_SU3;
-                    SpinVector H = get_local_field_SU3_flat(site, state, offset_SU3, t);
-                    for (size_t i = 0; i < spin_dim_SU3; ++i) {
-                        double dSdt_i = 0.0;
-                        for (size_t j = 0; j < spin_dim_SU3; ++j) {
-                            for (size_t k = 0; k < spin_dim_SU3; ++k) {
-                                dSdt_i += f[i](j, k) * H(j) * state[idx + k];
-                            }
-                        }
-                        if (damping_rates_SU3(i) != 0.0) {
-                            double eq = equilibrium_SU3[site](i);
-                            if (i == 2) eq -= thermal_eq3_shift;
-                            dSdt_i -= damping_rates_SU3(i) * (state[idx + i] - eq);
-                        }
-                        dsdt[idx + i] = dSdt_i;
                     }
                 }
             }
-        }
+        }  // end omp parallel
+
+        if (reservoir) dsdt[n_spin] = power - thermal_cool * E_dep;
     }
 
 // ---- MixedLattice::get_local_field_SU2_flat_into ----
-    // Heap-free, drive-hoisted variant of `get_local_field_SU2_flat`. Writes
-    // the full local field directly into the caller-supplied
-    // `H[0..spin_dim_SU2-1]`, accepting pre-computed envelope factors so the
-    // two `exp + cos` math calls per pulse are not repeated per site.
-    //
-    // Hot path (spin_dim_SU2==3, spin_dim_SU3==8) uses flat row-major
-    // packed buffers + compile-time-sized inline kernels (no MatrixXd
-    // pointer chase, unit-stride inner loop, vectorizable). Generic
-    // SU(N) shapes fall through to runtime-dim kernels.
+    // Full local field dE/dS at an SU(2) site (gradient convention), written
+    // into H[0..2]: field, on-site, SU(2)-SU(2), SU(2)-SU(3) and field-assisted
+    // bilinears, both trilinears, and the pulse drive with pre-computed factors.
     void MixedLattice::get_local_field_SU2_flat_into(
         size_t site, const ODEState& state, size_t offset_SU3,
         double drive_factor1, double drive_factor2,
         double* __restrict H, double env_E, double env_B,
         double env_Bx, double env_By, double env_Bz) const {
-        const size_t d2 = spin_dim_SU2;
-        const size_t d3 = spin_dim_SU3;
-        // Envelope lookup indexed by the per-bond `envelope` tag:
-        //   0=E(scalar) 1=B(scalar) 2=B_x 3=B_y 4=B_z (lab-frame components).
+        // Envelope by field-assisted bond tag: 0=E 1=B 2=B_x 3=B_y 4=B_z.
         const double env_lut[5] = { env_E, env_B, env_Bx, env_By, env_Bz };
-        const size_t idx = site * d2;
+        const size_t idx = site * 3;
         const double* __restrict field0 = field_SU2[site].data();
-        for (size_t a = 0; a < d2; ++a) H[a] = -field0[a];
+        for (size_t a = 0; a < 3; ++a) H[a] = -field0[a];
 
-        // Onsite: 2*A*S. A is a small SpinMatrix (3x3 in the hot case);
-        // accumulate a *= 2 hoist by doubling at the end.
+        // On-site: 2 A S.
         const auto& A = onsite_interaction_SU2[site];
-        for (size_t a = 0; a < d2; ++a) {
+        for (size_t a = 0; a < 3; ++a) {
             double acc = 0.0;
-            for (size_t b = 0; b < d2; ++b) {
-                acc += A(a, b) * state[idx + b];
-            }
+            for (size_t b = 0; b < 3; ++b) acc += A(a, b) * state[idx + b];
             H[a] += 2.0 * acc;
         }
 
-        const bool fast = (d2 == 3 && d3 == 8);
-
-        // ---- Bilinear SU(2)-SU(2): packed J(a,b), row-major ----
-        const auto& bp_SU2 = bilinear_partners_SU2[site];
-        const size_t n_bi = bp_SU2.size();
-        if (n_bi != 0) {
-            const double* __restrict Jbase = bilinear_packed_SU2[site].data();
-            if (fast) {
-                for (size_t n = 0; n < n_bi; ++n) {
-                    const double* __restrict S = &state[bp_SU2[n] * 3];
-                    bilinear_kernel<3, 3>(Jbase + n * 9, S, H);
-                }
-            } else {
-                const size_t stride = d2 * d2;
-                for (size_t n = 0; n < n_bi; ++n) {
-                    const double* __restrict S = &state[bp_SU2[n] * d2];
-                    bilinear_kernel_dyn(Jbase + n * stride, S, H, d2, d2);
-                }
-            }
+        const auto& bp = bilinear_partners_SU2[site];
+        if (!bp.empty()) {
+            const double* __restrict J = bilinear_packed_SU2[site].data();
+            for (size_t n = 0; n < bp.size(); ++n)
+                bilinear_kernel<3, 3>(J + n * 9, &state[bp[n] * 3], H);
         }
 
-        // ---- Mixed bilinear SU(2)-SU(3): packed J(a,c) ----
         const auto& mbp = mixed_bilinear_partners_SU2[site];
-        const size_t n_mb = mbp.size();
-        if (n_mb != 0) {
-            const double* __restrict Jbase = mixed_bilinear_packed_SU2[site].data();
-            if (fast) {
-                for (size_t n = 0; n < n_mb; ++n) {
-                    const double* __restrict S = &state[offset_SU3 + mbp[n] * 8];
-                    bilinear_kernel<3, 8>(Jbase + n * 24, S, H);
-                }
-            } else {
-                const size_t stride = d2 * d3;
-                for (size_t n = 0; n < n_mb; ++n) {
-                    const double* __restrict S = &state[offset_SU3 + mbp[n] * d3];
-                    bilinear_kernel_dyn(Jbase + n * stride, S, H, d2, d3);
-                }
-            }
+        if (!mbp.empty()) {
+            const double* __restrict J = mixed_bilinear_packed_SU2[site].data();
+            for (size_t n = 0; n < mbp.size(); ++n)
+                bilinear_kernel<3, 8>(J + n * 24, &state[offset_SU3 + mbp[n] * 8], H);
         }
 
-        // ---- Field-assisted (pulse-modulated) mixed bilinear SU(2)-SU(3) ----
-        // H_{E chi} / H_{B chi}: contribution to dH/dS_Fe, scaled per bond by
-        // the matching pulse envelope (env_E for SU(3)/electric, env_B for
-        // SU(2)/magnetic).  See MixedBilinearDrive / tmfeo3_foundation.tex.
+        // Field-assisted (pulse-gated) Fe-Tm exchange H_{E chi} / H_{B chi}.
         const auto& mbpd = mixed_bilinear_drive_partners_SU2[site];
-        const size_t n_mbd = mbpd.size();
-        if (n_mbd != 0 && (env_E != 0.0 || env_B != 0.0)) {
-            const double* __restrict Jbase = mixed_bilinear_drive_packed_SU2[site].data();
-            const auto& env_tag = mixed_bilinear_drive_envelope_SU2[site];
-            const size_t stride = d2 * d3;
-            for (size_t n = 0; n < n_mbd; ++n) {
-                const int tag = env_tag[n];
+        if (!mbpd.empty() && (env_E != 0.0 || env_B != 0.0 || env_Bx != 0.0 ||
+                              env_By != 0.0 || env_Bz != 0.0)) {
+            const double* __restrict J = mixed_bilinear_drive_packed_SU2[site].data();
+            const auto& tags = mixed_bilinear_drive_envelope_SU2[site];
+            for (size_t n = 0; n < mbpd.size(); ++n) {
+                const int tag = tags[n];
                 const double env = env_lut[(tag >= 0 && tag < 5) ? tag : 1];
                 if (env == 0.0) continue;
-                const double* __restrict J = Jbase + n * stride;
-                const double* __restrict S = &state[offset_SU3 + mbpd[n] * d3];
-                for (size_t a = 0; a < d2; ++a) {
-                    double acc = 0.0;
-                    for (size_t c = 0; c < d3; ++c) {
-                        acc += J[a * d3 + c] * S[c];
-                    }
-                    H[a] += env * acc;
-                }
+                scaled_bilinear_kernel<3, 8>(J + n * 24, &state[offset_SU3 + mbpd[n] * 8], env, H);
             }
         }
 
-        // ---- Trilinear SU(2)-SU(2)-SU(2): packed T(a,b,c) ----
-        const auto& tp_SU2 = trilinear_partners_SU2[site];
-        const size_t n_tri = tp_SU2.size();
-        if (n_tri != 0) {
-            const double* __restrict Tbase = trilinear_packed_SU2[site].data();
-            if (fast) {
-                for (size_t n = 0; n < n_tri; ++n) {
-                    const double* __restrict S1 = &state[tp_SU2[n][0] * 3];
-                    const double* __restrict S2 = &state[tp_SU2[n][1] * 3];
-                    trilinear_kernel<3, 3, 3>(Tbase + n * 27, S1, S2, H);
-                }
-            } else {
-                const size_t stride = d2 * d2 * d2;
-                for (size_t n = 0; n < n_tri; ++n) {
-                    const double* __restrict S1 = &state[tp_SU2[n][0] * d2];
-                    const double* __restrict S2 = &state[tp_SU2[n][1] * d2];
-                    trilinear_kernel_dyn(Tbase + n * stride, S1, S2, H, d2, d2, d2);
-                }
-            }
+        const auto& tp = trilinear_partners_SU2[site];
+        if (!tp.empty()) {
+            const double* __restrict T = trilinear_packed_SU2[site].data();
+            for (size_t n = 0; n < tp.size(); ++n)
+                trilinear_kernel<3, 3, 3>(T + n * 27, &state[tp[n][0] * 3], &state[tp[n][1] * 3], H);
         }
 
-        // ---- Mixed trilinear SU(2)-SU(2)-SU(3): packed T(a,b,c) ----
+        // SU(2)-SU(2)-SU(3): the same tensor as the energy and the MC field
+        // (no hidden reference subtraction; see set_mixed_trilinear_reference_SU3).
         const auto& mtp = mixed_trilinear_partners_SU2[site];
-        const size_t n_mtri = mtp.size();
-        if (n_mtri != 0) {
-            const double* __restrict Tbase = mixed_trilinear_packed_SU2[site].data();
-            // The SU(3) leg couples to the DEVIATION (λ − λ_eq): the static
-            // equilibrium contribution (large only for the population
-            // channels λ3, λ8) is already absorbed in the measured Fe
-            // parameters, so it must not renormalize the magnon spectrum.
-            // equilibrium_SU3 is zero unless Bloch damping set it.
-            const bool has_eq = !equilibrium_SU3.empty();
-            if (fast) {
-                for (size_t n = 0; n < n_mtri; ++n) {
-                    const double* __restrict S1 = &state[mtp[n][0] * 3];
-                    const double* __restrict S2 = &state[offset_SU3 + mtp[n][1] * 8];
-                    double S2s[8];
-                    if (has_eq) {
-                        const auto& eq = equilibrium_SU3[mtp[n][1]];
-                        for (int a = 0; a < 8; ++a) S2s[a] = S2[a] - eq(a);
-                    } else {
-                        for (int a = 0; a < 8; ++a) S2s[a] = S2[a];
-                    }
-                    trilinear_kernel<3, 3, 8>(Tbase + n * 72, S1, S2s, H);
-                }
-            } else {
-                const size_t stride = d2 * d2 * d3;
-                for (size_t n = 0; n < n_mtri; ++n) {
-                    const double* __restrict S1 = &state[mtp[n][0] * d2];
-                    const double* __restrict S2 = &state[offset_SU3 + mtp[n][1] * d3];
-                    std::vector<double> S2s(d3);
-                    if (has_eq) {
-                        const auto& eq = equilibrium_SU3[mtp[n][1]];
-                        for (size_t a = 0; a < d3; ++a) S2s[a] = S2[a] - eq(a);
-                    } else {
-                        for (size_t a = 0; a < d3; ++a) S2s[a] = S2[a];
-                    }
-                    trilinear_kernel_dyn(Tbase + n * stride, S1, S2s.data(), H, d2, d2, d3);
-                }
-            }
+        if (!mtp.empty()) {
+            const double* __restrict T = mixed_trilinear_packed_SU2[site].data();
+            for (size_t n = 0; n < mtp.size(); ++n)
+                trilinear_kernel<3, 3, 8>(T + n * 72, &state[mtp[n][0] * 3],
+                                          &state[offset_SU3 + mtp[n][1] * 8], H);
         }
 
-        // Drive (precomputed envelopes). Skip entirely when amp == 0 by the
-        // caller checking before invoking; here we just trust the factors.
         if (drive_factor1 != 0.0 || drive_factor2 != 0.0) {
             const size_t atom = site % N_atoms_SU2;
-            const double* fd0 = field_drive_SU2[0].data() + atom * d2;
-            const double* fd1 = field_drive_SU2[1].data() + atom * d2;
-            for (size_t a = 0; a < d2; ++a) {
-                H[a] -= fd0[a] * drive_factor1 + fd1[a] * drive_factor2;
-            }
+            const double* fd0 = field_drive_SU2[0].data() + atom * 3;
+            const double* fd1 = field_drive_SU2[1].data() + atom * 3;
+            for (size_t a = 0; a < 3; ++a) H[a] -= fd0[a] * drive_factor1 + fd1[a] * drive_factor2;
         }
-    }
-
-// ---- MixedLattice::get_local_field_SU2_flat ----
-    SpinVector MixedLattice::get_local_field_SU2_flat(size_t site, const ODEState& state, 
-                                         size_t offset_SU3, double t) const {
-        const size_t idx = site * spin_dim_SU2;
-        SpinVector H = -field_SU2[site];
-        
-        // Onsite: 2*A*S
-        for (size_t a = 0; a < spin_dim_SU2; ++a) {
-            for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                H(a) += 2.0 * onsite_interaction_SU2[site](a, b) * state[idx + b];
-            }
-        }
-        
-        // Bilinear SU(2)-SU(2): J*S_partner
-        for (size_t n = 0; n < bilinear_partners_SU2[site].size(); ++n) {
-            const size_t partner = bilinear_partners_SU2[site][n];
-            const size_t partner_idx = partner * spin_dim_SU2;
-            const auto& J = bilinear_interaction_SU2[site][n];
-            for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    H(a) += J(a, b) * state[partner_idx + b];
-                }
-            }
-        }
-        
-        // Mixed bilinear SU(2)-SU(3)
-        for (size_t n = 0; n < mixed_bilinear_partners_SU2[site].size(); ++n) {
-            const size_t partner = mixed_bilinear_partners_SU2[site][n];
-            const size_t partner_idx = offset_SU3 + partner * spin_dim_SU3;
-            const auto& J = mixed_bilinear_interaction_SU2[site][n];
-            for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                    H(a) += J(a, c) * state[partner_idx + c];
-                }
-            }
-        }
-        
-        // Trilinear SU(2)-SU(2)-SU(2): T[a](b,c) * S1[b] * S2[c]
-        for (size_t n = 0; n < trilinear_partners_SU2[site].size(); ++n) {
-            const size_t p1 = trilinear_partners_SU2[site][n][0];
-            const size_t p2 = trilinear_partners_SU2[site][n][1];
-            const size_t p1_idx = p1 * spin_dim_SU2;
-            const size_t p2_idx = p2 * spin_dim_SU2;
-            const auto& T = trilinear_interaction_SU2[site][n];
-            
-            for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                        temp += T[a](b, c) * state[p1_idx + b] * state[p2_idx + c];
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        // Mixed trilinear SU(2)-SU(2)-SU(3): T[a](b,c) * S_SU2[b] * S_SU3[c]
-        for (size_t n = 0; n < mixed_trilinear_partners_SU2[site].size(); ++n) {
-            const size_t p1 = mixed_trilinear_partners_SU2[site][n][0];
-            const size_t p2 = mixed_trilinear_partners_SU2[site][n][1];
-            const size_t p1_idx = p1 * spin_dim_SU2;
-            const size_t p2_idx = offset_SU3 + p2 * spin_dim_SU3;
-            const auto& T = mixed_trilinear_interaction_SU2[site][n];
-            
-            for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                        const double lam = state[p2_idx + c] -
-                            (equilibrium_SU3.empty() ? 0.0 : equilibrium_SU3[p2](c));
-                        temp += T[a](b, c) * state[p1_idx + b] * lam;
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        // Add time-dependent drive
-        H -= drive_field_SU2_at_time(t, site);
-        
-        return H;
     }
 
 // ---- MixedLattice::get_local_field_SU3_flat_into ----
-    // Heap-free, drive-hoisted variant of `get_local_field_SU3_flat`. See the
-    // docstring on `get_local_field_SU2_flat_into` for the rationale.
+    // Full local field dE/dn at an SU(3) site, written into H[0..7].
     void MixedLattice::get_local_field_SU3_flat_into(
         size_t site, const ODEState& state, size_t offset_SU3,
         double drive_factor1, double drive_factor2,
         double* __restrict H, double env_E, double env_B,
         double env_Bx, double env_By, double env_Bz) const {
-        const size_t d2 = spin_dim_SU2;
-        const size_t d3 = spin_dim_SU3;
-        // Envelope lookup indexed by the per-bond `envelope` tag (see SU2 twin).
         const double env_lut[5] = { env_E, env_B, env_Bx, env_By, env_Bz };
-        const size_t idx = offset_SU3 + site * d3;
+        const size_t idx = offset_SU3 + site * 8;
         const double* __restrict field0 = field_SU3[site].data();
-        for (size_t a = 0; a < d3; ++a) H[a] = -field0[a];
+        for (size_t a = 0; a < 8; ++a) H[a] = -field0[a];
 
-        // Onsite: 2*A*S
         const auto& A = onsite_interaction_SU3[site];
-        for (size_t a = 0; a < d3; ++a) {
+        for (size_t a = 0; a < 8; ++a) {
             double acc = 0.0;
-            for (size_t b = 0; b < d3; ++b) {
-                acc += A(a, b) * state[idx + b];
-            }
+            for (size_t b = 0; b < 8; ++b) acc += A(a, b) * state[idx + b];
             H[a] += 2.0 * acc;
         }
 
-        const bool fast = (d2 == 3 && d3 == 8);
-
-        // ---- Bilinear SU(3)-SU(3): packed J(a,b) ----
-        const auto& bp_SU3 = bilinear_partners_SU3[site];
-        const size_t n_bi = bp_SU3.size();
-        if (n_bi != 0) {
-            const double* __restrict Jbase = bilinear_packed_SU3[site].data();
-            if (fast) {
-                for (size_t n = 0; n < n_bi; ++n) {
-                    const double* __restrict S = &state[offset_SU3 + bp_SU3[n] * 8];
-                    bilinear_kernel<8, 8>(Jbase + n * 64, S, H);
-                }
-            } else {
-                const size_t stride = d3 * d3;
-                for (size_t n = 0; n < n_bi; ++n) {
-                    const double* __restrict S = &state[offset_SU3 + bp_SU3[n] * d3];
-                    bilinear_kernel_dyn(Jbase + n * stride, S, H, d3, d3);
-                }
-            }
+        const auto& bp = bilinear_partners_SU3[site];
+        if (!bp.empty()) {
+            const double* __restrict J = bilinear_packed_SU3[site].data();
+            for (size_t n = 0; n < bp.size(); ++n)
+                bilinear_kernel<8, 8>(J + n * 64, &state[offset_SU3 + bp[n] * 8], H);
         }
 
-        // ---- Mixed bilinear SU(3)-SU(2): packed J(a,b) ----
         const auto& mbp = mixed_bilinear_partners_SU3[site];
-        const size_t n_mb = mbp.size();
-        if (n_mb != 0) {
-            const double* __restrict Jbase = mixed_bilinear_packed_SU3[site].data();
-            if (fast) {
-                for (size_t n = 0; n < n_mb; ++n) {
-                    const double* __restrict S = &state[mbp[n] * 3];
-                    bilinear_kernel<8, 3>(Jbase + n * 24, S, H);
-                }
-            } else {
-                const size_t stride = d3 * d2;
-                for (size_t n = 0; n < n_mb; ++n) {
-                    const double* __restrict S = &state[mbp[n] * d2];
-                    bilinear_kernel_dyn(Jbase + n * stride, S, H, d3, d2);
-                }
-            }
+        if (!mbp.empty()) {
+            const double* __restrict J = mixed_bilinear_packed_SU3[site].data();
+            for (size_t n = 0; n < mbp.size(); ++n)
+                bilinear_kernel<8, 3>(J + n * 24, &state[mbp[n] * 3], H);
         }
 
-        // ---- Field-assisted (pulse-modulated) mixed bilinear SU(3)-SU(2) ----
-        // H_{E chi} / H_{B chi}: contribution to dH/d(lambda_Tm), scaled per
-        // bond by the matching pulse envelope (env_E electric, env_B magnetic).
         const auto& mbpd = mixed_bilinear_drive_partners_SU3[site];
-        const size_t n_mbd = mbpd.size();
-        if (n_mbd != 0 && (env_E != 0.0 || env_B != 0.0)) {
-            const double* __restrict Jbase = mixed_bilinear_drive_packed_SU3[site].data();
-            const auto& env_tag = mixed_bilinear_drive_envelope_SU3[site];
-            const size_t stride = d3 * d2;
-            for (size_t n = 0; n < n_mbd; ++n) {
-                const int tag = env_tag[n];
+        if (!mbpd.empty() && (env_E != 0.0 || env_B != 0.0 || env_Bx != 0.0 ||
+                              env_By != 0.0 || env_Bz != 0.0)) {
+            const double* __restrict J = mixed_bilinear_drive_packed_SU3[site].data();
+            const auto& tags = mixed_bilinear_drive_envelope_SU3[site];
+            for (size_t n = 0; n < mbpd.size(); ++n) {
+                const int tag = tags[n];
                 const double env = env_lut[(tag >= 0 && tag < 5) ? tag : 1];
                 if (env == 0.0) continue;
-                const double* __restrict J = Jbase + n * stride;
-                const double* __restrict S = &state[mbpd[n] * d2];
-                for (size_t a = 0; a < d3; ++a) {
-                    double acc = 0.0;
-                    for (size_t b = 0; b < d2; ++b) {
-                        acc += J[a * d2 + b] * S[b];
-                    }
-                    H[a] += env * acc;
-                }
+                scaled_bilinear_kernel<8, 3>(J + n * 24, &state[mbpd[n] * 3], env, H);
             }
         }
 
-        // ---- Trilinear SU(3)-SU(3)-SU(3): packed T(a,b,c) ----
-        const auto& tp_SU3 = trilinear_partners_SU3[site];
-        const size_t n_tri = tp_SU3.size();
-        if (n_tri != 0) {
-            const double* __restrict Tbase = trilinear_packed_SU3[site].data();
-            if (fast) {
-                for (size_t n = 0; n < n_tri; ++n) {
-                    const double* __restrict S1 = &state[offset_SU3 + tp_SU3[n][0] * 8];
-                    const double* __restrict S2 = &state[offset_SU3 + tp_SU3[n][1] * 8];
-                    trilinear_kernel<8, 8, 8>(Tbase + n * 512, S1, S2, H);
-                }
-            } else {
-                const size_t stride = d3 * d3 * d3;
-                for (size_t n = 0; n < n_tri; ++n) {
-                    const double* __restrict S1 = &state[offset_SU3 + tp_SU3[n][0] * d3];
-                    const double* __restrict S2 = &state[offset_SU3 + tp_SU3[n][1] * d3];
-                    trilinear_kernel_dyn(Tbase + n * stride, S1, S2, H, d3, d3, d3);
-                }
-            }
+        const auto& tp = trilinear_partners_SU3[site];
+        if (!tp.empty()) {
+            const double* __restrict T = trilinear_packed_SU3[site].data();
+            for (size_t n = 0; n < tp.size(); ++n)
+                trilinear_kernel<8, 8, 8>(T + n * 512, &state[offset_SU3 + tp[n][0] * 8],
+                                          &state[offset_SU3 + tp[n][1] * 8], H);
         }
 
-        // ---- Mixed trilinear SU(3)-SU(2)-SU(2): packed T(a,b,c) ----
         const auto& mtp = mixed_trilinear_partners_SU3[site];
-        const size_t n_mtri = mtp.size();
-        if (n_mtri != 0) {
-            const double* __restrict Tbase = mixed_trilinear_packed_SU3[site].data();
-            if (fast) {
-                for (size_t n = 0; n < n_mtri; ++n) {
-                    const double* __restrict S1 = &state[mtp[n][0] * 3];
-                    const double* __restrict S2 = &state[mtp[n][1] * 3];
-                    trilinear_kernel<8, 3, 3>(Tbase + n * 72, S1, S2, H);
-                }
-            } else {
-                const size_t stride = d3 * d2 * d2;
-                for (size_t n = 0; n < n_mtri; ++n) {
-                    const double* __restrict S1 = &state[mtp[n][0] * d2];
-                    const double* __restrict S2 = &state[mtp[n][1] * d2];
-                    trilinear_kernel_dyn(Tbase + n * stride, S1, S2, H, d3, d2, d2);
-                }
-            }
+        if (!mtp.empty()) {
+            const double* __restrict T = mixed_trilinear_packed_SU3[site].data();
+            for (size_t n = 0; n < mtp.size(); ++n)
+                trilinear_kernel<8, 3, 3>(T + n * 72, &state[mtp[n][0] * 3], &state[mtp[n][1] * 3], H);
         }
 
         if (drive_factor1 != 0.0 || drive_factor2 != 0.0) {
             const size_t atom = site % N_atoms_SU3;
-            const double* fd0 = field_drive_SU3[0].data() + atom * d3;
-            const double* fd1 = field_drive_SU3[1].data() + atom * d3;
-            for (size_t a = 0; a < d3; ++a) {
-                H[a] -= fd0[a] * drive_factor1 + fd1[a] * drive_factor2;
-            }
+            const double* fd0 = field_drive_SU3[0].data() + atom * 8;
+            const double* fd1 = field_drive_SU3[1].data() + atom * 8;
+            for (size_t a = 0; a < 8; ++a) H[a] -= fd0[a] * drive_factor1 + fd1[a] * drive_factor2;
         }
     }
 
-// ---- MixedLattice::get_local_field_SU3_flat ----
-    SpinVector MixedLattice::get_local_field_SU3_flat(size_t site, const ODEState& state, 
-                                         size_t offset_SU3, double t) const {
-        const size_t idx = offset_SU3 + site * spin_dim_SU3;
-        SpinVector H = -field_SU3[site];
-        
-        // Onsite: 2*A*S
-        for (size_t a = 0; a < spin_dim_SU3; ++a) {
-            for (size_t b = 0; b < spin_dim_SU3; ++b) {
-                H(a) += 2.0 * onsite_interaction_SU3[site](a, b) * state[idx + b];
-            }
+// ---- MixedLattice::relative_stationarity_residual ----
+    double MixedLattice::relative_stationarity_residual(const ODEState& state) const {
+        if (state.size() < spin_state_size()) {
+            throw std::invalid_argument("relative_stationarity_residual: state too short");
         }
-        
-        // Bilinear SU(3)-SU(3): J*S_partner
-        for (size_t n = 0; n < bilinear_partners_SU3[site].size(); ++n) {
-            const size_t partner = bilinear_partners_SU3[site][n];
-            const size_t partner_idx = offset_SU3 + partner * spin_dim_SU3;
-            const auto& J = bilinear_interaction_SU3[site][n];
-            for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                for (size_t b = 0; b < spin_dim_SU3; ++b) {
-                    H(a) += J(a, b) * state[partner_idx + b];
-                }
-            }
+        const size_t offset_SU3 = lattice_size_SU2 * 3;
+        double worst = 0.0;
+        for (size_t site = 0; site < lattice_size_SU2; ++site) {
+            double H[3], dS[3];
+            get_local_field_SU2_flat_into(site, state, offset_SU3, 0.0, 0.0, H);
+            const double* S = &state[site * 3];
+            dS[0] = H[1] * S[2] - H[2] * S[1];
+            dS[1] = H[2] * S[0] - H[0] * S[2];
+            dS[2] = H[0] * S[1] - H[1] * S[0];
+            const double scale = std::sqrt((H[0] * H[0] + H[1] * H[1] + H[2] * H[2]) *
+                                           (S[0] * S[0] + S[1] * S[1] + S[2] * S[2]));
+            const double rate = std::sqrt(dS[0] * dS[0] + dS[1] * dS[1] + dS[2] * dS[2]);
+            if (scale > 0.0) worst = std::max(worst, rate / scale);
         }
-        
-        // Mixed bilinear SU(3)-SU(2)
-        for (size_t n = 0; n < mixed_bilinear_partners_SU3[site].size(); ++n) {
-            const size_t partner = mixed_bilinear_partners_SU3[site][n];
-            const size_t partner_idx = partner * spin_dim_SU2;
-            const auto& J = mixed_bilinear_interaction_SU3[site][n];
-            for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    H(a) += J(a, b) * state[partner_idx + b];
-                }
-            }
+        for (size_t site = 0; site < lattice_size_SU3; ++site) {
+            double H[8], dn[8];
+            get_local_field_SU3_flat_into(site, state, offset_SU3, 0.0, 0.0, H);
+            const double* n = &state[offset_SU3 + site * 8];
+            su3_torque(H, n, su3_bracket, dn);
+            double h2 = 0.0, n2 = 0.0, r2 = 0.0;
+            for (int a = 0; a < 8; ++a) { h2 += H[a] * H[a]; n2 += n[a] * n[a]; r2 += dn[a] * dn[a]; }
+            const double scale = su3_bracket * std::sqrt(h2 * n2);
+            if (scale > 0.0) worst = std::max(worst, std::sqrt(r2) / scale);
         }
-        
-        // Trilinear SU(3)-SU(3)-SU(3): T[a](b,c) * S1[b] * S2[c]
-        for (size_t n = 0; n < trilinear_partners_SU3[site].size(); ++n) {
-            const size_t p1 = trilinear_partners_SU3[site][n][0];
-            const size_t p2 = trilinear_partners_SU3[site][n][1];
-            const size_t p1_idx = offset_SU3 + p1 * spin_dim_SU3;
-            const size_t p2_idx = offset_SU3 + p2 * spin_dim_SU3;
-            const auto& T = trilinear_interaction_SU3[site][n];
-            
-            for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU3; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                        temp += T[a](b, c) * state[p1_idx + b] * state[p2_idx + c];
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        // Mixed trilinear SU(3)-SU(2)-SU(2): T[a](b,c) * S_SU2_1[b] * S_SU2_2[c]
-        for (size_t n = 0; n < mixed_trilinear_partners_SU3[site].size(); ++n) {
-            const size_t p1 = mixed_trilinear_partners_SU3[site][n][0];
-            const size_t p2 = mixed_trilinear_partners_SU3[site][n][1];
-            const size_t p1_idx = p1 * spin_dim_SU2;
-            const size_t p2_idx = p2 * spin_dim_SU2;
-            const auto& T = mixed_trilinear_interaction_SU3[site][n];
-            
-            for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                        temp += T[a](b, c) * state[p1_idx + b] * state[p2_idx + c];
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        // Add time-dependent drive
-        H -= drive_field_SU3_at_time(t, site);
-        
-        return H;
+        return worst;
     }
+
+// ---- MixedLattice::max_dSdt_norm_no_drive ----
+    double MixedLattice::max_dSdt_norm_no_drive() const {
+        const ODEState state = spins_to_state();
+        ODEState dsdt(state.size(), 0.0);
+        evaluate_rhs(state, dsdt, DriveFactors{});
+        double max_norm = 0.0;
+        for (size_t i = 0; i < spin_state_size(); ++i) max_norm = std::max(max_norm, std::abs(dsdt[i]));
+        return max_norm;
+    }
+
+// ---- MixedLattice::gpu_unsupported_reason ----
+    string MixedLattice::gpu_unsupported_reason(bool want_spin_states) const {
+        string why;
+        auto add = [&why](const char* what) {
+            if (!why.empty()) why += ", ";
+            why += what;
+        };
+        auto any_entries = [](const auto& table) {
+            for (const auto& per_site : table) if (!per_site.empty()) return true;
+            return false;
+        };
+        if (any_entries(trilinear_partners_SU2) || any_entries(trilinear_partners_SU3))
+            add("SU(2)-SU(2)-SU(2) / SU(3)-SU(3)-SU(3) trilinear couplings");
+        if (any_entries(mixed_trilinear_partners_SU2) || any_entries(mixed_trilinear_partners_SU3))
+            add("mixed SU(2)-SU(2)-SU(3) trilinear couplings");
+        if (has_mixed_bilinear_drive) add("field-assisted Fe-Tm exchange");
+        if (alpha_gilbert != 0.0) add("SU(2) Gilbert damping");
+        if (damping_rates_SU3.size() > 0 && damping_rates_SU3.cwiseAbs().maxCoeff() > 0.0)
+            add("SU(3) Bloch damping");
+        if (thermal_heat != 0.0) add("thermal reservoir");
+        if (field_drive_freq_SU3_2 != 0.0) add("two-colour SU(3) pulse");
+        if (!tabulated_pulse_times.empty()) add("tabulated pulse waveform");
+        if (linear_drive_torque_SU2) add("linearised SU(2) drive torque");
+        if (su3_bracket != classical_spin::su3::kGellMannBracket) add("legacy SU(3) bracket convention");
+        if (want_spin_states) add("spin-state trajectory output");
+        return why;
+    }
+
+// ---- MixedLattice::set_mixed_trilinear_reference_SU3 ----
+    void MixedLattice::set_mixed_trilinear_reference_SU3(const SpinConfigSU3& reference) {
+        if (!reference.empty()) {
+            if (reference.size() != lattice_size_SU3) {
+                throw std::invalid_argument("set_mixed_trilinear_reference_SU3: expected " +
+                                            std::to_string(lattice_size_SU3) + " SU(3) vectors (got " +
+                                            std::to_string(reference.size()) + ")");
+            }
+            for (const auto& r : reference) {
+                if (r.size() != 8 || !r.allFinite()) {
+                    throw std::invalid_argument("set_mixed_trilinear_reference_SU3: every reference "
+                                                "vector must have 8 finite components");
+                }
+            }
+        }
+        // Undo a previous reference: its Fe-Fe bonds were appended at the end
+        // of each site's bilinear list, its on-site part is restored from the
+        // saved matrices.
+        if (!reference_bond_slots_.empty()) {
+            for (size_t i = 0; i < lattice_size_SU2; ++i) {
+                const size_t k = reference_bond_slots_[i].size();
+                bilinear_partners_SU2[i].resize(bilinear_partners_SU2[i].size() - k);
+                bilinear_interaction_SU2[i].resize(bilinear_interaction_SU2[i].size() - k);
+            }
+            onsite_interaction_SU2 = reference_saved_onsite_SU2_;
+        }
+        reference_bond_slots_.clear();
+        reference_saved_onsite_SU2_.clear();
+        trilinear_reference_SU3_.clear();
+
+        if (!reference.empty()) {
+            // T(S_i, S_j, n_k - r_k) = T(S_i, S_j, n_k) - S_i^a J^{ab} S_j^b,
+            // J^{ab} = sum_c T_i^a(b, c) r_k^c, for every SU(2)-side entry
+            // (i; j, k) of a triple. Distinct j: each triple has an entry at i
+            // and one at j, giving the bonds i->j (J) and j->i (J^T), counted
+            // 1/2 + 1/2 like any bond. j == i (a TmFeO3 W vertex is
+            // T(S_i, S_i, n_k)): the triple has two entries at i, with J and
+            // J^T, and the subtraction -S_i^T J S_i is on-site; each entry adds
+            // A -= (J + J^T)/4 (E = S^T A S, field 2 A S, A symmetric).
+            reference_saved_onsite_SU2_ = onsite_interaction_SU2;
+            reference_bond_slots_.assign(lattice_size_SU2, {});
+            for (size_t i = 0; i < lattice_size_SU2; ++i) {
+                for (size_t n = 0; n < mixed_trilinear_partners_SU2[i].size(); ++n) {
+                    const size_t j = mixed_trilinear_partners_SU2[i][n][0];
+                    const size_t k = mixed_trilinear_partners_SU2[i][n][1];
+                    const auto& T = mixed_trilinear_interaction_SU2[i][n];
+                    SpinMatrix J = SpinMatrix::Zero(spin_dim_SU2, spin_dim_SU2);
+                    for (size_t a = 0; a < spin_dim_SU2; ++a)
+                        for (size_t b = 0; b < spin_dim_SU2; ++b)
+                            for (size_t c = 0; c < spin_dim_SU3; ++c)
+                                J(a, b) += T[a](b, c) * reference[k](c);
+                    if (j == i) {
+                        onsite_interaction_SU2[i] -= 0.25 * (J + J.transpose());
+                    } else {
+                        bilinear_partners_SU2[i].push_back(j);
+                        bilinear_interaction_SU2[i].push_back(-J);
+                        reference_bond_slots_[i].push_back({bilinear_partners_SU2[i].size() - 1, n});
+                    }
+                }
+            }
+            trilinear_reference_SU3_ = reference;
+        }
+
+        num_bi_SU2 = 0;
+        for (const auto& bp : bilinear_partners_SU2) num_bi_SU2 = std::max(num_bi_SU2, bp.size());
+        build_packed_interaction_buffers();
+        build_color_partition();
+        invalidate_all_fields();
+    }
+
+// =============================================================
+// Pulse drives
+// =============================================================
+
+// ---- MixedLattice::integrate_pulse_train ----
+    MixedLattice::PumpProbeTrajectory MixedLattice::integrate_pulse_train(
+        const dyn::TimeGrid& grid, size_t k_start, ODEState x, const string& method,
+        vector<vector<double>>* spin_state_out, double abs_tol, double rel_tol,
+        const vector<size_t>& capture_at, vector<ODEState>* captured) {
+        // The installed pulse train belongs to this trajectory only: remove it
+        // on every exit path, including exceptions.
+        struct PulseGuard {
+            MixedLattice* lat;
+            ~PulseGuard() { lat->reset_pulse(); }
+        } guard{this};
+
+        const auto method_id = dyn::parse_ode_method(method);
+        if (k_start >= grid.n) throw std::invalid_argument("pulse drive: start index beyond the time grid");
+        if (x.size() != ode_state_size()) {
+            throw std::invalid_argument("pulse drive: initial state has " + std::to_string(x.size()) +
+                                        " entries, expected " + std::to_string(ode_state_size()));
+        }
+
+        // Windows where a pulse acts (its envelope exceeds ~1.6e-9 of the
+        // peak): the adaptive step is capped there at min(T_step, width/4,
+        // carrier period/4) so a pulse can never be stepped over; elsewhere the
+        // error controller alone sets the step.
+        const bool tabulated = !tabulated_pulse_times.empty();
+        std::vector<std::pair<double, double>> windows;
+        double cap = grid.dt;
+        auto add_species = [&](double amp, double width, double freq, double freq2,
+                               const array<double, 2>& centres) {
+            if (amp == 0.0) return;
+            for (size_t k = 0; k < std::min<size_t>(n_active_pulses, 2); ++k) {
+                if (tabulated) {
+                    windows.emplace_back(centres[k] + tabulated_pulse_times.front(),
+                                         centres[k] + tabulated_pulse_times.back());
+                } else {
+                    const double W = classical_spin_pulse_chunking::kPulseWindowSigmas * width;
+                    windows.emplace_back(centres[k] - W, centres[k] + W);
+                }
+            }
+            if (!tabulated) {
+                cap = std::min(cap, 0.25 * width);
+                for (double f : {freq, freq2}) {
+                    if (f != 0.0) cap = std::min(cap, 0.25 * 2.0 * M_PI / std::abs(f));
+                }
+            }
+        };
+        add_species(field_drive_amp_SU2, field_drive_width_SU2, field_drive_freq_SU2, 0.0, t_pulse_SU2);
+        add_species(field_drive_amp_SU3, field_drive_width_SU3, field_drive_freq_SU3,
+                    field_drive_freq_SU3_2, t_pulse_SU3);
+        const auto segments = dyn::segments_with_windows(grid, windows, cap);
+
+        PumpProbeTrajectory trajectory;
+        trajectory.reserve(grid.n - k_start);
+        if (spin_state_out) {
+            spin_state_out->clear();
+            spin_state_out->reserve(grid.n - k_start);
+        }
+        if (captured) captured->assign(capture_at.size(), ODEState());
+        const size_t n_spin = spin_state_size();
+        auto observer = [&](const ODEState& s, size_t k) {
+            require_finite(s, grid[k], "pulse drive");
+            trajectory.emplace_back(grid[k], observe(s.data()));
+            if (spin_state_out) spin_state_out->emplace_back(s.begin(), s.begin() + n_spin);
+            if (captured) {
+                for (size_t c = 0; c < capture_at.size(); ++c) {
+                    if (capture_at[c] == k) (*captured)[c] = s;
+                }
+            }
+        };
+        auto system = [this](const ODEState& s, ODEState& ds, double t) { landau_lifshitz(s, ds, t); };
+        dyn::integrate_on_time_grid(system, x, grid, 1, method_id, abs_tol, rel_tol, observer,
+                                    segments, k_start);
+        return trajectory;
+    }
+
+// ---- MixedLattice::single_pulse_drive ----
+    MixedLattice::PumpProbeTrajectory MixedLattice::single_pulse_drive(
+               const vector<SpinVector>& field_in_SU2, const vector<SpinVector>& field_in_SU3,
+               double t_B,
+               double pulse_amp_SU2, double pulse_width_SU2, double pulse_freq_SU2,
+               double pulse_amp_SU3, double pulse_width_SU3, double pulse_freq_SU3,
+               double T_start, double T_end, double step_size,
+               const string& method, bool use_gpu,
+               vector<vector<double>>* spin_state_out,
+               bool pulse_window_chunking,
+               double abs_tol, double rel_tol) {
+        (void) pulse_window_chunking;  // superseded by exact-grid integration
+        if (use_gpu) {
+#ifdef CUDA_ENABLED
+            check_gpu_supported(spin_state_out != nullptr);
+            return single_pulse_drive_gpu(field_in_SU2, field_in_SU3, t_B,
+                            pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                            pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+                            T_start, T_end, step_size, method);
+#else
+            std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED); "
+                         "running single_pulse_drive on the CPU." << endl;
+#endif
+        }
+        const auto grid = dyn::TimeGrid::covering(T_start, T_end, step_size,
+                                                  "single_pulse_drive (T_start, T_end, T_step)");
+        configure_pulse_train(1, field_in_SU2, field_in_SU3, t_B, {}, {}, t_B,
+                              pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                              pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3);
+        return integrate_pulse_train(grid, 0, spins_to_state(), method, spin_state_out, abs_tol, rel_tol);
+    }
+
+// ---- MixedLattice::double_pulse_drive ----
+    MixedLattice::PumpProbeTrajectory MixedLattice::double_pulse_drive(
+               const vector<SpinVector>& field_in_1_SU2, const vector<SpinVector>& field_in_1_SU3,
+               double t_B_1,
+               const vector<SpinVector>& field_in_2_SU2, const vector<SpinVector>& field_in_2_SU3,
+               double t_B_2,
+               double pulse_amp_SU2, double pulse_width_SU2, double pulse_freq_SU2,
+               double pulse_amp_SU3, double pulse_width_SU3, double pulse_freq_SU3,
+               double T_start, double T_end, double step_size,
+               const string& method, bool use_gpu,
+               vector<vector<double>>* spin_state_out,
+               bool pulse_window_chunking,
+               double abs_tol, double rel_tol) {
+        (void) pulse_window_chunking;
+        if (use_gpu) {
+#ifdef CUDA_ENABLED
+            check_gpu_supported(spin_state_out != nullptr);
+            return double_pulse_drive_gpu(field_in_1_SU2, field_in_1_SU3, t_B_1,
+                                field_in_2_SU2, field_in_2_SU3, t_B_2,
+                                pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                                pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+                                T_start, T_end, step_size, method);
+#else
+            std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED); "
+                         "running double_pulse_drive on the CPU." << endl;
+#endif
+        }
+        const auto grid = dyn::TimeGrid::covering(T_start, T_end, step_size,
+                                                  "double_pulse_drive (T_start, T_end, T_step)");
+        configure_pulse_train(2, field_in_1_SU2, field_in_1_SU3, t_B_1, field_in_2_SU2, field_in_2_SU3, t_B_2,
+                              pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                              pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3);
+        return integrate_pulse_train(grid, 0, spins_to_state(), method, spin_state_out, abs_tol, rel_tol);
+    }
+
+// =============================================================
+// Molecular dynamics
+// =============================================================
+
+namespace {
+
+// Report how far the initial state is from a stationary, physical one. Free
+// dynamics from a thermal state is legitimate, so these are warnings.
+void report_initial_state(const MixedLattice& lat, const MixedLattice::ODEState& x, const char* who) {
+    const double residual = lat.relative_stationarity_residual(x);
+    const double rho_min = lat.min_SU3_density_eigenvalue();
+    cout << who << ": initial state stationarity residual max|dS/dt|/(|H||S|) = " << residual
+         << ", min SU(3) density-matrix eigenvalue = " << rho_min << endl;
+    if (rho_min < -1e-8) {
+        std::cerr << "Warning (" << who << "): an SU(3) state is not a physical density matrix "
+                  << "(eigenvalue " << rho_min << " < 0); consider physicalize_SU3_state()." << endl;
+    }
+}
+
+#ifdef HDF5_ENABLED
+// Append 1-D double datasets to a group of an existing file (SEC2 driver, so
+// it also works against a parallel HDF5 build).
+void append_hdf5_columns(const std::string& filename, const std::string& group_name,
+                         const std::vector<std::pair<std::string, const std::vector<double>*>>& columns) {
+    hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
+    H5Pset_fapl_sec2(fapl);
+    hid_t fid = H5Fopen(filename.c_str(), H5F_ACC_RDWR, fapl);
+    H5Pclose(fapl);
+    if (fid < 0) throw std::runtime_error("cannot reopen " + filename + " to write " + group_name);
+    // H5File(hid_t) takes an additional reference; drop ours so close()
+    // really closes the file.
+    H5::H5File file(fid);
+    H5Idec_ref(fid);
+    H5::Group group = file.createGroup(group_name);
+    for (const auto& [name, data] : columns) {
+        hsize_t dims[1] = {data->size()};
+        H5::DataSpace space(1, dims);
+        H5::DataSet ds = group.createDataSet(name, H5::PredType::NATIVE_DOUBLE, space);
+        ds.write(data->data(), H5::PredType::NATIVE_DOUBLE);
+    }
+    group.close();
+    file.close();
+}
+#endif
+
+}  // namespace
 
 // ---- MixedLattice::molecular_dynamics ----
     void MixedLattice::molecular_dynamics(double T_start, double T_end, double dt_initial,
@@ -1192,17 +990,16 @@ inline void trilinear_kernel_dyn(const double* __restrict T,
                            double abs_tol, double rel_tol) {
         if (use_gpu) {
 #ifdef CUDA_ENABLED
-            // GPU path does not yet expose tolerance overrides; ignore.
-            (void) abs_tol; (void) rel_tol;
+            check_gpu_supported();
+            (void) abs_tol; (void) rel_tol;  // the GPU integrators are fixed-step
             molecular_dynamics_gpu(T_start, T_end, dt_initial, out_dir, save_interval, method);
+            return;
 #else
-            std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED)." << endl;
-            std::cerr << "Falling back to CPU implementation." << endl;
-            molecular_dynamics_cpu(T_start, T_end, dt_initial, out_dir, save_interval, method, abs_tol, rel_tol);
+            std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED); "
+                         "running molecular dynamics on the CPU." << endl;
 #endif
-        } else {
-            molecular_dynamics_cpu(T_start, T_end, dt_initial, out_dir, save_interval, method, abs_tol, rel_tol);
         }
+        molecular_dynamics_cpu(T_start, T_end, dt_initial, out_dir, save_interval, method, abs_tol, rel_tol);
     }
 
 // ---- MixedLattice::molecular_dynamics_cpu ----
@@ -1211,191 +1008,391 @@ inline void trilinear_kernel_dyn(const double* __restrict T,
                            const string& method,
                            double abs_tol, double rel_tol) {
 #ifndef HDF5_ENABLED
-        std::cerr << "Error: HDF5 support is required for molecular dynamics output." << endl;
-        std::cerr << "Please rebuild with -DHDF5_ENABLED flag and HDF5 libraries." << endl;
-        return;
+        (void) T_start; (void) T_end; (void) dt_initial; (void) out_dir;
+        (void) save_interval; (void) method; (void) abs_tol; (void) rel_tol;
+        throw std::runtime_error("molecular_dynamics requires HDF5 output; rebuild with HDF5_ENABLED");
 #else
+        if (save_interval == 0) throw std::invalid_argument("molecular_dynamics: save_interval must be >= 1");
+        if (!(dt_initial > 0.0)) throw std::invalid_argument("molecular_dynamics: time step must be > 0");
+        const auto method_id = dyn::parse_ode_method(method);
+        const auto grid = dyn::TimeGrid::covering(T_start, T_end, dt_initial * static_cast<double>(save_interval),
+                                                  "molecular_dynamics (T_start, T_end, dt * save_interval)");
         ensure_directory_exists(out_dir);
-        
-        cout << "Running mixed lattice molecular dynamics with Boost.Odeint: t=" << T_start << " → " << T_end << endl;
-        cout << "Integration method: " << method << endl;
-        cout << "Initial step size: " << dt_initial << endl;
-        
-        // Convert current spins to flat state vector
+
+        cout << "Mixed-lattice molecular dynamics: t = " << T_start << " -> " << grid.t_end()
+             << ", method " << dyn::ode_method_name(method_id) << ", dt " << dt_initial
+             << (dyn::is_adaptive(method_id) ? " (initial step)" : "")
+             << ", " << grid.n << " samples every " << grid.dt << endl;
+
         ODEState state = spins_to_state();
-        
-        // Create HDF5 writer with comprehensive metadata
-        std::unique_ptr<HDF5MixedMDWriter> hdf5_writer;
-        if (!out_dir.empty()) {
-            string hdf5_file = out_dir + "/trajectory.h5";
-            cout << "Writing trajectory to HDF5 file: " << hdf5_file << endl;
-            hdf5_writer = std::make_unique<HDF5MixedMDWriter>(
-                hdf5_file, 
+        report_initial_state(*this, state, "molecular_dynamics");
+
+        std::unique_ptr<HDF5MixedMDWriter> writer;
+        const string hdf5_file = out_dir.empty() ? string() : out_dir + "/trajectory.h5";
+        if (!hdf5_file.empty()) {
+            writer = std::make_unique<HDF5MixedMDWriter>(
+                hdf5_file,
                 lattice_size_SU2, spin_dim_SU2, N_atoms_SU2,
                 lattice_size_SU3, spin_dim_SU3, N_atoms_SU3,
-                dim1, dim2, dim3, method, 
-                dt_initial, T_start, T_end, save_interval, 
+                dim1, dim2, dim3, dyn::ode_method_name(method_id),
+                dt_initial, T_start, grid.t_end(), save_interval,
                 spin_length_SU2, spin_length_SU3,
-                &site_positions_SU2, &site_positions_SU3, 10000);
+                &site_positions_SU2, &site_positions_SU3, grid.n);
         }
-        
-        // Observer to save data at specified intervals
-        size_t step_count = 0;
-        size_t save_count = 0;
-        auto observer = [&](const ODEState& x, double t) {
-            if (step_count % save_interval == 0) {
-                // Compute magnetizations directly from flat state (zero allocation)
-                SpinVector M_SU2 = SpinVector::Zero(spin_dim_SU2);
-                SpinVector M_SU3 = SpinVector::Zero(spin_dim_SU3);
-                SpinVector M_SU2_antiferro = SpinVector::Zero(spin_dim_SU2);
-                SpinVector M_SU3_antiferro = SpinVector::Zero(spin_dim_SU3);
-                SpinVector M_SU2_global = SpinVector::Zero(spin_dim_SU2);
-                SpinVector M_SU3_global = SpinVector::Zero(spin_dim_SU3);
-                
-                double M_SU2_arr[8] = {0};
-                double M_SU2_antiferro_arr[8] = {0};
-                double M_SU2_global_arr[8] = {0};
-                compute_sublattice_magnetizations_from_flat(x.data(), 0, 
-                    lattice_size_SU2, spin_dim_SU2, M_SU2_arr, M_SU2_antiferro_arr);
-                compute_magnetization_global_SU2_from_flat(x.data(), M_SU2_global_arr);
-                compute_magnetization_staggered_SU2_from_flat(x.data(), M_SU2_antiferro_arr);
-                M_SU2 = Eigen::Map<Eigen::VectorXd>(M_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-                M_SU2_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU2_antiferro_arr, spin_dim_SU2);
-                M_SU2_global = Eigen::Map<Eigen::VectorXd>(M_SU2_global_arr, spin_dim_SU2);
-                
-                double M_SU3_arr[8] = {0};
-                double M_SU3_antiferro_arr[8] = {0};
-                double M_SU3_global_arr[8] = {0};
-                size_t SU3_offset = lattice_size_SU2 * spin_dim_SU2;
-                compute_sublattice_magnetizations_from_flat(x.data(), SU3_offset, 
-                    lattice_size_SU3, spin_dim_SU3, M_SU3_arr, M_SU3_antiferro_arr);
-                compute_magnetization_global_SU3_from_flat(x.data(), M_SU3_global_arr);
-                M_SU3 = Eigen::Map<Eigen::VectorXd>(M_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-                M_SU3_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU3_antiferro_arr, spin_dim_SU3) / double(lattice_size_SU3);
-                M_SU3_global = Eigen::Map<Eigen::VectorXd>(M_SU3_global_arr, spin_dim_SU3);
-                
-                // Compute accurate energy density directly from flat state (includes all interactions)
-                double E = total_energy_flat(x.data()) / (lattice_size_SU2 + lattice_size_SU3);
-                
-                // Write to HDF5 directly from flat state (no conversion needed)
-                if (hdf5_writer) {
-                    hdf5_writer->write_flat_step(t, 
-                                                M_SU2_antiferro, M_SU2, M_SU2_global,
-                                                M_SU3_antiferro, M_SU3, M_SU3_global,
-                                                x.data());
-                    save_count++;
-                }
-                
-                // Progress output
-                if (step_count % (save_interval * 10) == 0) {
-                    cout << "t=" << t << ", E/N=" << E 
-                         << ", |M_SU2|=" << M_SU2.norm() 
-                         << ", |M_SU3|=" << M_SU3.norm() << endl;
-                }
+
+        // Conserved quantities of the undamped, undriven flow, per site:
+        // |S_i| and the SU(3) Casimirs |n_i|^2, d_abc n^a n^b n^c.
+        const size_t offset_SU3 = lattice_size_SU2 * 3;
+        vector<double> S0(lattice_size_SU2), C2_0(lattice_size_SU3), C3_0(lattice_size_SU3);
+        for (size_t i = 0; i < lattice_size_SU2; ++i) {
+            const double* S = &state[i * 3];
+            S0[i] = std::sqrt(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+        }
+        for (size_t i = 0; i < lattice_size_SU3; ++i) {
+            C2_0[i] = classical_spin::su3::casimir2(&state[offset_SU3 + i * 8]);
+            C3_0[i] = classical_spin::su3::casimir3(&state[offset_SU3 + i * 8]);
+        }
+        vector<double> d_time, d_energy, d_spin, d_c2, d_c3;
+        for (auto* v : {&d_time, &d_energy, &d_spin, &d_c2, &d_c3}) v->reserve(grid.n);
+        const double n_sites = static_cast<double>(lattice_size_SU2 + lattice_size_SU3);
+        const size_t progress_every = std::max<size_t>(1, grid.n / 10);
+
+        auto observer = [&](const ODEState& x, size_t k) {
+            const double t = grid[k];
+            require_finite(x, t, "molecular_dynamics");
+            const Observables o = observe(x.data());
+            if (writer) {
+                writer->write_flat_step(t, o.first[0], o.first[1], o.first[2],
+                                        o.second[0], o.second[1], o.second[2], x.data());
             }
-            ++step_count;
+            double ds = 0.0, dc2 = 0.0, dc3 = 0.0;
+            for (size_t i = 0; i < lattice_size_SU2; ++i) {
+                const double* S = &x[i * 3];
+                ds = std::max(ds, std::abs(std::sqrt(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]) - S0[i]));
+            }
+            for (size_t i = 0; i < lattice_size_SU3; ++i) {
+                const double* n = &x[offset_SU3 + i * 8];
+                dc2 = std::max(dc2, std::abs(classical_spin::su3::casimir2(n) - C2_0[i]));
+                dc3 = std::max(dc3, std::abs(classical_spin::su3::casimir3(n) - C3_0[i]));
+            }
+            const double e = total_energy_flat(x.data()) / n_sites;
+            d_time.push_back(t);
+            d_energy.push_back(e);
+            d_spin.push_back(ds);
+            d_c2.push_back(dc2);
+            d_c3.push_back(dc3);
+            if (k % progress_every == 0 || k + 1 == grid.n) {
+                cout << "t=" << t << ", E/N=" << std::setprecision(12) << e << std::setprecision(6)
+                     << ", |M_SU2|=" << o.first[1].norm() << ", |M_SU3|=" << o.second[1].norm()
+                     << ", max||S|-S0|=" << ds << ", max|dC2|=" << dc2 << endl;
+            }
         };
-        
-        // Create ODE system wrapper for Boost.Odeint
-        auto system_func = [this](const ODEState& x, ODEState& dxdt, double t) {
-            this->ode_system(x, dxdt, t);
-        };
-        
-        // Integrate using selected method
-        // Apply user override if both tolerances are positive; otherwise
-        // fall back to the legacy method-aware defaults (1e-6 / 1e-8 BS).
-        double effective_abs_tol = abs_tol;
-        double effective_rel_tol = rel_tol;
-        if (effective_abs_tol <= 0.0 || effective_rel_tol <= 0.0) {
-            auto [a, r] = get_integration_tolerances(method);
-            if (effective_abs_tol <= 0.0) effective_abs_tol = a;
-            if (effective_rel_tol <= 0.0) effective_rel_tol = r;
+        auto system = [this](const ODEState& x, ODEState& dxdt, double t) { landau_lifshitz(x, dxdt, t); };
+        dyn::integrate_on_time_grid(system, state, grid, save_interval, method_id, abs_tol, rel_tol, observer);
+
+        if (writer) {
+            writer->close();
+            append_hdf5_columns(hdf5_file, "/diagnostics",
+                                {{"times", &d_time},
+                                 {"energy_per_site", &d_energy},
+                                 {"spin_length_drift_SU2", &d_spin},
+                                 {"casimir2_drift_SU3", &d_c2},
+                                 {"casimir3_drift_SU3", &d_c3}});
+            cout << "Trajectory (" << grid.n << " samples) and diagnostics written to " << hdf5_file << endl;
         }
-        integrate_ode_system(system_func, state, T_start, T_end, dt_initial,
-                            observer, method, true, effective_abs_tol, effective_rel_tol);
-        
-        // Note: MixedLattice::spins_SU2 and spins_SU3 remain unchanged (initial configuration preserved)
-        // The evolved state is stored in the ODEState 'state' variable
-        
-        // Close HDF5 file
-        if (hdf5_writer) {
-            hdf5_writer->close();
-            cout << "HDF5 trajectory saved with " << save_count << " snapshots" << endl;
-        }
-        
-        cout << "Molecular dynamics complete! (" << step_count << " steps)" << endl;
+        cout << "Energy drift |E(t_end) - E(t0)|/N = " << std::abs(d_energy.back() - d_energy.front()) << endl;
 #endif // HDF5_ENABLED
     }
 
-// ============================================================
-// 2DCS / pump-probe optimisation helpers (Ingredient XV).
-// Mirror of the Lattice helpers; see lattice_md.cpp for full prose.
-// ============================================================
-
-// ---- MixedLattice::max_dSdt_norm_no_drive ----
-    double MixedLattice::max_dSdt_norm_no_drive() const {
-        // Pack spins -> flat state, evaluate landau_lifshitz with both
-        // SU(2) and SU(3) drive amplitudes pinned to zero, restore the
-        // amplitudes, then return ‖dS/dt‖_∞. Used by W1 to verify the
-        // current configuration is a (numerical) stationary point of
-        // the deterministic flow before we synthesise M1(τ) by
-        // time-shifting M_pulse.
-        ODEState state = spins_to_state();
-        ODEState dsdt(state.size(), 0.0);
-
-        MixedLattice* self = const_cast<MixedLattice*>(this);
-        const double saved_amp_SU2 = self->field_drive_amp_SU2;
-        const double saved_amp_SU3 = self->field_drive_amp_SU3;
-        self->field_drive_amp_SU2 = 0.0;
-        self->field_drive_amp_SU3 = 0.0;
-        try {
-            self->landau_lifshitz(state, dsdt, 0.0);
-        } catch (...) {
-            self->field_drive_amp_SU2 = saved_amp_SU2;
-            self->field_drive_amp_SU3 = saved_amp_SU3;
-            throw;
-        }
-        self->field_drive_amp_SU2 = saved_amp_SU2;
-        self->field_drive_amp_SU3 = saved_amp_SU3;
-
-        double max_norm = 0.0;
-        for (double v : dsdt) {
-            const double a = std::abs(v);
-            if (a > max_norm) max_norm = a;
-        }
-        return max_norm;
-    }
+// =============================================================
+// Pump-probe / 2DCS spectroscopy
+// =============================================================
 
 // ---- MixedLattice::synthesize_M1_from_M0 ----
     MixedLattice::PumpProbeTrajectory MixedLattice::synthesize_M1_from_M0(
         const PumpProbeTrajectory& M_pulse_trajectory,
-        const pair<array<SpinVector, 3>, array<SpinVector, 3>>& M_ground,
+        const Observables& M_ground,
         double tau,
         double T_start, double T_end, double T_step) const {
         (void) T_start;
         (void) T_end;
+        if (!(T_step > 0.0)) throw std::invalid_argument("synthesize_M1_from_M0: T_step must be > 0");
+        const double r = tau / T_step;
+        const double m = std::round(r);
+        if (std::abs(r - m) > 1e-9 * std::max(1.0, std::abs(m))) {
+            throw std::invalid_argument("synthesize_M1_from_M0: tau = " + std::to_string(tau) +
+                                        " is not a multiple of T_step = " + std::to_string(T_step));
+        }
+        if (m < 0.0) throw std::invalid_argument("synthesize_M1_from_M0: requires tau >= 0");
+        const size_t shift = static_cast<size_t>(m);
         PumpProbeTrajectory M1;
         M1.reserve(M_pulse_trajectory.size());
-        if (M_pulse_trajectory.empty()) return M1;
-
-        const double T_start_M0 = M_pulse_trajectory.front().first;
-        const double tau_threshold = tau + T_start_M0;
-        const ptrdiff_t n = static_cast<ptrdiff_t>(M_pulse_trajectory.size());
-
-        for (const auto& [t_i, mag_i] : M_pulse_trajectory) {
-            (void) mag_i;
-            if (t_i < tau_threshold) {
-                M1.push_back({t_i, M_ground});
-            } else {
-                const double rel = (t_i - tau - T_start_M0) / T_step;
-                ptrdiff_t idx = static_cast<ptrdiff_t>(std::lround(rel));
-                if (idx < 0) idx = 0;
-                if (idx >= n) idx = n - 1;
-                M1.push_back({t_i, M_pulse_trajectory[static_cast<size_t>(idx)].second});
-            }
+        for (size_t k = 0; k < M_pulse_trajectory.size(); ++k) {
+            M1.emplace_back(M_pulse_trajectory[k].first,
+                            k < shift ? M_ground : M_pulse_trajectory[k - shift].second);
         }
         return M1;
     }
+
+// Validated description of one pump-probe scan, shared by the serial and the
+// MPI driver so both run exactly the same physics.
+struct MixedLattice::SpectroscopyPlan {
+    const vector<SpinVector>* pump_SU2 = nullptr;
+    const vector<SpinVector>* pump_SU3 = nullptr;
+    const vector<SpinVector>* probe_SU2 = nullptr;
+    const vector<SpinVector>* probe_SU3 = nullptr;
+    double amp_SU2 = 0.0, width_SU2 = 1.0, freq_SU2 = 0.0;
+    double amp_SU3 = 0.0, width_SU3 = 1.0, freq_SU3 = 0.0;
+    string method;
+    double abs_tol = 0.0, rel_tol = 0.0;
+    bool gpu = false;
+    bool save_spins = false;
+    dyn::TimeGrid grid;
+    vector<double> taus;
+    bool distinct_probe = false;
+    double residual = 0.0;          // relative stationarity of the ground state
+    bool w1 = false;                // synthesise M1 from M0
+    string w1_note;                 // why W1 is off (empty when on or not requested)
+    bool m01_from_m0 = false;       // continue M01 from stored M0 states
+    double probe_lead = 0.0;        // the probe is negligible before tau - probe_lead
+    vector<size_t> m01_start;       // per delay: grid index where M01 is integrated from
+    vector<size_t> checkpoint_indices;  // distinct m01_start > 0 (states kept from the M0 run)
+};
+
+struct MixedLattice::DelayResult {
+    PumpProbeTrajectory M1;          // empty when synthesised (W1)
+    PumpProbeTrajectory M01;         // samples k0 .. n-1
+    vector<double> M1_spins;         // flat, same samples as M1 (save_spins only)
+    vector<double> M01_spins;        // flat, samples k0 .. n-1 (save_spins only)
+    size_t k0 = 0;
+};
+
+namespace {
+
+vector<double> flatten_states(const vector<vector<double>>& states) {
+    vector<double> flat;
+    if (states.empty()) return flat;
+    flat.reserve(states.size() * states.front().size());
+    for (const auto& s : states) flat.insert(flat.end(), s.begin(), s.end());
+    return flat;
+}
+
+// Observables are 1 + 3*3 + 3*8 doubles per sample (time first).
+constexpr size_t kObsDoubles = 1 + 3 * 3 + 3 * 8;
+
+void flatten_trajectory(const MixedLattice::PumpProbeTrajectory& tr, vector<double>& buf) {
+    buf.resize(tr.size() * kObsDoubles);
+    for (size_t k = 0; k < tr.size(); ++k) {
+        double* p = &buf[k * kObsDoubles];
+        *p++ = tr[k].first;
+        for (const auto& v : tr[k].second.first) for (Eigen::Index d = 0; d < 3; ++d) *p++ = v(d);
+        for (const auto& v : tr[k].second.second) for (Eigen::Index d = 0; d < 8; ++d) *p++ = v(d);
+    }
+}
+
+MixedLattice::PumpProbeTrajectory unflatten_trajectory(const vector<double>& buf) {
+    MixedLattice::PumpProbeTrajectory tr(buf.size() / kObsDoubles);
+    for (size_t k = 0; k < tr.size(); ++k) {
+        const double* p = &buf[k * kObsDoubles];
+        tr[k].first = *p++;
+        for (auto& v : tr[k].second.first) { v = Eigen::Map<const Eigen::VectorXd>(p, 3); p += 3; }
+        for (auto& v : tr[k].second.second) { v = Eigen::Map<const Eigen::VectorXd>(p, 8); p += 8; }
+    }
+    return tr;
+}
+
+// M01 over the whole grid: samples before k0 are those of M0 (identical drive
+// up to the probe lead), samples from k0 on come from the continued run.
+MixedLattice::PumpProbeTrajectory assemble_m01(const MixedLattice::PumpProbeTrajectory& M0,
+                                               MixedLattice::PumpProbeTrajectory&& partial, size_t k0) {
+    if (k0 == 0) return std::move(partial);
+    MixedLattice::PumpProbeTrajectory full;
+    full.reserve(k0 + partial.size());
+    full.insert(full.end(), M0.begin(), M0.begin() + static_cast<std::ptrdiff_t>(k0));
+    full.insert(full.end(), std::make_move_iterator(partial.begin()), std::make_move_iterator(partial.end()));
+    return full;
+}
+
+vector<double> assemble_m01_spins(const vector<double>& M0_spins, vector<double>&& partial, size_t k0,
+                                  size_t state_dim) {
+    if (k0 == 0 || partial.empty()) return std::move(partial);
+    vector<double> full;
+    full.reserve(k0 * state_dim + partial.size());
+    full.insert(full.end(), M0_spins.begin(), M0_spins.begin() + static_cast<std::ptrdiff_t>(k0 * state_dim));
+    full.insert(full.end(), partial.begin(), partial.end());
+    return full;
+}
+
+void require_grid_length(const MixedLattice::PumpProbeTrajectory& tr, size_t n, const char* what) {
+    if (tr.size() != n) {
+        throw std::runtime_error(std::string("pump-probe: ") + what + " has " + std::to_string(tr.size()) +
+                                 " samples, the time grid has " + std::to_string(n));
+    }
+}
+
+}  // namespace
+
+// ---- MixedLattice::plan_spectroscopy ----
+    MixedLattice::SpectroscopyPlan MixedLattice::plan_spectroscopy(
+        const vector<SpinVector>& field_in_SU2, const vector<SpinVector>& field_in_SU3,
+        const vector<SpinVector>& field_in_SU2_B, const vector<SpinVector>& field_in_SU3_B,
+        double pulse_amp_SU2, double pulse_width_SU2, double pulse_freq_SU2,
+        double pulse_amp_SU3, double pulse_width_SU3, double pulse_freq_SU3,
+        double tau_start, double tau_end, double tau_step,
+        double T_start, double T_end, double T_step,
+        const string& method, bool use_gpu, bool save_spin_trajectories,
+        bool reuse_m0_for_m1, double stationarity_tol,
+        bool reuse_m0_for_m01, double abs_tol, double rel_tol) const {
+        SpectroscopyPlan p;
+        validate_pulse_directions(field_in_SU2, N_atoms_SU2, spin_dim_SU2, "pump direction (SU2)");
+        validate_pulse_directions(field_in_SU3, N_atoms_SU3, spin_dim_SU3, "pump direction (SU3)");
+        validate_pulse_directions(field_in_SU2_B, N_atoms_SU2, spin_dim_SU2, "probe direction (SU2)");
+        validate_pulse_directions(field_in_SU3_B, N_atoms_SU3, spin_dim_SU3, "probe direction (SU3)");
+        validate_pulse_shape(pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2, "pump-probe (SU2 pulse)");
+        validate_pulse_shape(pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3, "pump-probe (SU3 pulse)");
+        (void) dyn::parse_ode_method(method);
+
+        p.pump_SU2 = &field_in_SU2;
+        p.pump_SU3 = &field_in_SU3;
+        p.distinct_probe = !field_in_SU2_B.empty() || !field_in_SU3_B.empty();
+        p.probe_SU2 = field_in_SU2_B.empty() ? &field_in_SU2 : &field_in_SU2_B;
+        p.probe_SU3 = field_in_SU3_B.empty() ? &field_in_SU3 : &field_in_SU3_B;
+        p.amp_SU2 = pulse_amp_SU2; p.width_SU2 = pulse_width_SU2; p.freq_SU2 = pulse_freq_SU2;
+        p.amp_SU3 = pulse_amp_SU3; p.width_SU3 = pulse_width_SU3; p.freq_SU3 = pulse_freq_SU3;
+        p.method = method;
+        p.abs_tol = abs_tol;
+        p.rel_tol = rel_tol;
+#ifdef CUDA_ENABLED
+        p.gpu = use_gpu;
+        if (p.gpu) check_gpu_supported(save_spin_trajectories);
+#else
+        (void) use_gpu;
+#endif
+        p.save_spins = save_spin_trajectories;
+        p.grid = dyn::TimeGrid::covering(T_start, T_end, T_step, "pump-probe time grid (T_start, T_end, T_step)");
+        p.taus = dyn::delay_grid(tau_start, tau_end, tau_step, "pump-probe delay grid (tau_start, tau_end, tau_step)");
+
+        // Lead of a pulse before its centre: 9 widths for the Gaussian (envelope
+        // < 1.6e-9 of the peak), the start of the table for a tabulated pulse.
+        double lead = 0.0;
+        if (!tabulated_pulse_times.empty()) {
+            lead = -tabulated_pulse_times.front();
+        } else {
+            if (pulse_amp_SU2 != 0.0) lead = std::max(lead, classical_spin_pulse_chunking::kPulseWindowSigmas * pulse_width_SU2);
+            if (pulse_amp_SU3 != 0.0) lead = std::max(lead, classical_spin_pulse_chunking::kPulseWindowSigmas * pulse_width_SU3);
+        }
+        p.probe_lead = lead;
+
+        p.residual = relative_stationarity_residual(spins_to_state());
+        if (reuse_m0_for_m1) {
+            bool on_grid = true, non_negative = true;
+            for (double tau : p.taus) {
+                const double r = tau / T_step;
+                on_grid = on_grid && std::abs(r - std::round(r)) <= 1e-9 * std::max(1.0, std::abs(r));
+                non_negative = non_negative && tau >= 0.0;
+            }
+            if (p.gpu) p.w1_note = "GPU backend";
+            else if (p.distinct_probe) p.w1_note = "probe directions differ from the pump";
+            else if (p.save_spins) p.w1_note = "spin-state output requested";
+            else if (!non_negative) p.w1_note = "negative delays";
+            else if (!on_grid) p.w1_note = "delays are not multiples of T_step";
+            else if (T_start > -lead) p.w1_note = "the pump is already on at T_start";
+            else if (!(p.residual <= stationarity_tol)) {
+                std::ostringstream os;
+                os << "initial state not stationary (residual " << p.residual << " > tol " << stationarity_tol << ")";
+                p.w1_note = os.str();
+            } else {
+                p.w1 = true;
+            }
+        }
+
+        p.m01_from_m0 = reuse_m0_for_m01 && !p.gpu;
+        p.m01_start.assign(p.taus.size(), 0);
+        if (p.m01_from_m0) {
+            for (size_t j = 0; j < p.taus.size(); ++j) {
+                const double lo = (p.taus[j] - lead - T_start) / T_step;
+                if (lo >= 1.0) {
+                    p.m01_start[j] = std::min(static_cast<size_t>(std::floor(lo)), p.grid.n - 1);
+                }
+            }
+            for (size_t k : p.m01_start) if (k > 0) p.checkpoint_indices.push_back(k);
+            std::sort(p.checkpoint_indices.begin(), p.checkpoint_indices.end());
+            p.checkpoint_indices.erase(std::unique(p.checkpoint_indices.begin(), p.checkpoint_indices.end()),
+                                       p.checkpoint_indices.end());
+        }
+        return p;
+    }
+
+// ---- MixedLattice::run_reference_trajectory ----
+    MixedLattice::PumpProbeTrajectory MixedLattice::run_reference_trajectory(
+        const SpectroscopyPlan& p, const ODEState& x_ground,
+        vector<vector<double>>* spin_states, vector<ODEState>* checkpoints) {
+        if (p.gpu) {
+            return single_pulse_drive(*p.pump_SU2, *p.pump_SU3, 0.0,
+                                      p.amp_SU2, p.width_SU2, p.freq_SU2, p.amp_SU3, p.width_SU3, p.freq_SU3,
+                                      p.grid.t0, p.grid.t_end(), p.grid.dt, p.method, true, nullptr, true,
+                                      p.abs_tol, p.rel_tol);
+        }
+        configure_pulse_train(1, *p.pump_SU2, *p.pump_SU3, 0.0, {}, {}, 0.0,
+                              p.amp_SU2, p.width_SU2, p.freq_SU2, p.amp_SU3, p.width_SU3, p.freq_SU3);
+        return integrate_pulse_train(p.grid, 0, x_ground, p.method, spin_states, p.abs_tol, p.rel_tol,
+                                     p.checkpoint_indices, checkpoints);
+    }
+
+// ---- MixedLattice::compute_delay ----
+    void MixedLattice::compute_delay(const SpectroscopyPlan& p, size_t j, const ODEState& x_ground,
+                                     const ODEState* checkpoint, DelayResult& out) {
+        const double tau = p.taus[j];
+        out = DelayResult{};
+        if (!p.w1) {
+            if (p.gpu) {
+                out.M1 = single_pulse_drive(*p.probe_SU2, *p.probe_SU3, tau,
+                                            p.amp_SU2, p.width_SU2, p.freq_SU2, p.amp_SU3, p.width_SU3, p.freq_SU3,
+                                            p.grid.t0, p.grid.t_end(), p.grid.dt, p.method, true, nullptr, true,
+                                            p.abs_tol, p.rel_tol);
+            } else {
+                vector<vector<double>> states;
+                configure_pulse_train(1, *p.probe_SU2, *p.probe_SU3, tau, {}, {}, tau,
+                                      p.amp_SU2, p.width_SU2, p.freq_SU2, p.amp_SU3, p.width_SU3, p.freq_SU3);
+                out.M1 = integrate_pulse_train(p.grid, 0, x_ground, p.method, p.save_spins ? &states : nullptr,
+                                               p.abs_tol, p.rel_tol);
+                out.M1_spins = flatten_states(states);
+            }
+        }
+        if (p.gpu) {
+            out.M01 = double_pulse_drive(*p.pump_SU2, *p.pump_SU3, 0.0, *p.probe_SU2, *p.probe_SU3, tau,
+                                         p.amp_SU2, p.width_SU2, p.freq_SU2, p.amp_SU3, p.width_SU3, p.freq_SU3,
+                                         p.grid.t0, p.grid.t_end(), p.grid.dt, p.method, true, nullptr, true,
+                                         p.abs_tol, p.rel_tol);
+            return;
+        }
+        out.k0 = p.m01_from_m0 ? p.m01_start[j] : 0;
+        if (out.k0 > 0 && (checkpoint == nullptr || checkpoint->size() != ode_state_size())) {
+            throw std::logic_error("pump-probe: missing M0 state to continue M01 from");
+        }
+        vector<vector<double>> states;
+        configure_pulse_train(2, *p.pump_SU2, *p.pump_SU3, 0.0, *p.probe_SU2, *p.probe_SU3, tau,
+                              p.amp_SU2, p.width_SU2, p.freq_SU2, p.amp_SU3, p.width_SU3, p.freq_SU3);
+        out.M01 = integrate_pulse_train(p.grid, out.k0, out.k0 > 0 ? *checkpoint : x_ground, p.method,
+                                        p.save_spins ? &states : nullptr, p.abs_tol, p.rel_tol);
+        out.M01_spins = flatten_states(states);
+    }
+
+namespace {
+
+void print_plan(std::ostream& os, size_t n_tau, size_t n_t, double residual, bool w1,
+                const std::string& w1_note, bool m01, size_t n_checkpoints) {
+    os << "  Time grid: " << n_t << " samples; delays: " << n_tau << endl;
+    os << "  Ground-state stationarity residual max|dS/dt|/(|H||S|) = " << residual << endl;
+    os << "  [W1] M1 from time-shifted M0: " << (w1 ? "on" : "off");
+    if (!w1 && !w1_note.empty()) os << " (" << w1_note << ")";
+    os << endl;
+    os << "  [M01] continued from stored M0 states: " << (m01 ? "on" : "off");
+    if (m01) os << " (" << n_checkpoints << " stored states)";
+    os << endl;
+}
+
+}  // namespace
 
 // ---- MixedLattice::pump_probe_spectroscopy ----
     void MixedLattice::pump_probe_spectroscopy(const vector<SpinVector>& field_in_SU2,
@@ -1414,340 +1411,227 @@ inline void trilinear_kernel_dyn(const double* __restrict T,
                                  double stationarity_tol,
                                  int outer_omp_threads,
                                  bool pulse_window_chunking,
-                                 double abs_tol, double rel_tol) {
-        
+                                 double abs_tol, double rel_tol,
+                                 const vector<SpinVector>& field_in_SU2_B,
+                                 const vector<SpinVector>& field_in_SU3_B,
+                                 bool reuse_m0_for_m01) {
+        (void) pulse_window_chunking;
+        const SpectroscopyPlan plan = plan_spectroscopy(
+            field_in_SU2, field_in_SU3, field_in_SU2_B, field_in_SU3_B,
+            pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2, pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+            tau_start, tau_end, tau_step, T_start, T_end, T_step, method, use_gpu, save_spin_trajectories,
+            reuse_m0_for_m1, stationarity_tol, reuse_m0_for_m01, abs_tol, rel_tol);
+        const size_t n_tau = plan.taus.size();
+        const size_t n_t = plan.grid.n;
+        const size_t state_dim = spin_state_size();
+
         std::filesystem::create_directories(dir_name);
-        
-        cout << "\n==========================================" << endl;
-        cout << "Mixed Lattice Pump-Probe Spectroscopy" << endl;
-        cout << "==========================================" << endl;
-        cout << "SU(2) Pulse: amp=" << pulse_amp_SU2 << ", width=" << pulse_width_SU2 
-             << ", freq=" << pulse_freq_SU2 << endl;
-        cout << "SU(3) Pulse: amp=" << pulse_amp_SU3 << ", width=" << pulse_width_SU3 
-             << ", freq=" << pulse_freq_SU3 << endl;
-        cout << "Delay scan: " << tau_start << " → " << tau_end << " (step: " << tau_step << ")" << endl;
-        cout << "Integration: " << T_start << " → " << T_end << " (step: " << T_step << ")" << endl;
-        cout << "Optimisations: W1(reuse_m0_for_m1=" << (reuse_m0_for_m1 ? "on" : "off")
-             << ", tol=" << stationarity_tol << "), "
-             << "W2(outer_omp_threads=" << outer_omp_threads << "), "
-             << "W3(pulse_window_chunking=" << (pulse_window_chunking ? "on" : "off") << ")" << endl;
-        if (save_spin_trajectories) {
-            cout << "Raw spin-state saving: ENABLED" << endl;
-        }
-        
-        // Use current spin configuration as ground state (assumed pre-loaded)
-        cout << "\n[1/3] Using current configuration as ground state..." << endl;
-        double E_ground = energy_density();
-        double E_ground_SU2 = total_energy_SU2();
-        double E_ground_SU3 = total_energy_SU3();
-        SpinVector M_ground_SU2 = magnetization_SU2();
-        SpinVector M_ground_SU3 = magnetization_SU3();
-        cout << "  Ground state: E/N = " << E_ground << endl;
-        cout << "    Total Energy:     " << total_energy() << endl;
-        cout << "    SU2 Energy:       " << E_ground_SU2 << " (E/N_SU2 = " << E_ground_SU2 / lattice_size_SU2 << ")" << endl;
-        cout << "    SU3 Energy:       " << E_ground_SU3 << " (E/N_SU3 = " << E_ground_SU3 / lattice_size_SU3 << ")" << endl;
-        cout << "    |M_SU2| = " << M_ground_SU2.norm() << endl;
-        cout << "    |M_SU3| = " << M_ground_SU3.norm() << endl;
-        
-        // Save initial configuration
+        cout << "\n==========================================\n"
+             << "Mixed Lattice Pump-Probe Spectroscopy\n"
+             << "==========================================" << endl;
+        cout << "SU(2) pulse: amp=" << pulse_amp_SU2 << ", width=" << pulse_width_SU2
+             << ", freq=" << pulse_freq_SU2 << "; SU(3) pulse: amp=" << pulse_amp_SU3
+             << ", width=" << pulse_width_SU3 << ", freq=" << pulse_freq_SU3 << endl;
+        cout << "Delays: " << tau_start << " -> " << plan.taus.back() << " (step " << tau_step << "); time: "
+             << T_start << " -> " << plan.grid.t_end() << " (step " << T_step << ")" << endl;
+        print_plan(cout, n_tau, n_t, plan.residual, plan.w1, plan.w1_note, plan.m01_from_m0,
+                   plan.checkpoint_indices.size());
+
+        // The ground state is never modified by the drivers; restore it anyway
+        // on every exit path.
+        const SpinConfigSU2 ground_SU2 = spins_SU2;
+        const SpinConfigSU3 ground_SU3 = spins_SU3;
+        struct SpinRestore {
+            MixedLattice* lat; const SpinConfigSU2* s2; const SpinConfigSU3* s3;
+            ~SpinRestore() { lat->spins_SU2 = *s2; lat->spins_SU3 = *s3; }
+        } restore{this, &ground_SU2, &ground_SU3};
+
+        const ODEState x_ground = spins_to_state();
+        const Observables M_ground = observe(x_ground.data());
+        const double E_ground = energy_density();
+        cout << "Ground state: E/N = " << E_ground << ", |M_SU2| = " << magnetization_SU2().norm()
+             << ", |M_SU3| = " << magnetization_SU3().norm() << endl;
         save_positions_to_dir(dir_name);
         save_spin_config_to_dir(dir_name, "initial_spins");
-        
-        // Backup ground state
-        SpinConfigSU2 ground_state_SU2 = spins_SU2;
-        SpinConfigSU3 ground_state_SU3 = spins_SU3;
-        const size_t state_dim = lattice_size_SU2 * spin_dim_SU2 + lattice_size_SU3 * spin_dim_SU3;
-        
-        // Step 2: Reference single-pulse dynamics (pump at t=0)
-        cout << "\n[2/3] Running reference single-pulse dynamics (M0)..." << endl;
-        if (use_gpu) cout << "  Using GPU acceleration" << endl;
-        vector<double> M0_spin_flat;
-        vector<vector<double>> M0_spin_states;
-        auto M0_trajectory = single_pulse_drive(field_in_SU2, field_in_SU3, 0.0,
-                                   pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                   pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                   T_start, T_end, T_step, method, use_gpu,
-                                   save_spin_trajectories ? &M0_spin_states : nullptr,
-                                   pulse_window_chunking, abs_tol, rel_tol);
-        if (save_spin_trajectories && !M0_spin_states.empty()) {
-            const size_t n_t = M0_spin_states.size();
-            M0_spin_flat.resize(n_t * state_dim);
-            for (size_t t = 0; t < n_t; ++t) {
-                std::copy(M0_spin_states[t].begin(), M0_spin_states[t].end(),
-                          M0_spin_flat.data() + t * state_dim);
-            }
-        }
 
-        // ----- W1: capture ground-state magnetisation triples and decide
-        //       whether it is safe to synthesise M1(τ) from M0 by time
-        //       shift. Use the time-zero observer sample of M0 (which
-        //       was taken before the pulse fires for the t_B=0
-        //       integration only if T_start < 0; otherwise re-derive
-        //       from the now-restored ground state below). For safety
-        //       we always reset spins to the backup and re-evaluate.
-        spins_SU2 = ground_state_SU2;
-        spins_SU3 = ground_state_SU3;
+        cout << "Computing M0 (pump only)..." << endl;
+        vector<vector<double>> M0_states;
+        vector<ODEState> checkpoints;
+        const PumpProbeTrajectory M0 = run_reference_trajectory(
+            plan, x_ground, plan.save_spins ? &M0_states : nullptr, &checkpoints);
+        require_grid_length(M0, n_t, "M0");
+        const vector<double> M0_spins = flatten_states(M0_states);
+        M0_states.clear();
+        auto checkpoint_for = [&](size_t j) -> const ODEState* {
+            const size_t k0 = plan.m01_start[j];
+            if (k0 == 0) return nullptr;
+            const auto it = std::lower_bound(plan.checkpoint_indices.begin(), plan.checkpoint_indices.end(), k0);
+            return &checkpoints[static_cast<size_t>(it - plan.checkpoint_indices.begin())];
+        };
 
-        // Build the magnetisation triples that will be returned for
-        // every "before-pulse" sample of M_1(τ). We mirror exactly the
-        // observer logic inside single_pulse_drive (compute_*_from_flat).
-        pair<array<SpinVector, 3>, array<SpinVector, 3>> M_ground_pair;
-        {
-            ODEState gs_state = spins_to_state();
-            double M_SU2_local_arr[8] = {0};
-            double M_SU2_antiferro_arr[8] = {0};
-            double M_SU2_global_arr[8] = {0};
-            compute_sublattice_magnetizations_from_flat(gs_state.data(), 0,
-                lattice_size_SU2, spin_dim_SU2, M_SU2_local_arr, M_SU2_antiferro_arr);
-            compute_magnetization_global_SU2_from_flat(gs_state.data(), M_SU2_global_arr);
-            compute_magnetization_staggered_SU2_from_flat(gs_state.data(), M_SU2_antiferro_arr);
-
-            double M_SU3_local_arr[8] = {0};
-            double M_SU3_antiferro_arr[8] = {0};
-            double M_SU3_global_arr[8] = {0};
-            compute_sublattice_magnetizations_from_flat(gs_state.data(), lattice_size_SU2 * spin_dim_SU2,
-                lattice_size_SU3, spin_dim_SU3, M_SU3_local_arr, M_SU3_antiferro_arr);
-            compute_magnetization_global_SU3_from_flat(gs_state.data(), M_SU3_global_arr);
-
-            M_ground_pair.first = {
-                Eigen::Map<Eigen::VectorXd>(M_SU2_antiferro_arr, spin_dim_SU2),
-                Eigen::Map<Eigen::VectorXd>(M_SU2_local_arr, spin_dim_SU2) / double(lattice_size_SU2),
-                Eigen::Map<Eigen::VectorXd>(M_SU2_global_arr, spin_dim_SU2)
-            };
-            M_ground_pair.second = {
-                Eigen::Map<Eigen::VectorXd>(M_SU3_antiferro_arr, spin_dim_SU3) / double(lattice_size_SU3),
-                Eigen::Map<Eigen::VectorXd>(M_SU3_local_arr, spin_dim_SU3) / double(lattice_size_SU3),
-                Eigen::Map<Eigen::VectorXd>(M_SU3_global_arr, spin_dim_SU3)
-            };
-        }
-
-        bool can_reuse_m0 = false;
-        if (reuse_m0_for_m1 && !use_gpu) {
-            const double max_dS = max_dSdt_norm_no_drive();
-            cout << "  [W1 guard] max |dS/dt|_inf at ground state = "
-                 << max_dS << " (tol = " << stationarity_tol << ")" << endl;
-            if (max_dS <= stationarity_tol) {
-                can_reuse_m0 = true;
-                cout << "  [W1] Ground state is stationary — synthesising M1(τ) from M0 by time-shift." << endl;
-            } else {
-                cout << "  [W1] Ground state NOT stationary — falling back to fresh M1 integration each τ." << endl;
-            }
-        } else if (reuse_m0_for_m1 && use_gpu) {
-            cout << "  [W1] Skipping (GPU path: stationarity check is host-only)." << endl;
-        }
-        if (can_reuse_m0 && save_spin_trajectories) {
-            cout << "  [W1] Disabled because save_spin_trajectories=true." << endl;
-            can_reuse_m0 = false;
-        }
-
-        // Step 3: Delay time scan
-        int tau_steps = static_cast<int>(std::abs((tau_end - tau_start) / tau_step)) + 1;
-        cout << "\n[3/3] Scanning delay times (" << tau_steps << " steps)..." << endl;
-        
-        typedef vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> TrajectoryType;
-        
-        // Open HDF5 writer BEFORE the loop to write incrementally (avoids OOM)
-        string hdf5_file = dir_name + "/pump_probe_spectroscopy.h5";
-        
 #ifdef HDF5_ENABLED
+        const string hdf5_file = dir_name + "/pump_probe_spectroscopy.h5";
         HDF5MixedPumpProbeWriter writer(
             hdf5_file,
             lattice_size_SU2, spin_dim_SU2, N_atoms_SU2,
             lattice_size_SU3, spin_dim_SU3, N_atoms_SU3,
-            dim1, dim2, dim3,
-            spin_length_SU2, spin_length_SU3,
+            dim1, dim2, dim3, spin_length_SU2, spin_length_SU3,
             pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
             pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
             T_start, T_end, T_step, method,
             tau_start, tau_end, tau_step,
-            E_ground, M_ground_SU2, M_ground_SU3,
-            Temp_start, Temp_end, n_anneal,
-            T_zero_quench, quench_sweeps,
+            E_ground, magnetization_SU2(), magnetization_SU3(),
+            Temp_start, Temp_end, n_anneal, T_zero_quench, quench_sweeps,
             save_spin_trajectories,
             &field_in_SU2, &field_in_SU3,
-            &site_positions_SU2, &site_positions_SU3
-        );
-        
-        // Write reference trajectory
-        writer.write_reference_trajectory(M0_trajectory,
-                                          save_spin_trajectories ? &M0_spin_flat : nullptr);
+            &site_positions_SU2, &site_positions_SU3);
+        writer.write_reference_trajectory(M0, plan.save_spins ? &M0_spins : nullptr);
+#else
+        (void) Temp_start; (void) Temp_end; (void) n_anneal; (void) T_zero_quench; (void) quench_sweeps;
+        cout << "Note: HDF5 support not enabled; trajectories are computed but not written." << endl;
 #endif
 
-        // ----- W2: outer OpenMP parallelism over τ -----
-        // Each thread owns a deep clone of *this. The implicit
-        // copy ctor is sufficient because every member is value-typed
-        // (vector<...>, Eigen::VectorXd, plain doubles). No Lattice-style
-        // shallow ctor here.
+        // One delay point: compute, assemble on the full grid, write.
+        auto finish_delay = [&](size_t j, DelayResult& r) {
+            PumpProbeTrajectory M1 = plan.w1
+                ? synthesize_M1_from_M0(M0, M_ground, plan.taus[j], T_start, T_end, T_step)
+                : std::move(r.M1);
+            PumpProbeTrajectory M01 = assemble_m01(M0, std::move(r.M01), r.k0);
+            vector<double> M01_spins = assemble_m01_spins(M0_spins, std::move(r.M01_spins), r.k0, state_dim);
+            require_grid_length(M1, n_t, "M1");
+            require_grid_length(M01, n_t, "M01");
+#ifdef HDF5_ENABLED
+            writer.write_tau_trajectory(static_cast<int>(j), plan.taus[j], M1, M01,
+                                        plan.save_spins ? &r.M1_spins : nullptr,
+                                        plan.save_spins ? &M01_spins : nullptr);
+#else
+            (void) M01_spins;
+#endif
+        };
+
         int n_outer = 1;
 #ifdef _OPENMP
-        if (outer_omp_threads <= 0) {
-            n_outer = std::max(1, omp_get_max_threads());
-        } else {
-            n_outer = outer_omp_threads;
-        }
-        n_outer = std::min(n_outer, std::max(1, tau_steps));
-        const int saved_max_active = omp_get_max_active_levels();
-        omp_set_max_active_levels(1);
+        n_outer = (outer_omp_threads <= 0) ? std::max(1, omp_get_max_threads()) : outer_omp_threads;
+        n_outer = std::min<int>(n_outer, static_cast<int>(n_tau));
+        if (plan.gpu) n_outer = 1;  // one backend and one device stream for the whole scan
 #else
         (void) outer_omp_threads;
 #endif
 
         if (n_outer <= 1) {
-            double current_tau = tau_start;
-            for (int i = 0; i < tau_steps; ++i) {
-                cout << "\n--- Delay " << (i+1) << "/" << tau_steps << ": tau = " << current_tau << " ---" << endl;
-
-                TrajectoryType M1_traj;
-                vector<double> M1_spin_flat;
-                if (can_reuse_m0) {
-                    M1_traj = synthesize_M1_from_M0(M0_trajectory, M_ground_pair, current_tau,
-                                                    T_start, T_end, T_step);
-                } else {
-                    spins_SU2 = ground_state_SU2;
-                    spins_SU3 = ground_state_SU3;
-                    cout << "  Computing M1 (probe at tau)..." << endl;
-                    vector<vector<double>> M1_spin_states;
-                    M1_traj = single_pulse_drive(field_in_SU2, field_in_SU3, current_tau,
-                                        pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                        pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                        T_start, T_end, T_step, method, use_gpu,
-                                        save_spin_trajectories ? &M1_spin_states : nullptr,
-                                        pulse_window_chunking, abs_tol, rel_tol);
-                    if (save_spin_trajectories && !M1_spin_states.empty()) {
-                        const size_t n_t = M1_spin_states.size();
-                        M1_spin_flat.resize(n_t * state_dim);
-                        for (size_t t = 0; t < n_t; ++t) {
-                            std::copy(M1_spin_states[t].begin(), M1_spin_states[t].end(),
-                                      M1_spin_flat.data() + t * state_dim);
-                        }
-                    }
-                }
-
-                spins_SU2 = ground_state_SU2;
-                spins_SU3 = ground_state_SU3;
-                cout << "  Computing M01 (pump + probe)..." << endl;
-                vector<vector<double>> M01_spin_states;
-                auto M01_traj = double_pulse_drive(field_in_SU2, field_in_SU3, 0.0,
-                                         field_in_SU2, field_in_SU3, current_tau,
-                                         pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                         pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                         T_start, T_end, T_step, method, use_gpu,
-                                         save_spin_trajectories ? &M01_spin_states : nullptr,
-                                         pulse_window_chunking, abs_tol, rel_tol);
-                vector<double> M01_spin_flat;
-                if (save_spin_trajectories && !M01_spin_states.empty()) {
-                    const size_t n_t = M01_spin_states.size();
-                    M01_spin_flat.resize(n_t * state_dim);
-                    for (size_t t = 0; t < n_t; ++t) {
-                        std::copy(M01_spin_states[t].begin(), M01_spin_states[t].end(),
-                                  M01_spin_flat.data() + t * state_dim);
-                    }
-                }
-
-#ifdef HDF5_ENABLED
-                writer.write_tau_trajectory(i, current_tau, M1_traj, M01_traj,
-                                            save_spin_trajectories ? &M1_spin_flat : nullptr,
-                                            save_spin_trajectories ? &M01_spin_flat : nullptr);
-#endif
-                current_tau += tau_step;
+            for (size_t j = 0; j < n_tau; ++j) {
+                cout << "--- Delay " << (j + 1) << "/" << n_tau << ": tau = " << plan.taus[j] << " ---" << endl;
+                DelayResult r;
+                compute_delay(plan, j, x_ground, checkpoint_for(j), r);
+                finish_delay(j, r);
             }
         } else {
 #ifdef _OPENMP
-            cout << "  [W2] Distributing " << tau_steps << " τ points across "
-                 << n_outer << " OpenMP threads..." << endl;
+            // Outer parallelism over delays: every thread drives its own copy
+            // of the lattice (the pulse train is per-object state) with nested
+            // parallelism off; exceptions are carried out of the region.
+            cout << "  Distributing " << n_tau << " delays over " << n_outer << " OpenMP threads" << endl;
+            const int saved_levels = omp_get_max_active_levels();
+            omp_set_max_active_levels(1);
+            std::exception_ptr failure;
+            std::atomic<bool> failed{false};
             #pragma omp parallel num_threads(n_outer)
             {
-                MixedLattice local_lat(*this);
-                local_lat.spins_SU2 = ground_state_SU2;
-                local_lat.spins_SU3 = ground_state_SU3;
-
+                std::unique_ptr<MixedLattice> local;
+                try {
+                    local = std::make_unique<MixedLattice>(*this);
+                } catch (...) {
+                    #pragma omp critical(mixed_pump_probe_failure)
+                    if (!failure) failure = std::current_exception();
+                    failed = true;
+                }
                 #pragma omp for schedule(dynamic, 1)
-                for (int i = 0; i < tau_steps; ++i) {
-                    const double current_tau = tau_start + i * tau_step;
-                    TrajectoryType M1_traj;
-                    vector<double> M1_spin_flat;
-                    if (can_reuse_m0) {
-                        M1_traj = synthesize_M1_from_M0(M0_trajectory, M_ground_pair, current_tau,
-                                                        T_start, T_end, T_step);
-                    } else {
-                        local_lat.spins_SU2 = ground_state_SU2;
-                        local_lat.spins_SU3 = ground_state_SU3;
-                        vector<vector<double>> M1_spin_states;
-                        M1_traj = local_lat.single_pulse_drive(
-                            field_in_SU2, field_in_SU3, current_tau,
-                            pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                            pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                            T_start, T_end, T_step, method, /*use_gpu=*/false,
-                            save_spin_trajectories ? &M1_spin_states : nullptr,
-                            pulse_window_chunking, abs_tol, rel_tol);
-                        if (save_spin_trajectories && !M1_spin_states.empty()) {
-                            const size_t n_t = M1_spin_states.size();
-                            M1_spin_flat.resize(n_t * state_dim);
-                            for (size_t t = 0; t < n_t; ++t) {
-                                std::copy(M1_spin_states[t].begin(), M1_spin_states[t].end(),
-                                          M1_spin_flat.data() + t * state_dim);
-                            }
+                for (long jj = 0; jj < static_cast<long>(n_tau); ++jj) {
+                    if (!local || failed) continue;
+                    const size_t j = static_cast<size_t>(jj);
+                    std::exception_ptr error;
+                    try {
+                        DelayResult r;
+                        local->compute_delay(plan, j, x_ground, checkpoint_for(j), r);
+                        // No exception may leave a critical construct.
+                        #pragma omp critical(mixed_pump_probe_hdf5_write)
+                        {
+                            try { finish_delay(j, r); } catch (...) { error = std::current_exception(); }
                         }
+                    } catch (...) {
+                        error = std::current_exception();
                     }
-
-                    local_lat.spins_SU2 = ground_state_SU2;
-                    local_lat.spins_SU3 = ground_state_SU3;
-                    vector<vector<double>> M01_spin_states;
-                    auto M01_traj = local_lat.double_pulse_drive(
-                        field_in_SU2, field_in_SU3, 0.0,
-                        field_in_SU2, field_in_SU3, current_tau,
-                        pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                        pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                        T_start, T_end, T_step, method, /*use_gpu=*/false,
-                        save_spin_trajectories ? &M01_spin_states : nullptr,
-                        pulse_window_chunking, abs_tol, rel_tol);
-                    vector<double> M01_spin_flat;
-                    if (save_spin_trajectories && !M01_spin_states.empty()) {
-                        const size_t n_t = M01_spin_states.size();
-                        M01_spin_flat.resize(n_t * state_dim);
-                        for (size_t t = 0; t < n_t; ++t) {
-                            std::copy(M01_spin_states[t].begin(), M01_spin_states[t].end(),
-                                      M01_spin_flat.data() + t * state_dim);
-                        }
+                    if (error) {
+                        #pragma omp critical(mixed_pump_probe_failure)
+                        if (!failure) failure = error;
+                        failed = true;
                     }
-
-#ifdef HDF5_ENABLED
-                    #pragma omp critical(mixed_pump_probe_hdf5_write)
-                    {
-                        writer.write_tau_trajectory(i, current_tau, M1_traj, M01_traj,
-                                                    save_spin_trajectories ? &M1_spin_flat : nullptr,
-                                                    save_spin_trajectories ? &M01_spin_flat : nullptr);
-                    }
-#else
-                    (void) M1_traj;
-                    (void) M01_traj;
-#endif
                 }
             }
+            omp_set_max_active_levels(saved_levels);
+            if (failure) std::rethrow_exception(failure);
 #endif
         }
 
-#ifdef _OPENMP
-        omp_set_max_active_levels(saved_max_active);
-#endif
-
 #ifdef HDF5_ENABLED
         writer.close();
-        cout << "\n[Complete] All data written incrementally to: " << hdf5_file << endl;
-#else
-        cout << "Note: HDF5 support not enabled. Rebuild with -DHDF5_ENABLED flag." << endl;
+        cout << "\nAll trajectories written to " << hdf5_file << endl;
 #endif
-        
-        // Restore ground state at end
-        spins_SU2 = ground_state_SU2;
-        spins_SU3 = ground_state_SU3;
-
-        cout << "\n==========================================" << endl;
-        cout << "Pump-Probe Spectroscopy Complete!" << endl;
-        cout << "Output directory: " << dir_name << endl;
-        cout << "Total delay points: " << tau_steps << endl;
-        cout << "==========================================" << endl;
+        cout << "Pump-probe spectroscopy complete (" << n_tau << " delays)." << endl;
     }
+
+namespace {
+
+// Message tags of the MPI scan (fixed: the delay index travels in the payload,
+// so tags never approach MPI_TAG_UB however many delays there are).
+constexpr int kTagResult     = 7101;  // worker -> 0: int64 header {delay, status, k0, msg_len}
+constexpr int kTagM1         = 7102;
+constexpr int kTagM01        = 7103;
+constexpr int kTagM1Spins    = 7104;
+constexpr int kTagM01Spins   = 7105;
+constexpr int kTagError      = 7106;
+constexpr int kTagAssign     = 7110;  // 0 -> worker: int64 delay index (-1 = stop)
+constexpr int kTagCheckpoint = 7111;  // 0 -> worker: M0 state to continue M01 from
+
+// Large buffers go out in chunks whose element count fits an int.
+constexpr size_t kMaxMessageDoubles = size_t(1) << 27;
+
+void send_doubles(const double* p, size_t n, int dest, int tag, MPI_Comm comm) {
+    size_t off = 0;
+    do {
+        const size_t c = std::min(kMaxMessageDoubles, n - off);
+        MPI_Send(p + off, static_cast<int>(c), MPI_DOUBLE, dest, tag, comm);
+        off += c;
+    } while (off < n);
+}
+
+void recv_doubles(double* p, size_t n, int src, int tag, MPI_Comm comm) {
+    size_t off = 0;
+    do {
+        const size_t c = std::min(kMaxMessageDoubles, n - off);
+        MPI_Recv(p + off, static_cast<int>(c), MPI_DOUBLE, src, tag, comm, MPI_STATUS_IGNORE);
+        off += c;
+    } while (off < n);
+}
+
+// Collective error agreement: every rank passes its local error message
+// (empty = success). If any rank failed, every rank throws the message of the
+// lowest failing rank, so no rank is left waiting in a later collective.
+void agree_on_errors(MPI_Comm comm, const std::string& local_error, const char* phase) {
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+    int mine = local_error.empty() ? INT_MAX : rank;
+    int first = INT_MAX;
+    MPI_Allreduce(&mine, &first, 1, MPI_INT, MPI_MIN, comm);
+    if (first == INT_MAX) return;
+    int len = (rank == first) ? static_cast<int>(local_error.size()) : 0;
+    MPI_Bcast(&len, 1, MPI_INT, first, comm);
+    std::string msg = (rank == first) ? local_error : std::string(static_cast<size_t>(len), ' ');
+    MPI_Bcast(msg.data(), len, MPI_CHAR, first, comm);
+    throw std::runtime_error(std::string(phase) + " failed on rank " + std::to_string(first) + ": " + msg);
+}
+
+}  // namespace
 
 // ---- MixedLattice::pump_probe_spectroscopy_mpi ----
     void MixedLattice::pump_probe_spectroscopy_mpi(const vector<SpinVector>& field_in_SU2,
@@ -1767,861 +1651,262 @@ inline void trilinear_kernel_dyn(const double* __restrict T,
                                      bool pulse_window_chunking,
                                      double abs_tol, double rel_tol,
                                      const vector<SpinVector>& field_in_SU2_B,
-                                     const vector<SpinVector>& field_in_SU3_B) {
-        
-        int rank, mpi_size;
-        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-        MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
-        
-        std::filesystem::create_directories(dir_name);
+                                     const vector<SpinVector>& field_in_SU3_B,
+                                     bool reuse_m0_for_m01) {
+        int mpi_on = 0;
+        MPI_Initialized(&mpi_on);
+        int rank = 0, size = 1;
+        if (mpi_on) {
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            MPI_Comm_size(MPI_COMM_WORLD, &size);
+        }
+        if (size <= 1) {
+            pump_probe_spectroscopy(field_in_SU2, field_in_SU3,
+                                    pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                                    pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+                                    tau_start, tau_end, tau_step, T_start, T_end, T_step,
+                                    Temp_start, Temp_end, n_anneal, T_zero_quench, quench_sweeps,
+                                    dir_name, method, use_gpu, save_spin_trajectories,
+                                    reuse_m0_for_m1, stationarity_tol, /*outer_omp_threads=*/0,
+                                    pulse_window_chunking, abs_tol, rel_tol,
+                                    field_in_SU2_B, field_in_SU3_B, reuse_m0_for_m01);
+            return;
+        }
+        (void) pulse_window_chunking;
+        const MPI_Comm comm = MPI_COMM_WORLD;
 
-        // Distinct SU(2) direction for the 2nd pulse (probe @ tau). When the
-        // caller leaves field_in_SU2_B empty we fall back to field_in_SU2 so
-        // the legacy "same direction for both pulses" behaviour is preserved.
-        const bool distinct_pulse_dirs = !field_in_SU2_B.empty();
-        const vector<SpinVector>& field_in_SU2_probe =
-            distinct_pulse_dirs ? field_in_SU2_B : field_in_SU2;
-        // Distinct SU(3) direction for the 2nd pulse (probe @ tau). Same
-        // fallback logic. Allows e.g. an SU3 (E12) kick only at t=0 and a
-        // pure SU2 (qAFM) kick at tau, isolating omega_tau = qAFM.
-        const bool distinct_pulse_dirs_su3 = !field_in_SU3_B.empty();
-        const vector<SpinVector>& field_in_SU3_probe =
-            distinct_pulse_dirs_su3 ? field_in_SU3_B : field_in_SU3;
-        if (rank == 0 && distinct_pulse_dirs) {
-            cout << "  [2DCS] Distinct SU(2) pulse directions: pump @ t=0 uses field_in_SU2, "
-                 << "probe @ tau uses field_in_SU2_B (selects cross-polarization leg)." << endl;
+        // ---- Phase 1: validate on every rank (identical inputs give identical
+        // verdicts; agree_on_errors makes that robust) and open the output file.
+        std::unique_ptr<SpectroscopyPlan> plan;
+        std::string error;
+        try {
+            plan = std::make_unique<SpectroscopyPlan>(plan_spectroscopy(
+                field_in_SU2, field_in_SU3, field_in_SU2_B, field_in_SU3_B,
+                pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2, pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+                tau_start, tau_end, tau_step, T_start, T_end, T_step, method, use_gpu, save_spin_trajectories,
+                reuse_m0_for_m1, stationarity_tol, reuse_m0_for_m01, abs_tol, rel_tol));
+        } catch (const std::exception& e) {
+            error = e.what();
         }
-        if (rank == 0 && distinct_pulse_dirs_su3) {
-            cout << "  [2DCS] Distinct SU(3) pulse directions: pump @ t=0 uses field_in_SU3, "
-                 << "probe @ tau uses field_in_SU3_B." << endl;
-        }
-        
-        int tau_steps = static_cast<int>(std::abs((tau_end - tau_start) / tau_step)) + 1;
-        const bool scheduler_writer_only = (mpi_size > 1);
-        const int worker_count = scheduler_writer_only ? (mpi_size - 1) : 1;
-        const size_t state_dim = lattice_size_SU2 * spin_dim_SU2 + lattice_size_SU3 * spin_dim_SU3;
-        
-        if (rank == 0) {
-            cout << "\n==========================================" << endl;
-            cout << "Mixed Lattice Pump-Probe (MPI Parallel)" << endl;
-            cout << "==========================================" << endl;
-            cout << "MPI ranks: " << mpi_size << endl;
-            cout << "SU(2) Pulse: amp=" << pulse_amp_SU2 << ", width=" << pulse_width_SU2 
-                 << ", freq=" << pulse_freq_SU2 << endl;
-            cout << "SU(3) Pulse: amp=" << pulse_amp_SU3 << ", width=" << pulse_width_SU3 
-                 << ", freq=" << pulse_freq_SU3 << endl;
-            cout << "Delay scan: " << tau_start << " → " << tau_end << " (step: " << tau_step << ")" << endl;
-            cout << "Total delay points: " << tau_steps << endl;
-            if (scheduler_writer_only) {
-                cout << "Rank 0 role: scheduler/writer only" << endl;
-                cout << "Tau points per worker rank: ~" << (tau_steps + worker_count - 1) / worker_count << endl;
-            } else {
-                cout << "Tau points per rank: ~" << (tau_steps + mpi_size - 1) / mpi_size << endl;
-            }
-            if (use_gpu) {
-                cout << "GPU acceleration: ENABLED (each rank uses assigned GPU)" << endl;
-            }
-            if (save_spin_trajectories) {
-                cout << "Spin trajectory saving: ENABLED (state_dim=" << state_dim << ")" << endl;
-                cout << "  WARNING: This will significantly increase memory usage and file size." << endl;
-            }
-        }
-        
-        // Ground state info
-        if (rank == 0) {
-            cout << "\n[1/4] Using current configuration as ground state..." << endl;
-        }
-        double E_ground = energy_density();
-        double E_ground_SU2 = total_energy_SU2();
-        double E_ground_SU3 = total_energy_SU3();
-        SpinVector M_ground_SU2 = magnetization_SU2();
-        SpinVector M_ground_SU3 = magnetization_SU3();
-        if (rank == 0) {
-            cout << "  Ground state: E/N = " << E_ground << endl;
-            cout << "    Total Energy:     " << total_energy() << endl;
-            cout << "    SU2 Energy:       " << E_ground_SU2 << " (E/N_SU2 = " << E_ground_SU2 / lattice_size_SU2 << ")" << endl;
-            cout << "    SU3 Energy:       " << E_ground_SU3 << " (E/N_SU3 = " << E_ground_SU3 / lattice_size_SU3 << ")" << endl;
-            cout << "    |M_SU2| = " << M_ground_SU2.norm() << endl;
-            cout << "    |M_SU3| = " << M_ground_SU3.norm() << endl;
-        }
-        
-        // Save initial configuration (rank 0 only)
-        if (rank == 0) {
-            save_positions_to_dir(dir_name);
-            save_spin_config_to_dir(dir_name, "initial_spins");
-            save_energy_to_dir(dir_name, "energy_initial");
-        }
-        
-        // Backup ground state
-        SpinConfigSU2 ground_state_SU2 = spins_SU2;
-        SpinConfigSU3 ground_state_SU3 = spins_SU3;
-        
-        // Reference trajectory M0
-        if (rank == 0) {
-            cout << "\n[2/4] Running reference single-pulse dynamics (M0)..." << endl;
-        }
-        
-        typedef vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> TrajectoryType;
-        
-        TrajectoryType M0_trajectory;
-        vector<double> M0_spin_flat;  // flat (n_t * state_dim) spin state for M0, rank 0 only
-        if (rank == 0) {
-            vector<vector<double>> M0_spin_states;
-            M0_trajectory = single_pulse_drive(field_in_SU2, field_in_SU3, 0.0,
-                                               pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                               pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                               T_start, T_end, T_step, method, use_gpu,
-                                               save_spin_trajectories ? &M0_spin_states : nullptr,
-                                               pulse_window_chunking, abs_tol, rel_tol);
-            if (save_spin_trajectories && !M0_spin_states.empty()) {
-                size_t n_t = M0_spin_states.size();
-                M0_spin_flat.resize(n_t * state_dim);
-                for (size_t t = 0; t < n_t; ++t) {
-                    std::copy(M0_spin_states[t].begin(), M0_spin_states[t].end(),
-                              M0_spin_flat.data() + t * state_dim);
-                }
-            }
-            // Note: M0_spin_states[0] (if save_spin_traj) holds flat (n_t * state_dim) buffer
-            // It is written to HDF5 after the file is opened below
-        }
-        
-        // Restore ground state
-        spins_SU2 = ground_state_SU2;
-        spins_SU3 = ground_state_SU3;
+        agree_on_errors(comm, error, "pump_probe_spectroscopy_mpi: input validation");
+        // Rank 0's W1 verdict is authoritative (the residual is a floating-point
+        // reduction over a state the runner broadcast).
+        int w1 = plan->w1 ? 1 : 0;
+        MPI_Bcast(&w1, 1, MPI_INT, 0, comm);
+        plan->w1 = (w1 != 0);
 
-        // ----- W1: rank-0 stationarity check + decision broadcast -----
-        // Mirror of Lattice::pump_probe_spectroscopy_mpi: every worker
-        // rank gets the same can_reuse_m0 verdict so they all branch
-        // consistently when synthesising M1.
-        pair<array<SpinVector, 3>, array<SpinVector, 3>> M_ground_pair;
-        M_ground_pair.first  = { SpinVector::Zero(spin_dim_SU2),
-                                 SpinVector::Zero(spin_dim_SU2),
-                                 SpinVector::Zero(spin_dim_SU2) };
-        M_ground_pair.second = { SpinVector::Zero(spin_dim_SU3),
-                                 SpinVector::Zero(spin_dim_SU3),
-                                 SpinVector::Zero(spin_dim_SU3) };
-        {
-            ODEState gs_state = spins_to_state();
-            double M_SU2_local_arr[8] = {0};
-            double M_SU2_antiferro_arr[8] = {0};
-            double M_SU2_global_arr[8] = {0};
-            compute_sublattice_magnetizations_from_flat(gs_state.data(), 0,
-                lattice_size_SU2, spin_dim_SU2, M_SU2_local_arr, M_SU2_antiferro_arr);
-            compute_magnetization_global_SU2_from_flat(gs_state.data(), M_SU2_global_arr);
-            compute_magnetization_staggered_SU2_from_flat(gs_state.data(), M_SU2_antiferro_arr);
-
-            double M_SU3_local_arr[8] = {0};
-            double M_SU3_antiferro_arr[8] = {0};
-            double M_SU3_global_arr[8] = {0};
-            compute_sublattice_magnetizations_from_flat(gs_state.data(), lattice_size_SU2 * spin_dim_SU2,
-                lattice_size_SU3, spin_dim_SU3, M_SU3_local_arr, M_SU3_antiferro_arr);
-            compute_magnetization_global_SU3_from_flat(gs_state.data(), M_SU3_global_arr);
-
-            M_ground_pair.first = {
-                Eigen::Map<Eigen::VectorXd>(M_SU2_antiferro_arr, spin_dim_SU2),
-                Eigen::Map<Eigen::VectorXd>(M_SU2_local_arr, spin_dim_SU2) / double(lattice_size_SU2),
-                Eigen::Map<Eigen::VectorXd>(M_SU2_global_arr, spin_dim_SU2)
-            };
-            M_ground_pair.second = {
-                Eigen::Map<Eigen::VectorXd>(M_SU3_antiferro_arr, spin_dim_SU3) / double(lattice_size_SU3),
-                Eigen::Map<Eigen::VectorXd>(M_SU3_local_arr, spin_dim_SU3) / double(lattice_size_SU3),
-                Eigen::Map<Eigen::VectorXd>(M_SU3_global_arr, spin_dim_SU3)
-            };
-        }
-
-        int can_reuse_m0_flag = 0;
-        // W1 synthesises M1(τ) magnetisation triples by shifting M0(t)
-        // in time. The per-spin state is *not* reconstructible from
-        // those triples, so when the user requested
-        // save_spin_trajectories we must integrate every τ from
-        // scratch. Failing to do so caused mismatched MPI Send/Recv
-        // sizes for the M1 spin buffer (workers send 0 bytes,
-        // rank 0 receives uninitialised memory and writes garbage
-        // into HDF5). See Ingredient XVII in optimization_notes.tex.
-        if (rank == 0 && reuse_m0_for_m1 && (distinct_pulse_dirs || distinct_pulse_dirs_su3)) {
-            cout << "  [W1] Disabled because distinct SU(2)/SU(3) pulse directions are in use "
-                 << "(M1 probe @ tau is NOT a time-shift of the M0 pump)." << endl;
-        } else if (rank == 0 && reuse_m0_for_m1 && save_spin_trajectories) {
-            cout << "  [W1] Disabled because save_spin_trajectories=true (synthesis"
-                 << " produces magnetisation triples only, not per-site states)." << endl;
-        } else if (rank == 0 && reuse_m0_for_m1 && !use_gpu) {
-            const double max_dS = max_dSdt_norm_no_drive();
-            cout << "  [W1 guard] max |dS/dt|_inf at ground state = "
-                 << max_dS << " (tol = " << stationarity_tol << ")" << endl;
-            if (max_dS <= stationarity_tol) {
-                can_reuse_m0_flag = 1;
-                cout << "  [W1] Ground state is stationary — synthesising M1(τ) from M0 by time-shift." << endl;
-            } else {
-                cout << "  [W1] Ground state NOT stationary — falling back to fresh M1 integration each τ." << endl;
-            }
-        } else if (rank == 0 && reuse_m0_for_m1 && use_gpu) {
-            cout << "  [W1] Skipping (GPU path: stationarity check is host-only)." << endl;
-        }
-        MPI_Bcast(&can_reuse_m0_flag, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        const bool can_reuse_m0 = (can_reuse_m0_flag != 0);
-
-        // Broadcast M0 trajectory to all worker ranks so they can synthesise M1.
-        unsigned long long m0_npts_ull = 0;
-        if (can_reuse_m0 && rank == 0) {
-            m0_npts_ull = static_cast<unsigned long long>(M0_trajectory.size());
-        }
-        if (can_reuse_m0) {
-            MPI_Bcast(&m0_npts_ull, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-            const size_t m0_npts = static_cast<size_t>(m0_npts_ull);
-            const size_t per_pt = 1 + 3 * spin_dim_SU2 + 3 * spin_dim_SU3;
-            vector<double> m0_buf(m0_npts * per_pt);
-            if (rank == 0) {
-                for (size_t i = 0; i < m0_npts; ++i) {
-                    const auto& [t, mag] = M0_trajectory[i];
-                    m0_buf[i * per_pt] = t;
-                    for (int m = 0; m < 3; ++m) {
-                        for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                            m0_buf[i * per_pt + 1 + m * spin_dim_SU2 + d] = mag.first[m](d);
-                        }
-                    }
-                    const size_t su3_off = 1 + 3 * spin_dim_SU2;
-                    for (int m = 0; m < 3; ++m) {
-                        for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                            m0_buf[i * per_pt + su3_off + m * spin_dim_SU3 + d] = mag.second[m](d);
-                        }
-                    }
-                }
-            }
-            MPI_Bcast(m0_buf.data(), static_cast<int>(m0_buf.size()), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            if (rank != 0) {
-                M0_trajectory.assign(m0_npts, {0.0, {{SpinVector::Zero(spin_dim_SU2),
-                                                      SpinVector::Zero(spin_dim_SU2),
-                                                      SpinVector::Zero(spin_dim_SU2)},
-                                                     {SpinVector::Zero(spin_dim_SU3),
-                                                      SpinVector::Zero(spin_dim_SU3),
-                                                      SpinVector::Zero(spin_dim_SU3)}}});
-                for (size_t i = 0; i < m0_npts; ++i) {
-                    M0_trajectory[i].first = m0_buf[i * per_pt];
-                    for (int m = 0; m < 3; ++m) {
-                        for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                            M0_trajectory[i].second.first[m](d) =
-                                m0_buf[i * per_pt + 1 + m * spin_dim_SU2 + d];
-                        }
-                    }
-                    const size_t su3_off = 1 + 3 * spin_dim_SU2;
-                    for (int m = 0; m < 3; ++m) {
-                        for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                            M0_trajectory[i].second.second[m](d) =
-                                m0_buf[i * per_pt + su3_off + m * spin_dim_SU3 + d];
-                        }
-                    }
-                }
-            }
-        }
-
-        // Distribute tau values
-        if (rank == 0) {
-            cout << "\n[3/4] Distributing tau delays across " << mpi_size << " ranks..." << endl;
-        }
-        
-        vector<int> my_tau_indices;
-        vector<double> my_tau_values;
-        if (!scheduler_writer_only) {
-            for (int i = rank; i < tau_steps; i += mpi_size) {
-                my_tau_indices.push_back(i);
-                my_tau_values.push_back(tau_start + i * tau_step);
-            }
-        } else if (rank > 0) {
-            for (int i = rank - 1; i < tau_steps; i += worker_count) {
-                my_tau_indices.push_back(i);
-                my_tau_values.push_back(tau_start + i * tau_step);
-            }
-        }
-        
-        // Local trajectories
-        vector<TrajectoryType> local_M1_trajectories;
-        vector<TrajectoryType> local_M01_trajectories;
-        // Local spin state flat buffers (n_t * state_dim each), only populated if save_spin_trajectories
-        vector<vector<double>> local_spin_flat_M1;
-        vector<vector<double>> local_spin_flat_M01;
-        
-        local_M1_trajectories.reserve(my_tau_indices.size());
-        local_M01_trajectories.reserve(my_tau_indices.size());
-        if (save_spin_trajectories) {
-            local_spin_flat_M1.reserve(my_tau_indices.size());
-            local_spin_flat_M01.reserve(my_tau_indices.size());
-        }
-        
-        for (size_t idx = 0; idx < my_tau_indices.size(); ++idx) {
-            double current_tau = my_tau_values[idx];
-            int global_idx = my_tau_indices[idx];
-            
-            cout << "[Rank " << rank << "] Computing tau[" << global_idx << "] = " << current_tau 
-                 << " (" << (idx+1) << "/" << my_tau_indices.size() << ")" << endl;
-            
-            // Restore ground state
-            spins_SU2 = ground_state_SU2;
-            spins_SU3 = ground_state_SU3;
-            
-            // M1: synthesise from M0 if W1 is enabled, otherwise integrate.
-            // Note: W1 is *forced off* upstream when
-            // save_spin_trajectories=true (synthesis only produces
-            // magnetisation triples, not per-site states), so the
-            // synthesis branch is taken only when the spin buffer
-            // would not be sent over MPI. See Ingredient XVII.
-            {
-                vector<vector<double>> M1_spin_states;
-                TrajectoryType M1_traj;
-                if (can_reuse_m0) {
-                    M1_traj = synthesize_M1_from_M0(M0_trajectory, M_ground_pair, current_tau,
-                                                    T_start, T_end, T_step);
-                } else {
-                    M1_traj = single_pulse_drive(field_in_SU2_probe, field_in_SU3_probe, current_tau,
-                                        pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                        pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                        T_start, T_end, T_step, method, use_gpu,
-                                        save_spin_trajectories ? &M1_spin_states : nullptr,
-                                        pulse_window_chunking, abs_tol, rel_tol);
-                }
-                local_M1_trajectories.push_back(M1_traj);
-                if (save_spin_trajectories && !M1_spin_states.empty()) {
-                    size_t n_t = M1_spin_states.size();
-                    vector<double> flat(n_t * state_dim);
-                    for (size_t t = 0; t < n_t; ++t)
-                        std::copy(M1_spin_states[t].begin(), M1_spin_states[t].end(), flat.data() + t * state_dim);
-                    local_spin_flat_M1.push_back(std::move(flat));
-                } else if (save_spin_trajectories) {
-                    // Defensive: if the integrator returned no samples
-                    // we still need a placeholder so the per-τ index
-                    // stays aligned. Pad to the per-τ flat size
-                    // (M1_traj.size() * state_dim) with NaNs so any
-                    // downstream consumer immediately sees the gap
-                    // instead of silently consuming uninitialised
-                    // memory.
-                    local_spin_flat_M1.emplace_back(M1_traj.size() * state_dim,
-                                                    std::numeric_limits<double>::quiet_NaN());
-                }
-            }
-            
-            // Restore ground state
-            spins_SU2 = ground_state_SU2;
-            spins_SU3 = ground_state_SU3;
-            
-            // M01: Pump at 0 + Probe at tau
-            {
-                vector<vector<double>> M01_spin_states;
-                auto M01_traj = double_pulse_drive(field_in_SU2, field_in_SU3, 0.0,
-                                         field_in_SU2_probe, field_in_SU3_probe, current_tau,
-                                         pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                         pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                         T_start, T_end, T_step, method, use_gpu,
-                                         save_spin_trajectories ? &M01_spin_states : nullptr,
-                                         pulse_window_chunking, abs_tol, rel_tol);
-                local_M01_trajectories.push_back(M01_traj);
-                if (save_spin_trajectories && !M01_spin_states.empty()) {
-                    size_t n_t = M01_spin_states.size();
-                    vector<double> flat(n_t * state_dim);
-                    for (size_t t = 0; t < n_t; ++t)
-                        std::copy(M01_spin_states[t].begin(), M01_spin_states[t].end(), flat.data() + t * state_dim);
-                    local_spin_flat_M01.push_back(std::move(flat));
-                } else if (save_spin_trajectories) {
-                    // Defensive (see M1 branch above): pad to full size
-                    // with NaNs so MPI Send/Recv counts always match.
-                    local_spin_flat_M01.emplace_back(M01_traj.size() * state_dim,
-                                                     std::numeric_limits<double>::quiet_NaN());
-                }
-            }
-        }
-        
-        MPI_Barrier(MPI_COMM_WORLD);
-        
-        if (rank == 0) {
-            cout << "\n[4/4] Gathering results from all ranks..." << endl;
-        }
-        
-        // Compute sizes for serialization
-        unsigned long long time_points_ull = 0;
-        if (rank == 0) {
-            time_points_ull = static_cast<unsigned long long>(M0_trajectory.size());
-        } else if (!local_M1_trajectories.empty()) {
-            time_points_ull = static_cast<unsigned long long>(local_M1_trajectories.front().size());
-        }
-        MPI_Bcast(&time_points_ull, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
-        size_t time_points = static_cast<size_t>(time_points_ull);
-        // Data per point: time + 3 SU2 vectors + 3 SU3 vectors
-        size_t data_per_point = 1 + 3 * spin_dim_SU2 + 3 * spin_dim_SU3;
-        size_t traj_size = time_points * data_per_point;
-        // Size of flat spin state per trajectory (when save_spin_trajectories)
-        size_t state_traj_size_spins = time_points * state_dim;
-        
-        // Compute tau values (needed for HDF5)
-        vector<double> tau_values(tau_steps);
-        for (int i = 0; i < tau_steps; ++i) {
-            tau_values[i] = tau_start + i * tau_step;
-        }
+        const size_t n_tau = plan->taus.size();
+        const size_t n_t = plan->grid.n;
+        const size_t state_dim = spin_state_size();
+        const size_t ode_dim = ode_state_size();
+        const SpinConfigSU2 ground_SU2 = spins_SU2;
+        const SpinConfigSU3 ground_SU3 = spins_SU3;
+        struct SpinRestore {
+            MixedLattice* lat; const SpinConfigSU2* s2; const SpinConfigSU3* s3;
+            ~SpinRestore() { lat->spins_SU2 = *s2; lat->spins_SU3 = *s3; }
+        } restore{this, &ground_SU2, &ground_SU3};
+        const ODEState x_ground = spins_to_state();
+        const Observables M_ground = observe(x_ground.data());
 
 #ifdef HDF5_ENABLED
-        // ===== STREAMING APPROACH: Write to HDF5 as we receive data =====
-        // This avoids storing all trajectories in memory at once
-        
-        // Rank 0 opens HDF5 file and prepares for streaming writes
-        H5::H5File* file_ptr = nullptr;
-        H5::Group metadata_group, reference_group, tau_scan_group;
-        
-        if (rank == 0) {
-            string hdf5_file = dir_name + "/pump_probe_spectroscopy.h5";
-            cout << "\nWriting data to HDF5 file (streaming): " << hdf5_file << endl;
-            
-            try {
-                file_ptr = new H5::H5File(hdf5_file, H5F_ACC_TRUNC);
-                
-                // Create groups
-                metadata_group = file_ptr->createGroup("/metadata");
-                reference_group = file_ptr->createGroup("/reference");
-                tau_scan_group = file_ptr->createGroup("/tau_scan");
-                
-                // Write metadata (simplified - essential params only)
-                H5::DataSpace attr_space(H5S_SCALAR);
-                {
-                    auto write_attr = [&](const char* name, double val) {
-                        H5::Attribute attr = metadata_group.createAttribute(name, H5::PredType::NATIVE_DOUBLE, attr_space);
-                        attr.write(H5::PredType::NATIVE_DOUBLE, &val);
-                    };
-                    auto write_attr_int = [&](const char* name, size_t val) {
-                        H5::Attribute attr = metadata_group.createAttribute(name, H5::PredType::NATIVE_HSIZE, attr_space);
-                        attr.write(H5::PredType::NATIVE_HSIZE, &val);
-                    };
-                    
-                    write_attr_int("lattice_size_SU2", lattice_size_SU2);
-                    write_attr_int("lattice_size_SU3", lattice_size_SU3);
-                    write_attr_int("spin_dim_SU2", spin_dim_SU2);
-                    write_attr_int("spin_dim_SU3", spin_dim_SU3);
-                    write_attr_int("N_atoms_SU2", N_atoms_SU2);
-                    write_attr_int("N_atoms_SU3", N_atoms_SU3);
-                    write_attr("pulse_amp_SU2", pulse_amp_SU2);
-                    write_attr("pulse_width_SU2", pulse_width_SU2);
-                    write_attr("pulse_freq_SU2", pulse_freq_SU2);
-                    write_attr("pulse_amp_SU3", pulse_amp_SU3);
-                    write_attr("pulse_width_SU3", pulse_width_SU3);
-                    write_attr("pulse_freq_SU3", pulse_freq_SU3);
-                    write_attr("T_start", T_start);
-                    write_attr("T_end", T_end);
-                    write_attr("T_step", T_step);
-                    write_attr("tau_start", tau_start);
-                    write_attr("tau_end", tau_end);
-                    write_attr("tau_step", tau_step);
-                    write_attr_int("tau_steps", static_cast<size_t>(tau_steps));
-                    write_attr("ground_state_energy", E_ground);
-                    write_attr_int("save_spin_trajectories", save_spin_trajectories ? 1u : 0u);
-                    write_attr_int("state_dim_SU2", lattice_size_SU2 * spin_dim_SU2);
-                    write_attr_int("state_dim_SU3", lattice_size_SU3 * spin_dim_SU3);
-                    write_attr_int("state_dim_total", state_dim);
-                }
-                
-                // Write tau values array
-                hsize_t tau_dims[1] = {static_cast<hsize_t>(tau_steps)};
-                H5::DataSpace tau_space(1, tau_dims);
-                H5::DataSet tau_dataset = tau_scan_group.createDataSet("tau_values", H5::PredType::NATIVE_DOUBLE, tau_space);
-                tau_dataset.write(tau_values.data(), H5::PredType::NATIVE_DOUBLE);
-                
-                // Write reference trajectory M0
-                hsize_t time_dims[1] = {time_points};
-                H5::DataSpace time_space(1, time_dims);
-                
-                vector<double> times(time_points);
-                for (size_t i = 0; i < time_points; ++i) times[i] = M0_trajectory[i].first;
-                H5::DataSet time_ds = reference_group.createDataSet("times", H5::PredType::NATIVE_DOUBLE, time_space);
-                time_ds.write(times.data(), H5::PredType::NATIVE_DOUBLE);
-                
-                // Write M0 magnetization data (SU2 and SU3)
-                auto write_mag_dataset = [&](H5::Group& grp, const char* name, size_t sdim, int mag_idx, bool is_su2) {
-                    hsize_t dims[2] = {time_points, sdim};
-                    H5::DataSpace dspace(2, dims);
-                    vector<double> data(time_points * sdim);
-                    for (size_t t = 0; t < time_points; ++t) {
-                        const SpinVector& mag = is_su2 ? M0_trajectory[t].second.first[mag_idx] 
-                                                       : M0_trajectory[t].second.second[mag_idx];
-                        for (size_t d = 0; d < sdim; ++d) {
-                            data[t * sdim + d] = mag(d);
-                        }
-                    }
-                    H5::DataSet ds = grp.createDataSet(name, H5::PredType::NATIVE_DOUBLE, dspace);
-                    ds.write(data.data(), H5::PredType::NATIVE_DOUBLE);
-                };
-                
-                write_mag_dataset(reference_group, "M_antiferro_SU2", spin_dim_SU2, 0, true);
-                write_mag_dataset(reference_group, "M_local_SU2", spin_dim_SU2, 1, true);
-                write_mag_dataset(reference_group, "M_global_SU2", spin_dim_SU2, 2, true);
-                write_mag_dataset(reference_group, "M_antiferro_SU3", spin_dim_SU3, 0, false);
-                write_mag_dataset(reference_group, "M_local_SU3", spin_dim_SU3, 1, false);
-                write_mag_dataset(reference_group, "M_global_SU3", spin_dim_SU3, 2, false);
-                
-                // Write M0 spin state if enabled
-                if (save_spin_trajectories && !M0_spin_flat.empty()) {
-                    hsize_t n_t = static_cast<hsize_t>(time_points);
-                    hsize_t sd = static_cast<hsize_t>(state_dim);
-                    hsize_t dims[2] = {n_t, sd};
-                    hsize_t chunk[2] = {std::min((hsize_t)128, n_t), sd};
-                    H5::DSetCreatPropList plist;
-                    plist.setChunk(2, chunk);
-                    plist.setDeflate(4);
-                    H5::DataSpace dsp(2, dims);
-                    H5::DataSet ds = reference_group.createDataSet("M0_spin_state",
-                                        H5::PredType::NATIVE_DOUBLE, dsp, plist);
-                    ds.write(M0_spin_flat.data(), H5::PredType::NATIVE_DOUBLE);
-                }
-                
-                cout << "  Reference trajectory (M0) written." << endl;
-                
-            } catch (H5::Exception& e) {
-                std::cerr << "HDF5 Error opening file: " << e.getDetailMsg() << endl;
-                if (file_ptr) delete file_ptr;
-                file_ptr = nullptr;
-            }
-        }
-        
-        // Helper lambda to write a trajectory to HDF5 (rank 0 only)
-        auto write_tau_to_hdf5 = [&](int tau_idx, const TrajectoryType& M1_traj, const TrajectoryType& M01_traj,
-                                     const vector<double>* spin_M1_flat = nullptr,
-                                     const vector<double>* spin_M01_flat = nullptr) {
-            if (!file_ptr) return;
-            
-            std::string grp_name = "/tau_scan/tau_" + std::to_string(tau_idx);
-            H5::Group tau_grp = file_ptr->createGroup(grp_name);
-            
-            // Write tau value as attribute
-            H5::DataSpace attr_space(H5S_SCALAR);
-            double tau_val = tau_values[tau_idx];
-            H5::Attribute tau_attr = tau_grp.createAttribute("tau_value", H5::PredType::NATIVE_DOUBLE, attr_space);
-            tau_attr.write(H5::PredType::NATIVE_DOUBLE, &tau_val);
-            
-            size_t n_times = M1_traj.size();
-            
-            auto write_mag = [&](const char* name, const TrajectoryType& traj, size_t sdim, int mag_idx, bool is_su2) {
-                hsize_t dims[2] = {n_times, sdim};
-                H5::DataSpace dspace(2, dims);
-                vector<double> data(n_times * sdim);
-                for (size_t t = 0; t < n_times; ++t) {
-                    const SpinVector& mag = is_su2 ? traj[t].second.first[mag_idx] 
-                                                   : traj[t].second.second[mag_idx];
-                    for (size_t d = 0; d < sdim; ++d) {
-                        data[t * sdim + d] = mag(d);
-                    }
-                }
-                H5::DataSet ds = tau_grp.createDataSet(name, H5::PredType::NATIVE_DOUBLE, dspace);
-                ds.write(data.data(), H5::PredType::NATIVE_DOUBLE);
-            };
-            
-            write_mag("M1_antiferro_SU2", M1_traj, spin_dim_SU2, 0, true);
-            write_mag("M1_local_SU2", M1_traj, spin_dim_SU2, 1, true);
-            write_mag("M1_global_SU2", M1_traj, spin_dim_SU2, 2, true);
-            write_mag("M1_antiferro_SU3", M1_traj, spin_dim_SU3, 0, false);
-            write_mag("M1_local_SU3", M1_traj, spin_dim_SU3, 1, false);
-            write_mag("M1_global_SU3", M1_traj, spin_dim_SU3, 2, false);
-            
-            write_mag("M01_antiferro_SU2", M01_traj, spin_dim_SU2, 0, true);
-            write_mag("M01_local_SU2", M01_traj, spin_dim_SU2, 1, true);
-            write_mag("M01_global_SU2", M01_traj, spin_dim_SU2, 2, true);
-            write_mag("M01_antiferro_SU3", M01_traj, spin_dim_SU3, 0, false);
-            write_mag("M01_local_SU3", M01_traj, spin_dim_SU3, 1, false);
-            write_mag("M01_global_SU3", M01_traj, spin_dim_SU3, 2, false);
-            
-            // Write full spin state trajectories with gzip compression if provided
-            auto write_spin_state = [&](const char* name, const vector<double>* flat_buf) {
-                if (flat_buf == nullptr || flat_buf->empty()) return;
-                hsize_t n_t = static_cast<hsize_t>(n_times);
-                hsize_t sd = static_cast<hsize_t>(state_dim);
-                hsize_t dims[2] = {n_t, sd};
-                hsize_t chunk[2] = {std::min((hsize_t)128, n_t), sd};
-                H5::DSetCreatPropList plist;
-                plist.setChunk(2, chunk);
-                plist.setDeflate(4);
-                H5::DataSpace dsp(2, dims);
-                H5::DataSet ds = tau_grp.createDataSet(name, H5::PredType::NATIVE_DOUBLE, dsp, plist);
-                ds.write(flat_buf->data(), H5::PredType::NATIVE_DOUBLE);
-            };
-            write_spin_state("M1_spin_state", spin_M1_flat);
-            write_spin_state("M01_spin_state", spin_M01_flat);
-            
-            tau_grp.close();
-        };
-        
-        // Helper lambda to deserialize buffer to trajectory
-        auto deserialize_trajectory = [&](const vector<double>& buffer) -> TrajectoryType {
-            TrajectoryType traj(time_points);
-            for (size_t t = 0; t < time_points; ++t) {
-                size_t offset = t * data_per_point;
-                traj[t].first = buffer[offset];
-                // SU2 magnetizations
-                for (int m = 0; m < 3; ++m) {
-                    traj[t].second.first[m] = SpinVector::Zero(spin_dim_SU2);
-                    for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                        traj[t].second.first[m](d) = buffer[offset + 1 + m * spin_dim_SU2 + d];
-                    }
-                }
-                // SU3 magnetizations
-                size_t su3_offset = offset + 1 + 3 * spin_dim_SU2;
-                for (int m = 0; m < 3; ++m) {
-                    traj[t].second.second[m] = SpinVector::Zero(spin_dim_SU3);
-                    for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                        traj[t].second.second[m](d) = buffer[su3_offset + m * spin_dim_SU3 + d];
-                    }
-                }
-            }
-            return traj;
-        };
-        
-        // Helper: resize a trajectory to exactly `time_points` so every
-        // tau group in the HDF5 file has the same dataset shape (analysis
-        // tools assume a regular (n_tau, n_t, ...) grid).  Padding uses
-        // zeros for the magnetisation entries and extrapolates the time
-        // axis at uniform `T_step` so the FFT grid stays regular.
-        auto pad_to_time_points = [&](TrajectoryType& traj) {
-            if (traj.size() == time_points) return;
-            if (traj.size() > time_points) {
-                traj.resize(time_points);
-                return;
-            }
-            const size_t old_n = traj.size();
-            const double t_last = old_n > 0 ? traj.back().first : T_start;
-            traj.resize(time_points);
-            for (size_t t = old_n; t < time_points; ++t) {
-                traj[t].first = t_last + T_step * static_cast<double>(t - old_n + 1);
-                array<SpinVector, 3> zero_su2 = {SpinVector::Zero(spin_dim_SU2),
-                                                  SpinVector::Zero(spin_dim_SU2),
-                                                  SpinVector::Zero(spin_dim_SU2)};
-                array<SpinVector, 3> zero_su3 = {SpinVector::Zero(spin_dim_SU3),
-                                                  SpinVector::Zero(spin_dim_SU3),
-                                                  SpinVector::Zero(spin_dim_SU3)};
-                traj[t].second = {zero_su2, zero_su3};
-            }
-        };
-
-        auto pad_spin_flat = [&](vector<double>& sf) {
-            if (sf.size() == state_traj_size_spins) return;
-            if (sf.size() > state_traj_size_spins) {
-                sf.resize(state_traj_size_spins);
-                return;
-            }
-            sf.resize(state_traj_size_spins, 0.0);
-        };
-
-        // First: rank 0 writes its own local results immediately
-        if (rank == 0) {
-            for (size_t idx = 0; idx < my_tau_indices.size(); ++idx) {
-                int tau_idx = my_tau_indices[idx];
-                if (local_M1_trajectories[idx].size() != time_points ||
-                    local_M01_trajectories[idx].size() != time_points) {
-                    std::cerr << "[mixed_2dcs MPI] rank=0 tau_idx=" << tau_idx
-                              << " trajectory length mismatch: M1="
-                              << local_M1_trajectories[idx].size()
-                              << " M01=" << local_M01_trajectories[idx].size()
-                              << " expected=" << time_points
-                              << " — padding to keep HDF5 shape uniform.\n";
-                }
-                pad_to_time_points(local_M1_trajectories[idx]);
-                pad_to_time_points(local_M01_trajectories[idx]);
-                if (save_spin_trajectories) {
-                    if (idx < local_spin_flat_M1.size())  pad_spin_flat(local_spin_flat_M1[idx]);
-                    if (idx < local_spin_flat_M01.size()) pad_spin_flat(local_spin_flat_M01[idx]);
-                }
-                const vector<double>* sp_m1 = save_spin_trajectories && idx < local_spin_flat_M1.size()
-                                              ? &local_spin_flat_M1[idx] : nullptr;
-                const vector<double>* sp_m01 = save_spin_trajectories && idx < local_spin_flat_M01.size()
-                                               ? &local_spin_flat_M01[idx] : nullptr;
-                write_tau_to_hdf5(tau_idx, local_M1_trajectories[idx], local_M01_trajectories[idx], sp_m1, sp_m01);
-            }
-            cout << "  Rank 0 local trajectories written (" << my_tau_indices.size() << " tau points)." << endl;
-            
-            // Free local memory on rank 0 after writing
-            local_M1_trajectories.clear();
-            local_M1_trajectories.shrink_to_fit();
-            local_M01_trajectories.clear();
-            local_M01_trajectories.shrink_to_fit();
-            local_spin_flat_M1.clear();
-            local_spin_flat_M1.shrink_to_fit();
-            local_spin_flat_M01.clear();
-            local_spin_flat_M01.shrink_to_fit();
-        }
-        
-        // Now receive from other ranks and write immediately (streaming)
-        vector<double> M1_buffer(traj_size);
-        vector<double> M01_buffer(traj_size);
-        vector<double> spin_M1_buf, spin_M01_buf;
-        if (save_spin_trajectories) {
-            spin_M1_buf.resize(state_traj_size_spins);
-            spin_M01_buf.resize(state_traj_size_spins);
-        }
-        
-        int progress_interval = std::max(1, tau_steps / 20);  // Report every 5%
-        int received_count = 0;
-        
-        for (int tau_idx = 0; tau_idx < tau_steps; ++tau_idx) {
-            int owner_rank = scheduler_writer_only ? (1 + (tau_idx % worker_count)) : 0;
-            
-            if (owner_rank == 0) continue;  // Already written above
-            
-            if (rank == 0) {
-                // Receive obs trajectories from owner
-                MPI_Recv(M1_buffer.data(), traj_size, MPI_DOUBLE, owner_rank, 
-                        2 * tau_idx, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                MPI_Recv(M01_buffer.data(), traj_size, MPI_DOUBLE, owner_rank, 
-                        2 * tau_idx + 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                
-                // Receive spin state trajectories if enabled
-                if (save_spin_trajectories) {
-                    MPI_Recv(spin_M1_buf.data(), state_traj_size_spins, MPI_DOUBLE, owner_rank,
-                             2 * tau_steps + 2 * tau_idx, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                    MPI_Recv(spin_M01_buf.data(), state_traj_size_spins, MPI_DOUBLE, owner_rank,
-                             2 * tau_steps + 2 * tau_idx + 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                }
-                
-                // Deserialize and write to HDF5 immediately (no storage)
-                TrajectoryType M1_traj = deserialize_trajectory(M1_buffer);
-                TrajectoryType M01_traj = deserialize_trajectory(M01_buffer);
-                
-                write_tau_to_hdf5(tau_idx, M1_traj, M01_traj,
-                                  save_spin_trajectories ? &spin_M1_buf : nullptr,
-                                  save_spin_trajectories ? &spin_M01_buf : nullptr);
-                
-                received_count++;
-                if (received_count % progress_interval == 0) {
-                    int local_tau_count = static_cast<int>(my_tau_indices.size());
-                    cout << "  Progress: " << received_count << "/" << (tau_steps - local_tau_count) 
-                         << " remote tau points received and written." << endl;
-                }
-                
-            } else if (rank == owner_rank) {
-                // Find local index for this tau
-                size_t local_idx = 0;
-                for (size_t i = 0; i < my_tau_indices.size(); ++i) {
-                    if (my_tau_indices[i] == tau_idx) {
-                        local_idx = i;
-                        break;
-                    }
-                }
-
-                // ------------------------------------------------------------
-                // Bounds-safe serialization.
-                //
-                // `time_points` is broadcast from rank 0's M0_trajectory size.
-                // A worker's M1 / M01 trajectory length can in principle
-                // differ by ±1 sample because the integrator's segment
-                // boundaries (tau ± window, etc.) are not always exact
-                // multiples of step_size — e.g. when tau_step is not a
-                // multiple of md_timestep, or when two pulse windows merge
-                // for small |tau|.
-                //
-                // Without the clamp + pad below, accessing
-                // local_M*_trajectories[local_idx][t] for t == size() is
-                // undefined behaviour and was the source of the rank-K
-                // segfault observed in pump_probe_spectroscopy_mpi (see
-                // job 11092211 post-mortem).
-                // ------------------------------------------------------------
-                auto serialize = [&](const TrajectoryType& traj, vector<double>& buf,
-                                     const char* tag) {
-                    const size_t actual_n = traj.size();
-                    const size_t copy_n   = std::min(actual_n, time_points);
-                    if (actual_n != time_points) {
-                        std::cerr << "[mixed_2dcs MPI] rank=" << rank
-                                  << " tau_idx=" << tau_idx
-                                  << " " << tag << " trajectory length mismatch: "
-                                  << "actual=" << actual_n
-                                  << " expected=" << time_points
-                                  << " — clamping + zero-padding remainder.\n";
-                    }
-                    for (size_t t = 0; t < copy_n; ++t) {
-                        size_t offset = t * data_per_point;
-                        buf[offset] = traj[t].first;
-                        for (int m = 0; m < 3; ++m) {
-                            for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                                buf[offset + 1 + m * spin_dim_SU2 + d] =
-                                    traj[t].second.first[m](d);
-                            }
-                        }
-                        size_t su3_offset = offset + 1 + 3 * spin_dim_SU2;
-                        for (int m = 0; m < 3; ++m) {
-                            for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                                buf[su3_offset + m * spin_dim_SU3 + d] =
-                                    traj[t].second.second[m](d);
-                            }
-                        }
-                    }
-                    // Zero-pad any trailing samples that the worker did not
-                    // produce so the receiver still gets `traj_size` doubles.
-                    if (copy_n < time_points) {
-                        std::fill(buf.begin() + copy_n * data_per_point,
-                                  buf.end(), 0.0);
-                    }
-                };
-
-                serialize(local_M1_trajectories[local_idx],  M1_buffer,  "M1");
-                serialize(local_M01_trajectories[local_idx], M01_buffer, "M01");
-
-                MPI_Send(M1_buffer.data(), traj_size, MPI_DOUBLE, 0, 2 * tau_idx, MPI_COMM_WORLD);
-                MPI_Send(M01_buffer.data(), traj_size, MPI_DOUBLE, 0, 2 * tau_idx + 1, MPI_COMM_WORLD);
-                
-                // Send spin state trajectories if enabled.  Pad/truncate
-                // these the same way so the receiver's fixed-size buffer
-                // is always satisfied.
-                if (save_spin_trajectories) {
-                    const vector<double>& sf_m1 = local_spin_flat_M1[local_idx];
-                    const vector<double>& sf_m01 = local_spin_flat_M01[local_idx];
-
-                    auto send_spin = [&](const vector<double>& sf, int tag) {
-                        if (sf.size() == state_traj_size_spins) {
-                            MPI_Send(sf.data(),
-                                     static_cast<int>(state_traj_size_spins),
-                                     MPI_DOUBLE, 0, tag, MPI_COMM_WORLD);
-                        } else {
-                            // Re-pack into a padded/truncated buffer.
-                            vector<double> padded(state_traj_size_spins, 0.0);
-                            const size_t copy_n = std::min(sf.size(),
-                                                           state_traj_size_spins);
-                            std::copy(sf.begin(), sf.begin() + copy_n,
-                                      padded.begin());
-                            std::cerr << "[mixed_2dcs MPI] rank=" << rank
-                                      << " tau_idx=" << tau_idx
-                                      << " spin-state length mismatch: "
-                                      << "actual=" << sf.size()
-                                      << " expected=" << state_traj_size_spins
-                                      << " — padded.\n";
-                            MPI_Send(padded.data(),
-                                     static_cast<int>(state_traj_size_spins),
-                                     MPI_DOUBLE, 0, tag, MPI_COMM_WORLD);
-                        }
-                    };
-
-                    send_spin(sf_m1,  2 * tau_steps + 2 * tau_idx);
-                    send_spin(sf_m01, 2 * tau_steps + 2 * tau_idx + 1);
-                }
-            }
-        }
-        
-        // Close HDF5 file
-        if (rank == 0 && file_ptr) {
-            metadata_group.close();
-            reference_group.close();
-            tau_scan_group.close();
-            file_ptr->close();
-            delete file_ptr;
-            cout << "Successfully wrote all data to HDF5 file (streaming mode)" << endl;
-        }
-        
-#else
-        // No HDF5 - skip the communication and output
-        if (rank == 0) {
-            cout << "Note: HDF5 support not enabled. Skipping file output." << endl;
-        }
+        std::unique_ptr<HDF5MixedPumpProbeWriter> writer;
 #endif
-        
+        const string hdf5_file = dir_name + "/pump_probe_spectroscopy.h5";
         if (rank == 0) {
-            cout << "\n==========================================" << endl;
-            cout << "Pump-Probe Spectroscopy (MPI) Complete!" << endl;
-            cout << "Output directory: " << dir_name << endl;
-            cout << "Total delay points: " << tau_steps << endl;
-            cout << "==========================================" << endl;
+            try {
+                std::filesystem::create_directories(dir_name);
+                cout << "\n==========================================\n"
+                     << "Mixed Lattice Pump-Probe Spectroscopy (MPI, " << size << " ranks: 1 writer + "
+                     << (size - 1) << " workers, dynamic scheduling)\n"
+                     << "==========================================" << endl;
+                print_plan(cout, n_tau, n_t, plan->residual, plan->w1, plan->w1_note, plan->m01_from_m0,
+                           plan->checkpoint_indices.size());
+                if (plan->distinct_probe) {
+                    cout << "  Probe directions differ from the pump directions." << endl;
+                }
+                save_positions_to_dir(dir_name);
+                save_spin_config_to_dir(dir_name, "initial_spins");
+                save_energy_to_dir(dir_name, "energy_initial");
+#ifdef HDF5_ENABLED
+                writer = std::make_unique<HDF5MixedPumpProbeWriter>(
+                    hdf5_file,
+                    lattice_size_SU2, spin_dim_SU2, N_atoms_SU2,
+                    lattice_size_SU3, spin_dim_SU3, N_atoms_SU3,
+                    dim1, dim2, dim3, spin_length_SU2, spin_length_SU3,
+                    pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                    pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+                    T_start, T_end, T_step, method,
+                    tau_start, tau_end, tau_step,
+                    energy_density(), magnetization_SU2(), magnetization_SU3(),
+                    Temp_start, Temp_end, n_anneal, T_zero_quench, quench_sweeps,
+                    save_spin_trajectories,
+                    &field_in_SU2, &field_in_SU3,
+                    &site_positions_SU2, &site_positions_SU3);
+#else
+                (void) Temp_start; (void) Temp_end; (void) n_anneal; (void) T_zero_quench; (void) quench_sweeps;
+                cout << "Note: HDF5 support not enabled; trajectories are computed but not written." << endl;
+#endif
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
         }
-        
-        // Restore ground state
-        spins_SU2 = ground_state_SU2;
-        spins_SU3 = ground_state_SU3;
-        
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
+        agree_on_errors(comm, error, "pump_probe_spectroscopy_mpi: output setup");
 
+        // ---- Phase 2: reference M0 on rank 0 (also the source of the M1
+        // synthesis and of the states M01 is continued from).
+        PumpProbeTrajectory M0;
+        vector<double> M0_spins;
+        vector<ODEState> checkpoints;
+        if (rank == 0) {
+            try {
+                cout << "Computing M0 (pump only) on rank 0..." << endl;
+                vector<vector<double>> states;
+                M0 = run_reference_trajectory(*plan, x_ground, plan->save_spins ? &states : nullptr, &checkpoints);
+                require_grid_length(M0, n_t, "M0");
+                M0_spins = flatten_states(states);
+#ifdef HDF5_ENABLED
+                writer->write_reference_trajectory(M0, plan->save_spins ? &M0_spins : nullptr);
+#endif
+            } catch (const std::exception& e) {
+                error = e.what();
+            }
+        }
+        agree_on_errors(comm, error, "pump_probe_spectroscopy_mpi: reference trajectory M0");
+
+        // ---- Phase 3: dynamic master-worker scan. A worker's result message
+        // doubles as its request for the next delay; rank 0 writes each result
+        // as soon as it arrives. After the first error rank 0 hands out no more
+        // work but keeps serving requests until every worker has stopped.
+        if (rank == 0) {
+            size_t next = 0;
+            int active = size - 1;
+            size_t done = 0;
+            const size_t progress_every = std::max<size_t>(1, n_tau / 20);
+            vector<double> buf_M1, buf_M01, buf_s1, buf_s01;
+            while (active > 0) {
+                int64_t hdr[4];
+                MPI_Status st;
+                MPI_Recv(hdr, 4, MPI_INT64_T, MPI_ANY_SOURCE, kTagResult, comm, &st);
+                const int src = st.MPI_SOURCE;
+                if (hdr[0] >= 0) {
+                    const size_t j = static_cast<size_t>(hdr[0]);
+                    if (hdr[1] == 0) {
+                        const size_t k0 = static_cast<size_t>(hdr[2]);
+                        if (!plan->w1) {
+                            buf_M1.resize(n_t * kObsDoubles);
+                            recv_doubles(buf_M1.data(), buf_M1.size(), src, kTagM1, comm);
+                        }
+                        buf_M01.resize((n_t - k0) * kObsDoubles);
+                        recv_doubles(buf_M01.data(), buf_M01.size(), src, kTagM01, comm);
+                        if (plan->save_spins) {
+                            buf_s1.resize(n_t * state_dim);
+                            recv_doubles(buf_s1.data(), buf_s1.size(), src, kTagM1Spins, comm);
+                            buf_s01.resize((n_t - k0) * state_dim);
+                            recv_doubles(buf_s01.data(), buf_s01.size(), src, kTagM01Spins, comm);
+                        }
+                        if (error.empty()) {
+                            try {
+                                PumpProbeTrajectory M1 = plan->w1
+                                    ? synthesize_M1_from_M0(M0, M_ground, plan->taus[j], T_start, T_end, T_step)
+                                    : unflatten_trajectory(buf_M1);
+                                PumpProbeTrajectory M01 = assemble_m01(M0, unflatten_trajectory(buf_M01), k0);
+                                vector<double> M01_spins = plan->save_spins
+                                    ? assemble_m01_spins(M0_spins, std::move(buf_s01), k0, state_dim)
+                                    : vector<double>();
+                                require_grid_length(M1, n_t, "M1");
+                                require_grid_length(M01, n_t, "M01");
+#ifdef HDF5_ENABLED
+                                writer->write_tau_trajectory(static_cast<int>(j), plan->taus[j], M1, M01,
+                                                             plan->save_spins ? &buf_s1 : nullptr,
+                                                             plan->save_spins ? &M01_spins : nullptr);
+#endif
+                                if (++done % progress_every == 0 || done == n_tau) {
+                                    cout << "  " << done << "/" << n_tau << " delays written" << endl;
+                                }
+                            } catch (const std::exception& e) {
+                                error = std::string("writing delay ") + std::to_string(j) + ": " + e.what();
+                            }
+                        }
+                    } else {
+                        std::string msg(static_cast<size_t>(hdr[3]), '\0');
+                        MPI_Recv(msg.data(), static_cast<int>(hdr[3]), MPI_CHAR, src, kTagError, comm,
+                                 MPI_STATUS_IGNORE);
+                        if (error.empty()) {
+                            error = "rank " + std::to_string(src) + ", delay " + std::to_string(j) + ": " + msg;
+                        }
+                    }
+                }
+                const int64_t assign = (error.empty() && next < n_tau) ? static_cast<int64_t>(next++) : -1;
+                MPI_Send(&assign, 1, MPI_INT64_T, src, kTagAssign, comm);
+                if (assign < 0) {
+                    --active;
+                } else if (plan->m01_from_m0 && plan->m01_start[static_cast<size_t>(assign)] > 0) {
+                    const size_t k0 = plan->m01_start[static_cast<size_t>(assign)];
+                    const auto it = std::lower_bound(plan->checkpoint_indices.begin(),
+                                                     plan->checkpoint_indices.end(), k0);
+                    const ODEState& cp = checkpoints[static_cast<size_t>(it - plan->checkpoint_indices.begin())];
+                    send_doubles(cp.data(), cp.size(), src, kTagCheckpoint, comm);
+                }
+            }
+#ifdef HDF5_ENABLED
+            try {
+                writer->close();
+            } catch (const std::exception& e) {
+                if (error.empty()) error = std::string("closing ") + hdf5_file + ": " + e.what();
+            }
+#endif
+        } else {
+            int64_t hdr[4] = {-1, 0, 0, 0};
+            MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
+            ODEState checkpoint;
+            vector<double> buf;
+            while (true) {
+                int64_t assign = -1;
+                MPI_Recv(&assign, 1, MPI_INT64_T, 0, kTagAssign, comm, MPI_STATUS_IGNORE);
+                if (assign < 0) break;
+                const size_t j = static_cast<size_t>(assign);
+                const size_t k0 = plan->m01_from_m0 ? plan->m01_start[j] : 0;
+                if (k0 > 0) {
+                    checkpoint.resize(ode_dim);
+                    recv_doubles(checkpoint.data(), ode_dim, 0, kTagCheckpoint, comm);
+                }
+                DelayResult r;
+                std::string msg;
+                try {
+                    compute_delay(*plan, j, x_ground, k0 > 0 ? &checkpoint : nullptr, r);
+                    // Rank 0 sizes its receives from (n_t, k0): check before sending.
+                    if (!plan->w1) require_grid_length(r.M1, n_t, "M1");
+                    if (r.M01.size() != n_t - k0) throw std::runtime_error("M01 has an unexpected number of samples");
+                    if (plan->save_spins &&
+                        (r.M1_spins.size() != n_t * state_dim || r.M01_spins.size() != (n_t - k0) * state_dim)) {
+                        throw std::runtime_error("spin-state trajectory has an unexpected size");
+                    }
+                } catch (const std::exception& e) {
+                    msg = e.what();
+                    if (msg.empty()) msg = "unknown error";
+                }
+                if (msg.empty()) {
+                    hdr[0] = assign; hdr[1] = 0; hdr[2] = static_cast<int64_t>(k0); hdr[3] = 0;
+                    MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
+                    if (!plan->w1) {
+                        flatten_trajectory(r.M1, buf);
+                        send_doubles(buf.data(), buf.size(), 0, kTagM1, comm);
+                    }
+                    flatten_trajectory(r.M01, buf);
+                    send_doubles(buf.data(), buf.size(), 0, kTagM01, comm);
+                    if (plan->save_spins) {
+                        send_doubles(r.M1_spins.data(), r.M1_spins.size(), 0, kTagM1Spins, comm);
+                        send_doubles(r.M01_spins.data(), r.M01_spins.size(), 0, kTagM01Spins, comm);
+                    }
+                } else {
+                    hdr[0] = assign; hdr[1] = 1; hdr[2] = 0; hdr[3] = static_cast<int64_t>(msg.size());
+                    MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
+                    MPI_Send(msg.data(), static_cast<int>(msg.size()), MPI_CHAR, 0, kTagError, comm);
+                }
+            }
+        }
+        agree_on_errors(comm, error, "pump_probe_spectroscopy_mpi: delay scan");
+        if (rank == 0) {
+            cout << "Pump-probe spectroscopy (MPI) complete: " << n_tau << " delays in " << hdf5_file << endl;
+        }
+    }

@@ -7,7 +7,8 @@
 #include "classical_spin/core/su3_coherent_state.h"  // SU(3) coherent-state utilities
                                                      // (Zhang & Batista, PRB 104, 104409 (2021))
 #include "classical_spin/mc/mc_common.h"      // Common MC structs & templates
-#include "classical_spin/lattice/pulse_chunking.h"  // W3: pulse-window chunking helper
+#include "classical_spin/lattice/pulse_chunking.h"  // default pump-probe tolerances
+#include "classical_spin/dynamics/grid_integrate.h"   // exact-grid ODE integration
 #include <vector>
 #include <functional>
 #include <random>
@@ -27,14 +28,6 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-
-// Include Boost uBLAS for implicit solvers (rosenbrock4, implicit_euler)
-#include <boost/numeric/ublas/vector.hpp>
-#include <boost/numeric/ublas/matrix.hpp>
-#include <boost/numeric/odeint/stepper/rosenbrock4.hpp>
-#include <boost/numeric/odeint/stepper/rosenbrock4_controller.hpp>
-#include <boost/numeric/odeint/stepper/rosenbrock4_dense_output.hpp>
-#include <boost/numeric/odeint/stepper/implicit_euler.hpp>
 
 #ifdef HDF5_ENABLED
 #include "hdf5_io.h"
@@ -129,6 +122,11 @@ public:
     using SpinConfigSU2 = vector<SpinVector>;  // SU(2) spin configuration
     using SpinConfigSU3 = vector<SpinVector>;  // SU(3) spin configuration
     using ODEState = vector<double>;            // Flat state vector for Boost.Odeint
+    // Magnetisation observables of one sample:
+    // ([M_antiferro, M_local, M_global] SU(2), [M_antiferro, M_local, M_global] SU(3)).
+    using Observables = pair<array<SpinVector, 3>, array<SpinVector, 3>>;
+    // (time, observables) per sample of a pulse-drive trajectory.
+    using PumpProbeTrajectory = vector<pair<double, Observables>>;
 
     // Core lattice properties
     size_t spin_dim_SU2;         // Dimension of SU(2) spins (typically 3)
@@ -229,6 +227,7 @@ public:
     vector<SpinMatrix> sublattice_frames_SU2;  // Frame transformations for SU(2) sublattices
     vector<SpinMatrix> sublattice_frames_SU3;  // Frame transformations for SU(3) sublattices
     vector<double> afm_sublattice_signs_SU2;   // AFM sublattice signs for SU(2) (Bertaut modes)
+    vector<double> afm_sublattice_signs_SU3;   // AFM sublattice signs for SU(3)
 
     // Interaction counts per site
     size_t num_bi_SU2;       // Number of SU(2)-SU(2) bilinear neighbors per site
@@ -264,7 +263,13 @@ public:
     vector<size_t>             sites_by_color_csr_SU3;       // size lattice_size_SU3
     size_t                     n_colors_SU3 = 0;
 
-    // Time-dependent fields for molecular dynamics
+    // Time-dependent fields for molecular dynamics.
+    //
+    // The drive is a train of at most two physical pulses k = 0, 1 centred at
+    // t_pulse_*[k]; slot k acts (drives the spins AND gates the field-assisted
+    // Fe-Tm exchange) only for k < n_active_pulses. A single-pulse experiment
+    // therefore has no phantom second pulse, whatever its direction vectors.
+    size_t n_active_pulses = 0;
     array<SpinVector, 2> field_drive_SU2;     // Two pulse components for SU(2)
     // Global (lab-frame) representative of the two SU(2) pulse field vectors,
     // BEFORE the per-sublattice local-frame transform.  Used only to compute
@@ -300,26 +305,36 @@ public:
     // SU(2) Gilbert damping: dS/dt += (alpha/|S|) * S × (S × H)
     double alpha_gilbert = 0.0;
 
+    // Lie-Poisson coefficient c of the SU(3) equation of motion
+    //   dn^a/dt = c f_{abc} (∂E/∂n^b) n^c,
+    // c = 2 for n = <λ> (core/su3_coherent_state.h); taken from the SU(3) unit
+    // cell (UnitCell::poisson_bracket), 1 only under su3_legacy_convention.
+    double su3_bracket = classical_spin::su3::kGellMannBracket;
+
     // SU(3) Bloch damping/relaxation (tmfeo3_notes.tex Eq. blochdampedfull)
-    // dn^a/dt = (1/ℏ) f_{abc} h^b n^c  −  Γ_a (n^a − n^a_eq)
+    // dn^a/dt = c f_{abc} h^b n^c  −  Γ_a (n^a − n^a_eq)
     // damping_rates_SU3[a]: phenomenological relaxation rates Γ_a for each Gell-Mann channel
     // equilibrium_SU3[site]: thermal equilibrium Bloch vector n^a_eq for each SU(3) site
     SpinVector damping_rates_SU3;               // 8-component, one Γ per Gell-Mann channel
     SpinConfigSU3 equilibrium_SU3;              // Per-site equilibrium Bloch vector
 
-    // Thermal repopulation (tau-labeled heating): the energy absorbed from the
-    // SU(3) drive, E_dep(t) = ∫ f'(t)·Σ_i(v_i·λ_i) dt, shifts the λ3
-    // equilibrium by −thermal_heat·E_dep. The existing Γ_3 relaxation then
-    // chases the shifted equilibrium, so the population rise time is 1/Γ_3 and
-    // the pump-FID × probe interference in E_dep carries the ω_τ=E12 delay
-    // label into M_NL automatically. Accumulator resets when integration time
-    // jumps backward (a new trajectory).
+    // Thermal repopulation (tau-labeled heating). A reservoir energy E_dep
+    // is integrated as ONE EXTRA ODE VARIABLE appended to the spin state
+    // (spins_to_state() adds it, initialised to 0, whenever thermal_heat != 0):
+    //     dE_dep/dt = P(n) − thermal_cool · E_dep,
+    //     P(n) = Σ_sites Σ_{a ∉ {3,8}} Γ_a (n^a − n^a_eq)^2,
+    // a positive-definite proxy for the power dissipated by the coherence
+    // relaxation (the population channels λ3, λ8 are excluded: their
+    // relaxation returns energy to the bath, and re-heating from them would
+    // close a runaway loop). The λ3 relaxation target is shifted by
+    //     −min(thermal_cap, thermal_heat · E_dep),
+    // so the population rise time is 1/Γ_3 and the pump-FID × probe
+    // interference in P carries the τ label into M_NL. Being part of the ODE
+    // state, E_dep is integrated by the same (adaptive) scheme as the spins
+    // and the right-hand side stays a pure function of (state, t).
     double thermal_heat = 0.0;                  // coupling (0 = feature off)
-    double thermal_cap  = 1.0e30;               // max |lambda3 eq shift| (saturation)
+    double thermal_cap  = 1.0e30;               // max lambda3 eq shift (saturation)
     double thermal_cool = 0.0;                  // heat-reservoir cooling rate (1/time; 0 = no cooling)
-    mutable double thermal_Edep = 0.0;          // deposited energy accumulator
-    mutable double thermal_last_t = -1.0e300;   // last accumulation time
-    mutable double thermal_last_P = 0.0;        // last absorbed power (trapezoid)
 
     // ============================================================
     // LOCAL FIELD CACHING FOR OPTIMIZED MONTE CARLO
@@ -376,6 +391,16 @@ public:
           spin_length_SU2(spin_l_SU2),
           spin_length_SU3(spin_l_SU3)
     {
+        // The dynamics, the packed field kernels and the observables are
+        // written for SU(2) vectors (3 components) coupled to SU(3) Gell-Mann
+        // vectors (8 components); any other shape used to run silently with
+        // frozen spins or out-of-bounds structure constants.
+        if (spin_dim_SU2 != 3 || spin_dim_SU3 != 8) {
+            throw std::invalid_argument(
+                "MixedLattice: requires 3-component SU(2) and 8-component SU(3) spins (got spin_dim_SU2="
+                + std::to_string(spin_dim_SU2) + ", spin_dim_SU3=" + std::to_string(spin_dim_SU3) + ")");
+        }
+        su3_bracket = mixed_uc.SU3_cell.poisson_bracket;
         lattice_size_SU2 = N_atoms_SU2 * dim1 * dim2 * dim3;
         lattice_size_SU3 = N_atoms_SU3 * dim1 * dim2 * dim3;
         
@@ -432,6 +457,7 @@ public:
             sublattice_frames_SU3[atom] = mixed_uc.SU3_cell.sublattice_frames[atom];
         }
         afm_sublattice_signs_SU2 = mixed_uc.SU2_cell.afm_sublattice_signs;
+        afm_sublattice_signs_SU3 = mixed_uc.SU3_cell.afm_sublattice_signs;
 
         // Initialize time-dependent fields
         field_drive_SU2[0] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
@@ -3721,52 +3747,104 @@ public:
     }
 
     /**
-     * Set pulse parameters for SU(2) (drive field is transformed to local frame)
+     * Two-pulse drive for SU(2): pulse k is centred at t_Bk with per-atom
+     * global-frame directions field_ink (transformed to the local frame,
+     * B_local = F^T B_global), amplitude `amp`, Gaussian width `width` and
+     * carrier `freq`. Marks both pulse slots active; single-pulse experiments
+     * go through single_pulse_drive(), which activates only slot 0. Silent:
+     * drivers print the pulse configuration once.
      */
     void set_pulse_SU2(const vector<SpinVector>& field_in1, double t_B1,
                       const vector<SpinVector>& field_in2, double t_B2,
                       double amp, double width, double freq);
 
     /**
-     * Set pulse parameters for SU(3) (drive field is transformed to local frame)
+     * Two-pulse drive for SU(3) (same conventions as set_pulse_SU2).
      */
     void set_pulse_SU3(const vector<SpinVector>& field_in1, double t_B1,
                       const vector<SpinVector>& field_in2, double t_B2,
                       double amp, double width, double freq);
 
     /**
-     * Reset pulse fields
+     * Remove the pulse train (no active pulses, zero directions and
+     * amplitudes). The pulse SHAPE configuration that the runners set once per
+     * run -- second SU(3) colour, tabulated waveform -- is kept.
      */
     void reset_pulse() {
-        field_drive_SU2[0].setZero();
-        field_drive_SU2[1].setZero();
-        field_drive_SU3[0].setZero();
-        field_drive_SU3[1].setZero();
+        n_active_pulses = 0;
+        for (int k = 0; k < 2; ++k) {
+            field_drive_SU2[k].setZero();
+            field_drive_SU3[k].setZero();
+            field_drive_global_SU2[k].setZero();
+        }
+        t_pulse_SU2 = {0.0, 0.0};
+        t_pulse_SU3 = {0.0, 0.0};
         field_drive_amp_SU2 = 0.0;
         field_drive_freq_SU2 = 0.0;
+        field_drive_width_SU2 = 1.0;
         field_drive_amp_SU3 = 0.0;
         field_drive_freq_SU3 = 0.0;
+        field_drive_width_SU3 = 1.0;
     }
 
     /**
      * Set SU(3) Bloch damping rates Γ_a for each Gell-Mann channel.
      * See tmfeo3_notes.tex Eq. blochdampedfull:
      *   dn^a/dt += −Γ_a (n^a − n^a_eq)
-     * @param rates  8-component vector of damping rates (one per Gell-Mann index)
+     * Rates are physical relaxation rates (1/time) and are independent of the
+     * bracket convention.
+     * @param rates  8-component vector of non-negative damping rates
      */
     void set_damping_SU3(const SpinVector& rates) {
-        assert(rates.size() == (int)spin_dim_SU3);
+        if (rates.size() != static_cast<Eigen::Index>(spin_dim_SU3)) {
+            throw std::invalid_argument("set_damping_SU3: rates must have " +
+                                        std::to_string(spin_dim_SU3) + " components (got " +
+                                        std::to_string(rates.size()) + ")");
+        }
+        for (Eigen::Index a = 0; a < rates.size(); ++a) {
+            if (!std::isfinite(rates(a)) || rates(a) < 0.0) {
+                throw std::invalid_argument("set_damping_SU3: rates must be finite and >= 0");
+            }
+        }
         damping_rates_SU3 = rates;
     }
 
     /**
      * Set per-site SU(3) equilibrium Bloch vectors for Bloch damping.
+     * Only the relaxation target: the Hamiltonian is not affected (see
+     * set_mixed_trilinear_reference_SU3 for an explicit reference subtraction).
      * @param eq  Per-site equilibrium vectors (size = lattice_size_SU3)
      */
     void set_equilibrium_SU3(const SpinConfigSU3& eq) {
-        assert(eq.size() == lattice_size_SU3);
+        if (eq.size() != lattice_size_SU3) {
+            throw std::invalid_argument("set_equilibrium_SU3: expected " + std::to_string(lattice_size_SU3) +
+                                        " vectors (got " + std::to_string(eq.size()) + ")");
+        }
+        for (const auto& v : eq) {
+            if (v.size() != static_cast<Eigen::Index>(spin_dim_SU3)) {
+                throw std::invalid_argument("set_equilibrium_SU3: every vector must have " +
+                                            std::to_string(spin_dim_SU3) + " components");
+            }
+        }
         equilibrium_SU3 = eq;
     }
+
+    /**
+     * Subtract an explicit SU(3) reference configuration r from the SU(3) leg
+     * of every SU(2)-SU(2)-SU(3) trilinear coupling:
+     *     T(S_i, S_j, n_k)  ->  T(S_i, S_j, n_k - r_k).
+     * The subtraction is the Fe-Fe bilinear -T(S_i, S_j, r_k) (on-site when
+     * j = i); it is folded into the SU(2) bilinear / on-site tables, so the
+     * total energy, the Monte Carlo
+     * energy differences / local fields and the dynamics all see the same
+     * modified Hamiltonian. (It used to be applied to the MD field only, with
+     * r silently taken from the Bloch-damping equilibrium, so an annealed
+     * ground state was not stationary once damping was switched on.)
+     * Calling it again replaces the reference; an empty argument removes it.
+     * Re-minimise afterwards if a stationary initial state is needed.
+     */
+    void set_mixed_trilinear_reference_SU3(const SpinConfigSU3& reference);
+    const SpinConfigSU3& mixed_trilinear_reference_SU3() const { return trilinear_reference_SU3_; }
 
     /**
      * Set uniform equilibrium Bloch vector for all SU(3) sites.
@@ -3836,11 +3914,23 @@ public:
     /// normalized to max|E|=1.  Sets tabulated_pulse_sigma for chunking.
     void load_tabulated_pulse(const std::string& filename);
 
+    /// Number of spin components in the flat state [SU(2) | SU(3)].
+    size_t spin_state_size() const {
+        return lattice_size_SU2 * spin_dim_SU2 + lattice_size_SU3 * spin_dim_SU3;
+    }
+
+    /// True when the thermal reservoir E_dep is integrated (state has one extra entry).
+    bool has_thermal_reservoir() const { return thermal_heat != 0.0; }
+
+    /// Size of the ODE state: spins, plus E_dep when has_thermal_reservoir().
+    size_t ode_state_size() const { return spin_state_size() + (has_thermal_reservoir() ? 1 : 0); }
+
     /**
-     * Convert spin configurations to flat state vector
+     * Convert spin configurations to the flat ODE state
+     * [SU(2) spins | SU(3) spins | E_dep (only with the thermal reservoir, = 0)].
      */
     ODEState spins_to_state() const {
-        ODEState state(lattice_size_SU2 * spin_dim_SU2 + lattice_size_SU3 * spin_dim_SU3);
+        ODEState state(ode_state_size(), 0.0);
         
         size_t idx = 0;
         // Pack SU(2) spins
@@ -3885,317 +3975,43 @@ public:
     }
 
     /**
-     * Generic ODE integration wrapper supporting multiple methods
-     * Mirrors the integrator selection from lattice.h
-     * 
-     * @param system_func ODE system function (x, dxdt, t)
-     * @param state Current state (will be modified in-place)
-     * @param T_start Start time
-     * @param T_end End time
-     * @param dt_step Time step (initial for adaptive methods)
-     * @param observer Observer function called at intervals
-     * @param method Integration method (see list below)
-     * @param use_adaptive Use adaptive stepping (if method supports it)
-     * @param abs_tol Absolute tolerance for adaptive methods
-     * @param rel_tol Relative tolerance for adaptive methods
-     * 
-     * Available methods:
-     * 
-     * EXPLICIT METHODS (recommended for non-stiff problems):
-     * - "euler": Explicit Euler (1st order, simple, inaccurate)
-     * - "rk2" or "midpoint": Runge-Kutta 2nd order
-     * - "rk4": Classic Runge-Kutta 4th order (good balance, fixed step)
-     * - "rk5" or "rkck54": Cash-Karp 5(4) (adaptive, good for smooth problems)
-     * - "rk54" or "rkf54": Runge-Kutta-Fehlberg 5(4) (adaptive)
-     * - "dopri5": Dormand-Prince 5(4) (default, recommended for general use)
-     * - "rk78" or "rkf78": Runge-Kutta-Fehlberg 7(8) (high accuracy, expensive)
-     * - "bulirsch_stoer" or "bs": Bulirsch-Stoer (very high accuracy, expensive)
-     * - "adams_bashforth" or "ab": Adams-Bashforth 5-step multistep (efficient for smooth problems)
-     * - "adams_moulton" or "am": Adams-Bashforth-Moulton predictor-corrector (more accurate)
-     * 
-     * IMPLICIT METHODS (recommended for stiff problems):
-     * - "rosenbrock4" or "rb4": Rosenbrock 4th order (stiff systems, uses numerical Jacobian)
-     * - "implicit_euler" or "ie": Implicit Euler (1st order, very stable for stiff systems)
-     * 
-     * Note: Implicit methods use numerical Jacobian approximation via finite differences.
-     * They are more stable for stiff problems but computationally more expensive.
+     * Integrate `system_func` over [T_start, T_end] and call
+     * observer(state, t_k) on the exact grid t_k = T_start + k dt_step
+     * (k = 0..n, the last point not beyond T_end). Kept for source
+     * compatibility; the drivers use dynamics::integrate_on_time_grid
+     * directly. Unknown method names throw std::invalid_argument.
+     * `use_adaptive` is accepted for compatibility: adaptive methods always
+     * use error control and dense output, fixed-step methods never do.
      */
     template<typename System, typename Observer>
     void integrate_ode_system(System system_func, ODEState& state,
                              double T_start, double T_end, double dt_step,
                              Observer observer, const string& method,
                              bool use_adaptive = false,
-                             double abs_tol = 1e-6, double rel_tol = 1e-6) {
-        namespace odeint = boost::numeric::odeint;
-        
-        if (method == "euler") {
-            odeint::integrate_const(
-                odeint::euler<ODEState>(),
-                system_func, state, T_start, T_end, dt_step, observer
-            );
-        } else if (method == "rk2" || method == "midpoint") {
-            odeint::integrate_const(
-                odeint::modified_midpoint<ODEState>(),
-                system_func, state, T_start, T_end, dt_step, observer
-            );
-        } else if (method == "rk4") {
-            odeint::integrate_const(
-                odeint::runge_kutta4<ODEState>(),
-                system_func, state, T_start, T_end, dt_step, observer
-            );
-        } else if (method == "rk5" || method == "rkck54") {
-            if (use_adaptive) {
-                odeint::integrate_adaptive(
-                    odeint::make_controlled<odeint::runge_kutta_cash_karp54<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            } else {
-                odeint::integrate_const(
-                    odeint::make_controlled<odeint::runge_kutta_cash_karp54<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            }
-        } else if (method == "rk54" || method == "rkf54") {
-            // Aliased to Cash-Karp 5(4): see Lattice::integrate_ode_system
-            // for the rationale (Boost has no fehlberg54 stepper; the
-            // previous fehlberg78 wiring was a copy-paste bug that
-            // silently doubled the per-step cost).
-            if (use_adaptive) {
-                odeint::integrate_adaptive(
-                    odeint::make_controlled<odeint::runge_kutta_cash_karp54<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            } else {
-                odeint::integrate_const(
-                    odeint::make_controlled<odeint::runge_kutta_cash_karp54<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            }
-        } else if (method == "dopri5") {
-            if (use_adaptive) {
-                odeint::integrate_adaptive(
-                    odeint::make_controlled<odeint::runge_kutta_dopri5<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            } else {
-                odeint::integrate_const(
-                    odeint::make_controlled<odeint::runge_kutta_dopri5<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            }
-        } else if (method == "rk78" || method == "rkf78") {
-            if (use_adaptive) {
-                odeint::integrate_adaptive(
-                    odeint::make_controlled<odeint::runge_kutta_fehlberg78<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            } else {
-                odeint::integrate_const(
-                    odeint::make_controlled<odeint::runge_kutta_fehlberg78<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            }
-        } else if (method == "bulirsch_stoer" || method == "bs") {
-            if (use_adaptive) {
-                odeint::integrate_adaptive(
-                    odeint::bulirsch_stoer<ODEState>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            } else {
-                odeint::integrate_const(
-                    odeint::bulirsch_stoer<ODEState>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            }
-        } else if (method == "adams_bashforth" || method == "ab") {
-            // Adams-Bashforth 5-step multistep method (efficient for smooth problems)
-            odeint::adams_bashforth<5, ODEState> stepper;
-            odeint::integrate_const(stepper, system_func, state, T_start, T_end, dt_step, observer);
-        } else if (method == "adams_moulton" || method == "am") {
-            // Adams-Bashforth-Moulton predictor-corrector (higher accuracy multistep)
-            odeint::adams_bashforth_moulton<5, ODEState> stepper;
-            odeint::integrate_const(stepper, system_func, state, T_start, T_end, dt_step, observer);
-        } else if (method == "rosenbrock4" || method == "rb4") {
-            // Rosenbrock 4th order implicit method (good for stiff systems)
-            // Uses numerical Jacobian approximation via finite differences
-            using ublas_state = boost::numeric::ublas::vector<double>;
-            using ublas_matrix = boost::numeric::ublas::matrix<double>;
-            
-            const size_t N = state.size();
-            const double eps_jac = 1e-8;  // Finite difference step for Jacobian
-            
-            // Convert std::vector state to ublas::vector
-            ublas_state ublas_x(N);
-            for (size_t i = 0; i < N; ++i) {
-                ublas_x(i) = state[i];
-            }
-            
-            // Create wrapper for system function that works with ublas types
-            auto ublas_system = [&system_func, N](const ublas_state& x, ublas_state& dxdt, double t) {
-                ODEState x_vec(N), dxdt_vec(N);
-                for (size_t i = 0; i < N; ++i) x_vec[i] = x(i);
-                system_func(x_vec, dxdt_vec, t);
-                for (size_t i = 0; i < N; ++i) dxdt(i) = dxdt_vec[i];
-            };
-            
-            // Create numerical Jacobian function
-            auto ublas_jacobian = [&system_func, N, eps_jac](const ublas_state& x, ublas_matrix& J, double t, ublas_state& dfdt) {
-                ODEState x_vec(N), dxdt_base(N), dxdt_pert(N);
-                for (size_t i = 0; i < N; ++i) x_vec[i] = x(i);
-                
-                // Compute base derivative
-                system_func(x_vec, dxdt_base, t);
-                
-                // Compute Jacobian columns by finite differences
-                J.resize(N, N);
-                for (size_t j = 0; j < N; ++j) {
-                    double x_orig = x_vec[j];
-                    double h = eps_jac * std::max(1.0, std::abs(x_orig));
-                    x_vec[j] = x_orig + h;
-                    system_func(x_vec, dxdt_pert, t);
-                    x_vec[j] = x_orig;
-                    
-                    for (size_t i = 0; i < N; ++i) {
-                        J(i, j) = (dxdt_pert[i] - dxdt_base[i]) / h;
-                    }
-                }
-                
-                // Compute df/dt by finite differences in time
-                double h_t = eps_jac * std::max(1.0, std::abs(t));
-                for (size_t i = 0; i < N; ++i) x_vec[i] = x(i);
-                system_func(x_vec, dxdt_pert, t + h_t);
-                for (size_t i = 0; i < N; ++i) {
-                    dfdt(i) = (dxdt_pert[i] - dxdt_base[i]) / h_t;
-                }
-            };
-            
-            // Create implicit system as pair of (system, jacobian)
-            auto implicit_system = std::make_pair(ublas_system, ublas_jacobian);
-            
-            // Create ublas observer wrapper
-            auto ublas_observer = [&observer, N](const ublas_state& x, double t) {
-                ODEState x_vec(N);
-                for (size_t i = 0; i < N; ++i) x_vec[i] = x(i);
-                observer(x_vec, t);
-            };
-            
-            // Use rosenbrock4 with dense output for adaptive stepping
-            // Note: rosenbrock4<double> means double is the value_type (scalar type)
-            //       The state type is automatically ublas::vector<double>
-            if (use_adaptive) {
-                odeint::integrate_adaptive(
-                    odeint::make_dense_output<odeint::rosenbrock4<double>>(abs_tol, rel_tol),
-                    implicit_system, ublas_x, T_start, T_end, dt_step, ublas_observer);
-            } else {
-                odeint::integrate_const(
-                    odeint::make_dense_output<odeint::rosenbrock4<double>>(abs_tol, rel_tol),
-                    implicit_system, ublas_x, T_start, T_end, dt_step, ublas_observer);
-            }
-            
-            // Copy result back to std::vector state
-            for (size_t i = 0; i < N; ++i) {
-                state[i] = ublas_x(i);
-            }
-        } else if (method == "implicit_euler" || method == "ie") {
-            // Implicit Euler method (1st order, very stable for stiff systems)
-            // Uses numerical Jacobian approximation via finite differences
-            using ublas_state = boost::numeric::ublas::vector<double>;
-            using ublas_matrix = boost::numeric::ublas::matrix<double>;
-            
-            const size_t N = state.size();
-            const double eps_jac = 1e-8;
-            
-            // Convert to ublas state
-            ublas_state ublas_x(N);
-            for (size_t i = 0; i < N; ++i) {
-                ublas_x(i) = state[i];
-            }
-            
-            // Create wrapper for system function
-            auto ublas_system = [&system_func, N](const ublas_state& x, ublas_state& dxdt, double t) {
-                ODEState x_vec(N), dxdt_vec(N);
-                for (size_t i = 0; i < N; ++i) x_vec[i] = x(i);
-                system_func(x_vec, dxdt_vec, t);
-                for (size_t i = 0; i < N; ++i) dxdt(i) = dxdt_vec[i];
-            };
-            
-            // Create numerical Jacobian function for implicit_euler
-            // Note: implicit_euler uses 3-argument Jacobian: (x, J, t) without dfdt
-            auto ublas_jacobian = [&system_func, N, eps_jac](const ublas_state& x, ublas_matrix& J, double t) {
-                ODEState x_vec(N), dxdt_base(N), dxdt_pert(N);
-                for (size_t i = 0; i < N; ++i) x_vec[i] = x(i);
-                
-                system_func(x_vec, dxdt_base, t);
-                
-                J.resize(N, N);
-                for (size_t j = 0; j < N; ++j) {
-                    double x_orig = x_vec[j];
-                    double h = eps_jac * std::max(1.0, std::abs(x_orig));
-                    x_vec[j] = x_orig + h;
-                    system_func(x_vec, dxdt_pert, t);
-                    x_vec[j] = x_orig;
-                    
-                    for (size_t i = 0; i < N; ++i) {
-                        J(i, j) = (dxdt_pert[i] - dxdt_base[i]) / h;
-                    }
-                }
-            };
-            
-            auto implicit_system = std::make_pair(ublas_system, ublas_jacobian);
-            
-            // Create ublas observer wrapper
-            auto ublas_observer = [&observer, N](const ublas_state& x, double t) {
-                ODEState x_vec(N);
-                for (size_t i = 0; i < N; ++i) x_vec[i] = x(i);
-                observer(x_vec, t);
-            };
-            
-            // Implicit Euler integration with manual stepping
-            // Note: implicit_euler<double> uses ublas::vector<double> as state
-            odeint::implicit_euler<double> stepper;
-            double t = T_start;
-            while (t < T_end) {
-                stepper.do_step(implicit_system, ublas_x, t, dt_step);
-                t += dt_step;
-                ublas_observer(ublas_x, t);
-            }
-            
-            // Copy result back
-            for (size_t i = 0; i < N; ++i) {
-                state[i] = ublas_x(i);
-            }
-        } else {
-            cout << "Warning: Unknown method '" << method << "', using dopri5" << endl;
-            cout << "Available explicit methods: euler, rk2/midpoint, rk4, rk5/rkck54, rk54/rkf54, dopri5, " << endl;
-            cout << "                            rk78/rkf78, bulirsch_stoer/bs, adams_bashforth/ab, adams_moulton/am" << endl;
-            cout << "Available implicit methods: rosenbrock4/rb4, implicit_euler/ie" << endl;
-            if (use_adaptive) {
-                odeint::integrate_adaptive(
-                    odeint::make_controlled<odeint::runge_kutta_dopri5<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            } else {
-                odeint::integrate_const(
-                    odeint::make_controlled<odeint::runge_kutta_dopri5<ODEState>>(abs_tol, rel_tol),
-                    system_func, state, T_start, T_end, dt_step, observer
-                );
-            }
-        }
+                             double abs_tol = 1e-6, double rel_tol = 1e-6) const {
+        (void) use_adaptive;
+        namespace dyn = classical_spin::dynamics;
+        const auto grid = dyn::TimeGrid::covering(T_start, T_end, dt_step, "integrate_ode_system");
+        dyn::integrate_on_time_grid(system_func, state, grid, 1, dyn::parse_ode_method(method),
+                                    abs_tol, rel_tol,
+                                    [&](const ODEState& x, size_t k) { observer(x, grid[k]); });
     }
 
     /**
-     * ODE system function for Boost.Odeint
+     * ODE system function for Boost.Odeint (alias of landau_lifshitz).
      */
-    void ode_system(const ODEState& x, ODEState& dxdt, double t);
+    void ode_system(const ODEState& x, ODEState& dxdt, double t) const;
 
     /**
-     * Compute Landau-Lifshitz derivatives using structure constants
-     * Note: For SU(2), use cross product. For SU(3), use Gell-Mann structure constants.
-     * 
-     * Direct ODEState implementation - no intermediate SpinConfig conversions for efficiency.
-     * State layout: [SU2_site0_components... SU2_siteN... SU3_site0_components... SU3_siteM...]
+     * Equations of motion, a pure function of (state, t) and the current drive:
+     *   SU(2):  dS/dt = H × S + (α/|S|) S × (S × H)            (LL-Gilbert)
+     *   SU(3):  dn^a/dt = c f_{abc} H^b n^c − Γ_a (n^a − n^a_eq), c = su3_bracket
+     *   E_dep:  dE_dep/dt = P(n) − thermal_cool E_dep           (thermal reservoir)
+     * with H = ∂E/∂S (∂E/∂n) the local field including the pulse drive.
+     * State layout: [SU2 site0 .. SU2 siteN | SU3 site0 .. SU3 siteM | E_dep?];
+     * `state` may omit E_dep (then E_dep = 0 and dsdt has the same size).
      */
-    void landau_lifshitz(const ODEState& state, ODEState& dsdt, double t);
+    void landau_lifshitz(const ODEState& state, ODEState& dsdt, double t) const;
 
 public:
     /**
@@ -4228,42 +4044,34 @@ public:
                                        double env_Bx = 0.0, double env_By = 0.0,
                                        double env_Bz = 0.0) const;
 
-private:
     /**
-     * Compute local field for SU(2) site directly from flat state vector
-     * More efficient than get_local_field_SU2() which uses SpinConfig
-     * 
-     * @param site Site index in SU(2) sublattice
-     * @param state Flat ODE state vector
-     * @param offset_SU3 Starting index of SU(3) spins in state vector
-     * @param t Current time (for time-dependent drive)
+     * Dimensionless stationarity residual of `state` without any drive:
+     *     max_i |dS_i/dt| / (c_i |H_i| |S_i|),
+     * the largest sine of the angle between a spin and its local field
+     * (c_i = 1 for SU(2), su3_bracket for SU(3); damping excluded). It is
+     * independent of the energy scale, so one tolerance fits every model.
      */
-
-    SpinVector get_local_field_SU2_flat(size_t site, const ODEState& state, 
-                                         size_t offset_SU3, double t) const;
-    
-    /**
-     * Compute local field for SU(3) site directly from flat state vector
-     * More efficient than get_local_field_SU3() which uses SpinConfig
-     * 
-     * @param site Site index in SU(3) sublattice
-     * @param state Flat ODE state vector
-     * @param offset_SU3 Starting index of SU(3) spins in state vector
-     * @param t Current time (for time-dependent drive)
-     */
-    SpinVector get_local_field_SU3_flat(size_t site, const ODEState& state, 
-                                         size_t offset_SU3, double t) const;
+    double relative_stationarity_residual(const ODEState& state) const;
 
     /**
-     * Helper: Get integration tolerances based on method
+     * Empty string if the GPU MD path implements every term of the current
+     * model and drive, otherwise a description of what it would silently drop
+     * (trilinear couplings, field-assisted exchange, Gilbert/Bloch damping,
+     * the thermal reservoir, two-colour or tabulated pulses, the linearised
+     * drive torque, a non-default SU(3) bracket, spin-state output).
      */
-    static std::pair<double, double> get_integration_tolerances(const string& method) {
-        if (method == "bulirsch_stoer") {
-            return {1e-8, 1e-8};  // abs_tol, rel_tol
+    string gpu_unsupported_reason(bool want_spin_states = false) const;
+
+    /// Throws std::invalid_argument when gpu_unsupported_reason() is non-empty.
+    void check_gpu_supported(bool want_spin_states = false) const {
+        const string why = gpu_unsupported_reason(want_spin_states);
+        if (!why.empty()) {
+            throw std::invalid_argument("MixedLattice GPU dynamics would silently drop: " + why +
+                                        "; run with use_gpu = false");
         }
-        return {1e-6, 1e-6};
     }
 
+private:
     /**
      * Helper: Safely create directories if path is non-empty
      */
@@ -4282,6 +4090,45 @@ private:
      * @param M_local_arr Output array for local magnetization
      * @param M_antiferro_arr Output array for antiferromagnetic magnetization
      */
+    // SU(3) reference subtraction folded into the SU(2) bilinear / on-site
+    // tables: reference_bond_slots_[i] holds, for SU(2) site i, the bilinear
+    // indices appended by set_mixed_trilinear_reference_SU3 and the
+    // mixed-trilinear entry each one was derived from.
+    SpinConfigSU3 trilinear_reference_SU3_;
+    vector<vector<std::pair<size_t, size_t>>> reference_bond_slots_;
+    vector<SpinMatrix> reference_saved_onsite_SU2_;   // on-site matrices before the fold
+
+    // Pulse envelope factors of one right-hand-side evaluation (zero = no drive).
+    struct DriveFactors {
+        double su2[2] = {0.0, 0.0};   // amplitude x envelope x carrier, pulse k
+        double su3[2] = {0.0, 0.0};
+        double env_E = 0.0, env_B = 0.0;                 // field-assisted exchange gates
+        double env_Bx = 0.0, env_By = 0.0, env_Bz = 0.0; // lab-frame B(t) components
+    };
+    DriveFactors drive_factors(double t) const;
+    // Equations of motion for given drive factors (see landau_lifshitz).
+    void evaluate_rhs(const ODEState& state, ODEState& dsdt, const DriveFactors& d) const;
+
+    // Install a train of n_pulses (1 or 2) pulses; slot 1 is inert for n = 1.
+    void configure_pulse_train(size_t n_pulses,
+                               const vector<SpinVector>& field1_SU2, const vector<SpinVector>& field1_SU3,
+                               double t1,
+                               const vector<SpinVector>& field2_SU2, const vector<SpinVector>& field2_SU3,
+                               double t2,
+                               double amp_SU2, double width_SU2, double freq_SU2,
+                               double amp_SU3, double width_SU3, double freq_SU3);
+    // Integrate state x from grid index k_start to the end of `grid` under the
+    // installed pulse train and return observe() at every sample k_start..n-1
+    // (the spin state too if requested; the states at the global indices
+    // `capture_at` go to `captured`). The pulse train is removed afterwards,
+    // also on error.
+    PumpProbeTrajectory integrate_pulse_train(const classical_spin::dynamics::TimeGrid& grid,
+                                              size_t k_start, ODEState x, const string& method,
+                                              vector<vector<double>>* spin_state_out,
+                                              double abs_tol, double rel_tol,
+                                              const vector<size_t>& capture_at = {},
+                                              vector<ODEState>* captured = nullptr);
+
     static void compute_sublattice_magnetizations_from_flat(const double* x, size_t offset,
                                                             size_t lattice_size, size_t spin_dim,
                                                             double* M_local_arr, double* M_antiferro_arr) {
@@ -4511,6 +4358,59 @@ public:
         for (size_t d = 0; d < spin_dim_SU2; ++d) M_stag_arr[d] /= double(lattice_size_SU2);
     }
 
+    /**
+     * SU(3) staggered magnetisation from a flat state: sublattice frames and
+     * the unit cell's AFM signs, exactly like the SU(2) version. (It used to
+     * alternate signs by flat site index, which depends on the site ordering;
+     * for the TmFeO3 cell, whose Tm signs are (+,-,+,-) with identity frames,
+     * both definitions coincide.)
+     */
+    void compute_magnetization_staggered_SU3_from_flat(const double* x, double* M_stag_arr) const {
+        for (size_t d = 0; d < spin_dim_SU3; ++d) M_stag_arr[d] = 0.0;
+        const size_t offset = lattice_size_SU2 * spin_dim_SU2;
+        for (size_t i = 0; i < lattice_size_SU3; ++i) {
+            const size_t atom = i % N_atoms_SU3;
+            const double sign = afm_sublattice_signs_SU3[atom];
+            const size_t idx = offset + i * spin_dim_SU3;
+            for (size_t mu = 0; mu < spin_dim_SU3; ++mu) {
+                for (size_t nu = 0; nu < spin_dim_SU3; ++nu) {
+                    M_stag_arr[mu] += sign * sublattice_frames_SU3[atom](mu, nu) * x[idx + nu];
+                }
+            }
+        }
+        for (size_t d = 0; d < spin_dim_SU3; ++d) M_stag_arr[d] /= double(lattice_size_SU3);
+    }
+
+    /**
+     * All magnetisation observables of a flat state, as recorded by every
+     * pulse-drive / MD driver (one definition for all of them):
+     * SU(2): [staggered (frames x AFM signs), mean local-frame, mean global]
+     * SU(3): [staggered (frames x AFM signs), mean local-frame, mean global].
+     */
+    Observables observe(const double* x) const {
+        Observables o;
+        double buf[8];
+        compute_magnetization_staggered_SU2_from_flat(x, buf);
+        o.first[0] = Eigen::Map<const Eigen::VectorXd>(buf, spin_dim_SU2);
+        o.first[1] = SpinVector::Zero(spin_dim_SU2);
+        for (size_t i = 0; i < lattice_size_SU2; ++i)
+            o.first[1] += Eigen::Map<const Eigen::VectorXd>(x + i * spin_dim_SU2, spin_dim_SU2);
+        o.first[1] /= double(lattice_size_SU2);
+        compute_magnetization_global_SU2_from_flat(x, buf);
+        o.first[2] = Eigen::Map<const Eigen::VectorXd>(buf, spin_dim_SU2);
+
+        const size_t off = lattice_size_SU2 * spin_dim_SU2;
+        compute_magnetization_staggered_SU3_from_flat(x, buf);
+        o.second[0] = Eigen::Map<const Eigen::VectorXd>(buf, spin_dim_SU3);
+        o.second[1] = SpinVector::Zero(spin_dim_SU3);
+        for (size_t i = 0; i < lattice_size_SU3; ++i)
+            o.second[1] += Eigen::Map<const Eigen::VectorXd>(x + off + i * spin_dim_SU3, spin_dim_SU3);
+        o.second[1] /= double(lattice_size_SU3);
+        compute_magnetization_global_SU3_from_flat(x, buf);
+        o.second[2] = Eigen::Map<const Eigen::VectorXd>(buf, spin_dim_SU3);
+        return o;
+    }
+
     // ============================================================
     // FILE I/O
     // ============================================================
@@ -4713,10 +4613,22 @@ public:
     }
 
     /**
-     * Molecular dynamics with single pulse field for SU(2) sublattice
-     * Returns magnetization trajectory without I/O
+     * Dynamics under ONE pulse centred at t_B (SU(2) and SU(3) components share
+     * the centre), starting from the current spins, which are left unchanged.
+     * Returns observe() at every point of the exact grid
+     * t_k = T_start + k step, k = 0..n (t_n <= T_end): n + 1 samples whose
+     * times are computed from integers, so trajectories with different pulse
+     * times are sample-by-sample comparable. `spin_state_out` (optional)
+     * receives the full spin state at every sample.
+     *
+     * Adaptive methods (dopri5) use dense output: steps are chosen by the
+     * error controller, capped inside the pulse window (|t - t_B| <= 9 width)
+     * at min(step, width/4, period/4) so the pulse cannot be stepped over.
+     * `pulse_window_chunking` is accepted for compatibility and ignored: the
+     * exact-grid integration needs no chunking (the chunk seams of the old
+     * scheme dropped steps).
      */
-    vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> single_pulse_drive(
+    PumpProbeTrajectory single_pulse_drive(
                const vector<SpinVector>& field_in_SU2, const vector<SpinVector>& field_in_SU3,
                double t_B,
                double pulse_amp_SU2, double pulse_width_SU2, double pulse_freq_SU2,
@@ -4724,131 +4636,15 @@ public:
                double T_start, double T_end, double step_size,
                const string& method = "dopri5", bool use_gpu = false,
                vector<vector<double>>* spin_state_out = nullptr,
-               // W3: pulse-window-aware chunked integration. The pulse
-               // window is built from max(σ_SU2, σ_SU3) so we never
-               // under-resolve either drive envelope.
                bool pulse_window_chunking = true,
-               // Ingredient XVIII: pump-probe ODE tolerances (default 1e-8;
-               // previously hard-coded 1e-10).
                double abs_tol = classical_spin_pulse_chunking::kDefaultPumpProbeAbsTol,
-               double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol) {
-        
-        if (use_gpu) {
-#ifdef CUDA_ENABLED
-            return single_pulse_drive_gpu(field_in_SU2, field_in_SU3, t_B,
-                            pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                            pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                            T_start, T_end, step_size, method);
-#else
-            std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED)." << endl;
-            std::cerr << "Falling back to CPU implementation." << endl;
-            // Fall through to CPU implementation
-#endif
-        }
-        
-        // Set up pulse
-        set_pulse_SU2(field_in_SU2, t_B, vector<SpinVector>(N_atoms_SU2, SpinVector::Zero(spin_dim_SU2)),
-                     0.0, pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2);
-        set_pulse_SU3(field_in_SU3, t_B, vector<SpinVector>(N_atoms_SU3, SpinVector::Zero(spin_dim_SU3)),
-                     0.0, pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3);
-        
-        // Storage for trajectory: (time, ([M_SU2_antiferro, M_SU2_local, M_SU2_global], [M_SU3_antiferro, M_SU3_local, M_SU3_global]))
-        vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> trajectory;
-        
-        // Start from current spins configuration
-        ODEState state = spins_to_state();
-        
-        // Create ODE system wrapper
-        auto system_func = [this](const ODEState& x, ODEState& dxdt, double t) {
-            this->ode_system(x, dxdt, t);
-        };
-        
-        // Observer to collect magnetization at regular intervals
-        double last_save_time = T_start;
-        auto observer = [&](const ODEState& x, double t) {
-            if (t - last_save_time >= step_size - 1e-10 || t >= T_end - 1e-10) {
-                // Compute SU(2) magnetizations using helper functions
-                double M_SU2_local_arr[8] = {0};
-                double M_SU2_antiferro_arr[8] = {0};
-                double M_SU2_global_arr[8] = {0};
-                
-                compute_sublattice_magnetizations_from_flat(x.data(), 0, 
-                    lattice_size_SU2, spin_dim_SU2, M_SU2_local_arr, M_SU2_antiferro_arr);
-                compute_magnetization_global_SU2_from_flat(x.data(), M_SU2_global_arr);
-                compute_magnetization_staggered_SU2_from_flat(x.data(), M_SU2_antiferro_arr);
-                
-                // Compute SU(3) magnetizations using helper functions
-                double M_SU3_local_arr[8] = {0};
-                double M_SU3_antiferro_arr[8] = {0};
-                double M_SU3_global_arr[8] = {0};
-                
-                compute_sublattice_magnetizations_from_flat(x.data(), lattice_size_SU2 * spin_dim_SU2, 
-                    lattice_size_SU3, spin_dim_SU3, M_SU3_local_arr, M_SU3_antiferro_arr);
-                compute_magnetization_global_SU3_from_flat(x.data(), M_SU3_global_arr);
-                
-                SpinVector M_SU2_local = Eigen::Map<Eigen::VectorXd>(M_SU2_local_arr, spin_dim_SU2) / double(lattice_size_SU2);
-                SpinVector M_SU2_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU2_antiferro_arr, spin_dim_SU2);
-                SpinVector M_SU2_global = Eigen::Map<Eigen::VectorXd>(M_SU2_global_arr, spin_dim_SU2);
-                SpinVector M_SU3_local = Eigen::Map<Eigen::VectorXd>(M_SU3_local_arr, spin_dim_SU3) / double(lattice_size_SU3);
-                SpinVector M_SU3_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU3_antiferro_arr, spin_dim_SU3) / double(lattice_size_SU3);
-                SpinVector M_SU3_global = Eigen::Map<Eigen::VectorXd>(M_SU3_global_arr, spin_dim_SU3);
-                
-                trajectory.push_back({t, {{M_SU2_antiferro, M_SU2_local, M_SU2_global}, {M_SU3_antiferro, M_SU3_local, M_SU3_global}}});
-                last_save_time = t;
-                if (spin_state_out != nullptr) {
-                    spin_state_out->push_back(vector<double>(x.begin(), x.end()));
-                }
-            }
-        };
-
-        // ---- W3: pulse-window-aware chunked integration ------------------
-        // The chunking partitions [T_start, T_end] into pulse-active and
-        // free segments.  We pass `step_size` (NOT seg.dt_init) to every
-        // chunk so `integrate_const(controlled_stepper, ..., dt)` fires
-        // the observer at the *same* fixed cadence in every segment.
-        //
-        // Why this matters: integrate_const treats `dt` as the observer
-        // cadence.  If we passed the larger `seg.dt_init` (= 20*step_size)
-        // in free segments, the observer would only fire every 0.4 ps
-        // there, producing a trajectory whose length depends on the
-        // pulse positions.  In the MPI 2DCS driver the rank-0 reference
-        // M0 has one pulse at t=0, while workers have pulses at {0, τ}.
-        // Different τ values then yield different trajectory lengths,
-        // and rank 0's MPI Send/Recv (sized from M0) overflows the
-        // worker buffer → segfault.  Using `step_size` everywhere
-        // restores a uniform cadence.  The marginal W3 speedup of
-        // skipping observer ticks in free regions is given up in
-        // exchange for predictable, MPI-safe trajectory lengths.
-        if (pulse_window_chunking) {
-            namespace ck = classical_spin_pulse_chunking;
-            const double sigma = std::max(pulse_width_SU2, pulse_width_SU3);
-            const auto segments = ck::build_pulse_segments(
-                T_start, T_end,
-                /*pulse_centers=*/ {t_B},
-                /*window=*/ ck::kPulseWindowSigmas * sigma,
-                /*T_step=*/ step_size,
-                /*free_dt_factor=*/ ck::kFreeDtFactor);
-            for (const auto& seg : segments) {
-                integrate_ode_system(system_func, state,
-                                     seg.t0, seg.t1, step_size,
-                                     observer, method, false, abs_tol, rel_tol);
-            }
-        } else {
-            integrate_ode_system(system_func, state, T_start, T_end, step_size,
-                                observer, method, false, abs_tol, rel_tol);
-        }
-
-        // Reset pulse
-        reset_pulse();
-        
-        return trajectory;
-    }
+               double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol);
 
     /**
-     * Molecular dynamics with two-pulse field
-     * Returns magnetization trajectory without I/O
+     * Dynamics under TWO pulses centred at t_B_1 and t_B_2, with independent
+     * per-pulse directions; otherwise identical to single_pulse_drive.
      */
-    vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> double_pulse_drive(
+    PumpProbeTrajectory double_pulse_drive(
                const vector<SpinVector>& field_in_1_SU2, const vector<SpinVector>& field_in_1_SU3,
                double t_B_1,
                const vector<SpinVector>& field_in_2_SU2, const vector<SpinVector>& field_in_2_SU3,
@@ -4860,120 +4656,26 @@ public:
                vector<vector<double>>* spin_state_out = nullptr,
                bool pulse_window_chunking = true,
                double abs_tol = classical_spin_pulse_chunking::kDefaultPumpProbeAbsTol,
-               double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol) {
-        
-        if (use_gpu) {
-#ifdef CUDA_ENABLED
-            return double_pulse_drive_gpu(field_in_1_SU2, field_in_1_SU3, t_B_1,
-                                field_in_2_SU2, field_in_2_SU3, t_B_2,
-                                pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                T_start, T_end, step_size, method);
-#else
-            std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED)." << endl;
-            std::cerr << "Falling back to CPU implementation." << endl;
-            // Fall through to CPU implementation
-#endif
-        }
-        
-        // Set up two-pulse configuration
-        set_pulse_SU2(field_in_1_SU2, t_B_1, field_in_2_SU2, t_B_2,
-                     pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2);
-        set_pulse_SU3(field_in_1_SU3, t_B_1, field_in_2_SU3, t_B_2,
-                     pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3);
-        
-        // Storage for trajectory
-        vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> trajectory;
-        
-        // Start from current spins configuration
-        ODEState state = spins_to_state();
-        
-        // Create ODE system wrapper
-        auto system_func = [this](const ODEState& x, ODEState& dxdt, double t) {
-            this->ode_system(x, dxdt, t);
-        };
-        
-        // Observer to collect magnetization at regular intervals
-        double last_save_time = T_start;
-        auto observer = [&](const ODEState& x, double t) {
-            if (t - last_save_time >= step_size - 1e-10 || t >= T_end - 1e-10) {
-                // Compute SU(2) magnetizations using helper functions
-                double M_SU2_local_arr[8] = {0};
-                double M_SU2_antiferro_arr[8] = {0};
-                double M_SU2_global_arr[8] = {0};
-                
-                compute_sublattice_magnetizations_from_flat(x.data(), 0, 
-                    lattice_size_SU2, spin_dim_SU2, M_SU2_local_arr, M_SU2_antiferro_arr);
-                compute_magnetization_global_SU2_from_flat(x.data(), M_SU2_global_arr);
-                compute_magnetization_staggered_SU2_from_flat(x.data(), M_SU2_antiferro_arr);
-                
-                // Compute SU(3) magnetizations using helper functions
-                double M_SU3_local_arr[8] = {0};
-                double M_SU3_antiferro_arr[8] = {0};
-                double M_SU3_global_arr[8] = {0};
-                
-                compute_sublattice_magnetizations_from_flat(x.data(), lattice_size_SU2 * spin_dim_SU2, 
-                    lattice_size_SU3, spin_dim_SU3, M_SU3_local_arr, M_SU3_antiferro_arr);
-                compute_magnetization_global_SU3_from_flat(x.data(), M_SU3_global_arr);
-                
-                SpinVector M_SU2_local = Eigen::Map<Eigen::VectorXd>(M_SU2_local_arr, spin_dim_SU2) / double(lattice_size_SU2);
-                SpinVector M_SU2_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU2_antiferro_arr, spin_dim_SU2);
-                SpinVector M_SU2_global = Eigen::Map<Eigen::VectorXd>(M_SU2_global_arr, spin_dim_SU2);
-                SpinVector M_SU3_local = Eigen::Map<Eigen::VectorXd>(M_SU3_local_arr, spin_dim_SU3) / double(lattice_size_SU3);
-                SpinVector M_SU3_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU3_antiferro_arr, spin_dim_SU3) / double(lattice_size_SU3);
-                SpinVector M_SU3_global = Eigen::Map<Eigen::VectorXd>(M_SU3_global_arr, spin_dim_SU3);
-                
-                trajectory.push_back({t, {{M_SU2_antiferro, M_SU2_local, M_SU2_global}, {M_SU3_antiferro, M_SU3_local, M_SU3_global}}});
-                last_save_time = t;
-                if (spin_state_out != nullptr) {
-                    spin_state_out->push_back(vector<double>(x.begin(), x.end()));
-                }
-            }
-        };
-
-        // ---- W3: pulse-window-aware chunked integration ------------------
-        // See single_pulse_drive() for the rationale on passing
-        // `step_size` (not `seg.dt_init`) — uniform observer cadence is
-        // required for MPI buffer-size correctness in the 2DCS driver.
-        if (pulse_window_chunking) {
-            namespace ck = classical_spin_pulse_chunking;
-            const double sigma = std::max(pulse_width_SU2, pulse_width_SU3);
-            const auto segments = ck::build_pulse_segments(
-                T_start, T_end,
-                /*pulse_centers=*/ {t_B_1, t_B_2},
-                /*window=*/ ck::kPulseWindowSigmas * sigma,
-                /*T_step=*/ step_size,
-                /*free_dt_factor=*/ ck::kFreeDtFactor);
-            for (const auto& seg : segments) {
-                integrate_ode_system(system_func, state,
-                                     seg.t0, seg.t1, step_size,
-                                     observer, method, false, abs_tol, rel_tol);
-            }
-        } else {
-            integrate_ode_system(system_func, state, T_start, T_end, step_size,
-                                observer, method, false, abs_tol, rel_tol);
-        }
-
-        // Reset pulse
-        reset_pulse();
-        
-        return trajectory;
-    }
+               double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol);
 
     /**
-     * Molecular dynamics using Boost.Odeint
+     * Free (undriven) dynamics of the current spins over [T_start, T_end],
+     * written to out_dir/trajectory.h5 on the uniform grid
+     * t_k = T_start + k (save_interval dt_initial). Fixed-step methods take
+     * save_interval steps of dt_initial per sample; adaptive methods use dense
+     * output with dt_initial as the initial step. Diagnostics on the same grid
+     * go to the /diagnostics group: energy per site and the drifts of |S_i|
+     * and of the two SU(3) Casimirs |n_i|^2, d_abc n^a n^b n^c (conserved by
+     * the undamped flow); a non-finite state aborts with an exception.
+     * Non-positive tolerances select the method defaults (1e-6; 1e-8 for BS).
      */
     void molecular_dynamics(double T_start, double T_end, double dt_initial,
                            const string& out_dir = "", size_t save_interval = 100,
                            const string& method = "dopri5", bool use_gpu = false,
-                           // Ingredient XVIII: MD tolerance overrides. Negative
-                           // values fall back to get_integration_tolerances(method)
-                           // so legacy callers keep their existing 1e-6 (or 1e-8 for BS).
                            double abs_tol = -1.0, double rel_tol = -1.0);
 
     /**
-     * CPU implementation of molecular dynamics
-     * Requires HDF5 for output - all non-HDF5 I/O has been retired.
+     * CPU implementation of molecular_dynamics (requires HDF5 for output).
      */
     void molecular_dynamics_cpu(double T_start, double T_end, double dt_initial,
                            const string& out_dir = "", size_t save_interval = 100,
@@ -5005,77 +4707,63 @@ public:
     }
 
     // ------------------------------------------------------------------
-    // W1 (time-translation) helpers — see Ingredient XV in
-    // docs/optimization_notes.tex.
+    // Pump-probe (2DCS) spectroscopy.
     //
-    // The single-pulse drive trajectory M_1(τ; t) of a deterministic
-    // LLG flow that starts from a stationary initial state is just the
-    // time-shifted single-pulse-applied-at-t=0 trajectory:
+    // For pulse fluences A (pump at t = 0) and B (probe at t = tau) the
+    // drivers record, on ONE exact grid t_k = T_start + k T_step shared by
+    // all trajectories,
+    //     M0(t)        pump only,
+    //     M1(tau; t)   probe only,
+    //     M01(tau; t)  pump + probe,
+    // so that the nonlinear signal M_NL = M01 - M0 - M1 (formed in
+    // post-processing) is well defined sample by sample.
     //
-    //     M_1(τ; t) = M_pulse(t − τ)
-    //
-    // (where M_pulse is the trajectory produced by `single_pulse_drive`
-    // with t_B = 0). The same identity reduces M_0(τ; t) to the *no-drive*
-    // trajectory of a stationary configuration, which is itself constant
-    // in time. We exploit this by computing only M_pulse once per (M_0,
-    // first pulse) pair and synthesising every M_1(τ) from it.
-    //
-    // The synthesis is only safe when:
-    //   1. langevin_temperature == 0  (deterministic LLG).
-    //   2. The initial state is stationary, i.e. max_t |dS/dt|_∞ < tol
-    //      with the drive disabled. We expose `max_dSdt_norm_no_drive()`
-    //      so the driver can verify this at runtime.
+    // Two exact savings are applied when their preconditions hold:
+    //   W1  M1(tau; t) = M0(t - tau) for a stationary initial state of the
+    //       autonomous (undriven) flow and tau on the grid; checked with the
+    //       dimensionless residual relative_stationarity_residual() <=
+    //       stationarity_tol. Disabled for distinct probe directions, for
+    //       spin-state output and on the GPU.
+    //   M01 For t < tau - W (W = probe half-support, 9 widths, where the
+    //       probe envelope is < 1.6e-9 of its peak) the pump-probe drive
+    //       equals the pump-only drive, so M01 is continued from the M0 state
+    //       stored at that grid point and its earlier samples are those of M0
+    //       (exactly zero M_NL before the probe arrives, and roughly half the
+    //       M01 cost). Controlled by `reuse_m0_for_m01` (config key of the
+    //       same name, default on).
     // ------------------------------------------------------------------
-    using PumpProbeTrajectory =
-        vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>>;
 
     /**
-     * Sample max ||dS/dt||_∞ across both sublattices over the
-     * current configuration with the pulse drive disabled. Returns a
-     * bound that is < tol iff the configuration is a (numerical)
-     * stationary point of the deterministic LLG flow.
-     *
-     * This is W1's runtime safety guard: the spectroscopy driver
-     * skips the M_1 → time-shift synthesis whenever the bound exceeds
-     * `stationarity_tol`, falling back to the explicit single-pulse
-     * integration. We never silently produce a wrong trajectory.
+     * max_i |dS_i/dt|_inf of the current spins with the drive removed and
+     * damping included (absolute, in inverse time units). See
+     * relative_stationarity_residual() for the scale-free W1 criterion.
      */
     double max_dSdt_norm_no_drive() const;
 
     /**
-     * Build M_1(τ; t) by time-shifting an M_pulse trajectory captured
-     * with t_B = 0:  M_1(τ; t)[i] = M_pulse((t_i − τ)). Indices outside
-     * the M_pulse window are filled with the stationary ground-state
-     * magnetisation `M_ground` (M_pulse asymptotes to M_ground far
-     * from the pulse window).
-     *
-     * @param M_pulse_trajectory  Output of single_pulse_drive(t_B = 0)
-     *                            covering [T_start − τ_max, T_end].
-     * @param M_ground            Stationary magnetisation.
-     * @param tau                 Delay τ (the pulse fires at t = τ).
-     * @param T_start, T_end, T_step  Output grid (same as M_pulse cadence).
+     * M1(tau; t_k) = M0(t_k - tau) for a trajectory M0 recorded with the pump
+     * at t = 0 on the grid T_start + k T_step: the sample index is shifted by
+     * the integer m = tau / T_step and samples before the probe take the
+     * stationary `M_ground`. Throws std::invalid_argument if tau is not a
+     * multiple of T_step (to 1e-9 relative) -- rounding it, as before, put
+     * M1 up to T_step/2 off its time label.
      */
     PumpProbeTrajectory synthesize_M1_from_M0(
         const PumpProbeTrajectory& M_pulse_trajectory,
-        const pair<array<SpinVector, 3>, array<SpinVector, 3>>& M_ground,
+        const Observables& M_ground,
         double tau,
         double T_start, double T_end, double T_step) const;
 
     /**
-     * Complete pump-probe nonlinear spectroscopy workflow for mixed lattice
-     * Handles both SU(2) and SU(3) sublattices with consistent nomenclature
-     * 
-     * NOTE: Ground state should be prepared beforehand via simulated_annealing()
-     *       or loaded from file before calling this method.
-     *
-     * Optional W1/W2/W3 controls:
-     *   reuse_m0_for_m1       — opt in to time-translation synthesis of
-     *                           M_1 trajectories. Auto-disabled if the
-     *                           runtime stationarity guard fails.
-     *   stationarity_tol      — guard threshold on max ||dS/dt||_∞.
-     *   outer_omp_threads     — OpenMP team size for the τ loop. <= 0
-     *                           leaves it to the runtime / env.
-     *   pulse_window_chunking — pass-through to single_/double_pulse_drive.
+     * Pump-probe / 2DCS scan on one process (optionally OpenMP-parallel over
+     * tau with `outer_omp_threads` > 1; the scan is serial on the GPU so every
+     * trajectory uses one backend). Writes dir_name/pump_probe_spectroscopy.h5.
+     * The ground state must be prepared beforehand (annealed or loaded).
+     *   reuse_m0_for_m1   enable W1 (see above), stationarity_tol its threshold
+     *   field_in_SU2_B / field_in_SU3_B  probe directions (empty: same as pump)
+     *   reuse_m0_for_m01  continue M01 from stored M0 states (see above)
+     * Delays: tau_start + i tau_step for i = 0..n-1 with tau_end included (to
+     * round-off); tau_step must be non-zero and point towards tau_end.
      */
     void pump_probe_spectroscopy(const vector<SpinVector>& field_in_SU2,
                                  const vector<SpinVector>& field_in_SU3,
@@ -5094,16 +4782,20 @@ public:
                                  int outer_omp_threads = 0,
                                  bool pulse_window_chunking = true,
                                  double abs_tol = classical_spin_pulse_chunking::kDefaultPumpProbeAbsTol,
-                                 double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol);
+                                 double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol,
+                                 const vector<SpinVector>& field_in_SU2_B = {},
+                                 const vector<SpinVector>& field_in_SU3_B = {},
+                                 bool reuse_m0_for_m01 = true);
 
     /**
-     * MPI-parallelized pump-probe spectroscopy for mixed lattice
-     * 
-     * Distributes tau delay values across MPI ranks for parallel computation.
-     * Each rank computes a subset of tau values, then rank 0 gathers and writes results.
-     *
-     * W2 (inter-τ parallelism) is provided here by MPI; the new W1/W3
-     * controls behave like the serial driver above.
+     * MPI version of pump_probe_spectroscopy with the same physics and the
+     * same HDF5 file layout. Rank 0 computes M0, synthesises M1 under W1 and
+     * writes the file; the other ranks pull delay indices from rank 0 one at a
+     * time (dynamic load balancing) and stream each result back as soon as it
+     * is computed, so no rank holds more than one delay point. With a single
+     * rank it falls back to the serial driver. Errors on any rank (invalid
+     * input, non-finite dynamics, I/O failure) are reported to every rank and
+     * rethrown everywhere as std::runtime_error -- no rank is left blocked.
      */
     void pump_probe_spectroscopy_mpi(const vector<SpinVector>& field_in_SU2,
                                      const vector<SpinVector>& field_in_SU3,
@@ -5123,7 +4815,31 @@ public:
                                      double abs_tol = classical_spin_pulse_chunking::kDefaultPumpProbeAbsTol,
                                      double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol,
                                      const vector<SpinVector>& field_in_SU2_B = {},
-                                     const vector<SpinVector>& field_in_SU3_B = {});
+                                     const vector<SpinVector>& field_in_SU3_B = {},
+                                     bool reuse_m0_for_m01 = true);
+
+private:
+    struct SpectroscopyPlan;   // validated scan description (mixed_lattice_md.cpp)
+    struct DelayResult;        // M1 / partial M01 of one delay
+    // M0 with the states needed to continue M01 (plan.checkpoint_indices).
+    PumpProbeTrajectory run_reference_trajectory(const SpectroscopyPlan& plan, const ODEState& x_ground,
+                                                 vector<vector<double>>* spin_states,
+                                                 vector<ODEState>* checkpoints);
+    // M1 (unless synthesised) and M01 from its start index for delay j.
+    void compute_delay(const SpectroscopyPlan& plan, size_t j, const ODEState& x_ground,
+                       const ODEState* checkpoint, DelayResult& out);
+    SpectroscopyPlan plan_spectroscopy(const vector<SpinVector>& field_in_SU2,
+                                       const vector<SpinVector>& field_in_SU3,
+                                       const vector<SpinVector>& field_in_SU2_B,
+                                       const vector<SpinVector>& field_in_SU3_B,
+                                       double pulse_amp_SU2, double pulse_width_SU2, double pulse_freq_SU2,
+                                       double pulse_amp_SU3, double pulse_width_SU3, double pulse_freq_SU3,
+                                       double tau_start, double tau_end, double tau_step,
+                                       double T_start, double T_end, double T_step,
+                                       const string& method, bool use_gpu, bool save_spin_trajectories,
+                                       bool reuse_m0_for_m1, double stationarity_tol,
+                                       bool reuse_m0_for_m01, double abs_tol, double rel_tol) const;
+public:
 
 // ============================================================
 // GPU Implementation Section
@@ -5201,11 +4917,7 @@ private:
      */
     void ensure_gpu_mixed_data_initialized() const {
         if (gpu_mixed_data_initialized_) return;
-        if (has_mixed_bilinear_drive) {
-            throw std::runtime_error(
-                "MixedLattice GPU MD does not support field-assisted Fe-Tm "
-                "exchange (H_{E chi} / H_{B chi}); run with use_gpu=false.");
-        }
+        check_gpu_supported();  // the device kernels implement only part of the model
         gpu_mixed_data_cache_ = create_gpu_mixed_data();
         gpu_mixed_data_initialized_ = true;
     }
@@ -6123,11 +5835,7 @@ private:
      */
     void ensure_gpu_mixed_data_initialized() const {
         if (gpu_mixed_data_initialized_) return;
-        if (has_mixed_bilinear_drive) {
-            throw std::runtime_error(
-                "MixedLattice GPU MD does not support field-assisted Fe-Tm "
-                "exchange (H_{E chi} / H_{B chi}); run with use_gpu=false.");
-        }
+        check_gpu_supported();  // the device kernels implement only part of the model
         
         // Flatten SU(2) data
         vector<double> flat_field_SU2, flat_onsite_SU2, flat_bilinear_SU2;
@@ -6425,13 +6133,7 @@ private:
                                       {M_antiferro_SU3, M_local_SU3, M_global_SU3}}});
         }
         
-        // Reset pulses
-        field_drive_SU2[0] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
-        field_drive_SU2[1] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
-        field_drive_amp_SU2 = 0.0;
-        field_drive_SU3[0] = SpinVector::Zero(N_atoms_SU3 * spin_dim_SU3);
-        field_drive_SU3[1] = SpinVector::Zero(N_atoms_SU3 * spin_dim_SU3);
-        field_drive_amp_SU3 = 0.0;
+        reset_pulse();
         
         return trajectory;
     }
@@ -6511,13 +6213,7 @@ private:
                                       {M_antiferro_SU3, M_local_SU3, M_global_SU3}}});
         }
         
-        // Reset pulses
-        field_drive_SU2[0] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
-        field_drive_SU2[1] = SpinVector::Zero(N_atoms_SU2 * spin_dim_SU2);
-        field_drive_amp_SU2 = 0.0;
-        field_drive_SU3[0] = SpinVector::Zero(N_atoms_SU3 * spin_dim_SU3);
-        field_drive_SU3[1] = SpinVector::Zero(N_atoms_SU3 * spin_dim_SU3);
-        field_drive_amp_SU3 = 0.0;
+        reset_pulse();
         
         return trajectory;
     }

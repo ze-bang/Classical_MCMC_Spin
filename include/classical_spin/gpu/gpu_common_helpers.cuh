@@ -381,7 +381,11 @@ void add_drive_field_device(double* local_field,
 }
 
 /**
- * Compute Landau-Lifshitz derivative: dsdt = H_eff × spin
+ * Compute Landau-Lifshitz derivative: dsdt = H_eff × spin (SU(2)), and the
+ * Lie-Poisson equation dn_a/dt = 2 f_abc H_b n_c for SU(3) Gell-Mann vectors
+ * n = <lambda> ([lambda_a, lambda_b] = 2i f_abc lambda_c; see
+ * core/su3_coherent_state.h). The host refuses the GPU path for the legacy
+ * bracket convention (MixedLattice::check_gpu_supported).
  */
 __device__ __forceinline__
 void compute_ll_derivative_device(double* dsdt, const double* spin, 
@@ -390,6 +394,7 @@ void compute_ll_derivative_device(double* dsdt, const double* spin,
         cross_product_SU2_device(dsdt, local_field, spin);
     } else if (spin_dim == 8) {
         cross_product_SU3_device(dsdt, local_field, spin);
+        for (int a = 0; a < 8; ++a) dsdt[a] *= 2.0;   // kGellMannBracket
     } else {
         // Generic case - zero for now
         for (size_t i = 0; i < spin_dim; ++i) {
