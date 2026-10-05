@@ -590,7 +590,26 @@ add_optimized_executable(bench_integrators src/apps/bench_integrators.cpp)
 # methods (euler/rk2/rk4/ssprk53/dopri5). No-op when built without CUDA.
 add_optimized_executable(test_mixed_gpu_cpu_equivalence src/apps/test_mixed_gpu_cpu_equivalence.cpp)
 
+# Physics validation suite (tests/): every kernel is checked against a result
+# known independently of the code -- closed-form statistical mechanics, exact
+# Boltzmann quadrature for tiny clusters, analytic precession / magnon
+# frequencies and known classical ground states.
+set(CLASSICAL_SPIN_PHYSICS_TESTS
+    test_mc_statistics
+    test_mc_exact
+    test_md_exact
+    test_sa_ground_state
+)
+foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
+    add_optimized_executable(${t} tests/${t}.cpp)
+endforeach()
+
 if(BUILD_TESTING)
+    foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
+        add_test(NAME physics_${t} COMMAND ${t})
+        set_tests_properties(physics_${t} PROPERTIES TIMEOUT 300 LABELS physics
+                             ENVIRONMENT "OMP_NUM_THREADS=2")
+    endforeach()
     add_test(NAME e1_phonon_regressions COMMAND test_e1_phonon_regressions)
     add_test(NAME mixed_trilinear_regressions COMMAND test_mixed_trilinear_regressions)
     add_test(NAME global_frame_equivalence COMMAND test_global_frame_equivalence)

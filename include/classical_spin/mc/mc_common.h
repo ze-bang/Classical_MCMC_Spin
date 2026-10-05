@@ -107,61 +107,79 @@ struct AutocorrelationResult {
 // ============================================================
 
 /**
- * Binning analysis (recursive blocking) for error estimation
- * with automatic integrated autocorrelation time detection.
+ * Binning analysis (Flyvbjerg-Petersen blocking) for the standard error of
+ * the mean of a correlated time series, with the integrated autocorrelation
+ * time tau_int = (err_l / err_0)^2 / 2 read off the chosen level.
+ *
+ * Level choice: the smallest block length B = 2^l satisfying the
+ * Wolff / Lee et al. criterion  B^3 >= 2 n (err_l / err_0)^4 , i.e. blocks
+ * long compared with the autocorrelation time (B^3 > 8 n tau^2) while
+ * keeping as many blocks as possible. (Taking the maximum error over levels,
+ * as was done previously, is biased upward by the noise of the few-block
+ * levels.) If no level qualifies, the deepest level with at least 16 blocks
+ * is used and the error is a lower bound.
+ *
+ * Variances are accumulated on mean-shifted data so that a large common
+ * offset (total energies of big lattices) does not cancel catastrophically.
  */
 inline BinningResult binning_analysis(const vector<double>& data) {
     BinningResult result;
     if (data.empty()) return result;
 
-    size_t n = data.size();
+    const size_t n = data.size();
     result.mean = std::accumulate(data.begin(), data.end(), 0.0) / double(n);
+    double residual = 0.0;  // second pass removes the rounding error of the first
+    for (double x : data) residual += x - result.mean;
+    result.mean += residual / double(n);
+
+    vector<double> binned(n);
+    for (size_t i = 0; i < n; ++i) binned[i] = data[i] - result.mean;
 
     if (n < 4) {
         double var = 0.0;
-        for (double x : data) var += (x - result.mean) * (x - result.mean);
-        result.error = std::sqrt(var / (n * (n - 1)));
+        for (double x : binned) var += x * x;
+        result.error = (n > 1) ? std::sqrt(var / (double(n) * double(n - 1))) : 0.0;
         return result;
     }
 
-    // Recursive blocking
-    vector<double> binned = data;
-    size_t max_levels = static_cast<size_t>(std::log2(n)) - 1;
-    result.errors_by_level.reserve(max_levels);
-
     while (binned.size() >= 4) {
-        size_t m = binned.size();
-        double s = 0.0, s2 = 0.0;
-        for (double x : binned) { s += x; s2 += x * x; }
-        double mean_l = s / m;
-        double var_l  = s2 / m - mean_l * mean_l;
-        result.errors_by_level.push_back(std::sqrt(var_l / (m - 1)));
+        const size_t m = binned.size();
+        double s = 0.0;
+        for (double x : binned) s += x;
+        const double mean_l = s / double(m);
+        double var_l = 0.0;
+        for (double x : binned) var_l += (x - mean_l) * (x - mean_l);
+        var_l /= double(m);
+        result.errors_by_level.push_back(std::sqrt(var_l / double(m - 1)));
 
-        vector<double> next;
-        next.reserve(m / 2);
-        for (size_t i = 0; i + 1 < m; i += 2)
-            next.push_back(0.5 * (binned[i] + binned[i + 1]));
+        vector<double> next(m / 2);
+        for (size_t i = 0; i < m / 2; ++i)
+            next[i] = 0.5 * (binned[2 * i] + binned[2 * i + 1]);
         binned = std::move(next);
     }
 
-    // Optimal level = level with maximum error (plateau)
-    if (result.errors_by_level.size() > 2) {
-        double mx = 0.0;
-        for (size_t l = 0; l < result.errors_by_level.size(); ++l)
-            if (result.errors_by_level[l] > mx) {
-                mx = result.errors_by_level[l];
-                result.optimal_bin_level = l;
-            }
-    }
-
-    if (!result.errors_by_level.empty()) {
-        size_t use = std::min(result.optimal_bin_level + 1,
-                              result.errors_by_level.size() - 1);
-        result.error = result.errors_by_level[use];
-        if (result.errors_by_level[0] > 1e-20) {
-            double ratio = result.error / result.errors_by_level[0];
-            result.tau_int = 0.5 * ratio * ratio;
+    const size_t n_levels = result.errors_by_level.size();
+    const double err0 = result.errors_by_level[0];
+    size_t chosen = n_levels;
+    if (err0 > 0.0) {
+        for (size_t l = 0; l < n_levels; ++l) {
+            const double B = std::ldexp(1.0, int(l));
+            const double r2 = (result.errors_by_level[l] / err0) * (result.errors_by_level[l] / err0);
+            if (B * B * B >= 2.0 * double(n) * r2 * r2) { chosen = l; break; }
         }
+    }
+    if (chosen == n_levels) {
+        chosen = 0;
+        for (size_t l = 0; l < n_levels; ++l)
+            if ((n >> l) >= 16) chosen = l;
+    }
+    result.optimal_bin_level = chosen;
+    result.error = result.errors_by_level[chosen];
+    if (err0 > 0.0) {
+        const double ratio = result.error / err0;
+        result.tau_int = std::max(0.5, 0.5 * ratio * ratio);
+    } else {
+        result.tau_int = 0.5;
     }
     return result;
 }
