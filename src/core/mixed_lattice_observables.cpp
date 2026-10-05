@@ -33,270 +33,52 @@
     }
 
 // ---- MixedLattice::compute_thermodynamic_observables ----
+// Shared estimators (mc/statistics.h): Gamma-method means and errors,
+// c = Var(E)/(N T^2) and the E-S cross terms by jackknife over blocks of
+// ~8 tau_int that cover every sample.
     MixedThermodynamicObservables MixedLattice::compute_thermodynamic_observables(
         const vector<MixedMeasurement>& measurements,
         double T) const {
-        
         MixedThermodynamicObservables obs;
         obs.temperature = T;
-        size_t n_samples = measurements.size();
-        
-        if (n_samples == 0) return obs;
-        
-        size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
-        
-        // 1. Energy observables with binning analysis
-        vector<double> energy_per_site(n_samples);
-        vector<double> energy_SU2_per_site(n_samples);
-        vector<double> energy_SU3_per_site(n_samples);
-        
-        for (size_t i = 0; i < n_samples; ++i) {
-            energy_per_site[i] = measurements[i].energy / double(total_sites);
-            energy_SU2_per_site[i] = measurements[i].energy_SU2 / double(lattice_size_SU2);
-            energy_SU3_per_site[i] = measurements[i].energy_SU3 / double(lattice_size_SU3);
+        const size_t n = measurements.size();
+        if (n == 0) return obs;
+        const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
+
+        vector<double> E(n), e(n), e2(n), e3(n);
+        for (size_t i = 0; i < n; ++i) {
+            E[i] = measurements[i].energy;
+            e[i] = E[i] / double(total_sites);
+            e2[i] = lattice_size_SU2 ? measurements[i].energy_SU2 / double(lattice_size_SU2) : 0.0;
+            e3[i] = lattice_size_SU3 ? measurements[i].energy_SU3 / double(lattice_size_SU3) : 0.0;
         }
-        
-        MixedBinningResult E_result = binning_analysis(energy_per_site);
-        MixedBinningResult E_SU2_result = binning_analysis(energy_SU2_per_site);
-        MixedBinningResult E_SU3_result = binning_analysis(energy_SU3_per_site);
-        
-        obs.energy_total.value = E_result.mean;
-        obs.energy_total.error = E_result.error;
-        obs.energy_SU2.value = E_SU2_result.mean;
-        obs.energy_SU2.error = E_SU2_result.error;
-        obs.energy_SU3.value = E_SU3_result.mean;
-        obs.energy_SU3.error = E_SU3_result.error;
-        
-        // 2. Specific heat per site with jackknife error estimation
-        //    c_V = Var(E) / (T² N²) = Var(E/N) / T²
-        {
-            const double N_sites = double(total_sites);  // c = Var(E)/(N T^2)
-            
-            // Extract energies for easier access
-            vector<double> E_total(n_samples);
-            for (size_t i = 0; i < n_samples; ++i) {
-                E_total[i] = measurements[i].energy;
-            }
-            
-            // Handle edge case: need at least 2 samples for variance
-            if (n_samples < 2) {
-                obs.specific_heat.value = 0.0;
-                obs.specific_heat.error = 0.0;
-            } else {
-                // Compute mean first for numerical stability (two-pass algorithm)
-                double E_mean = 0.0;
-                for (size_t i = 0; i < n_samples; ++i) {
-                    E_mean += E_total[i];
-                }
-                E_mean /= n_samples;
-                
-                // Compute variance using shifted data for numerical stability
-                // Var(E) = <(E - E_mean)²> which avoids catastrophic cancellation
-                double var_E = 0.0;
-                for (size_t i = 0; i < n_samples; ++i) {
-                    double delta = E_total[i] - E_mean;
-                    var_E += delta * delta;
-                }
-                var_E /= n_samples;  // Biased estimator (for heat capacity)
-                
-                // Ensure non-negative variance (numerical protection)
-                var_E = std::max(0.0, var_E);
-                obs.specific_heat.value = var_E / (T * T * N_sites);
-                
-                // Jackknife error estimation
-                // Use at most 100 jackknife blocks, at least 2
-                size_t n_jack = std::min(n_samples, size_t(100));
-                n_jack = std::max(n_jack, size_t(2));
-                size_t block_size = std::max(size_t(1), n_samples / n_jack);
-                // Recalculate n_jack based on actual block_size to handle remainders
-                n_jack = (n_samples + block_size - 1) / block_size;
-                
-                vector<double> C_jack(n_jack);
-                
-                for (size_t j = 0; j < n_jack; ++j) {
-                    // Leave out block j: indices [j*block_size, min((j+1)*block_size, n_samples))
-                    size_t block_start = j * block_size;
-                    size_t block_end = std::min((j + 1) * block_size, n_samples);
-                    
-                    // Compute jackknife mean (excluding block j)
-                    double E_sum = 0.0;
-                    size_t count = 0;
-                    for (size_t i = 0; i < n_samples; ++i) {
-                        if (i < block_start || i >= block_end) {
-                            E_sum += E_total[i];
-                            ++count;
-                        }
-                    }
-                    
-                    if (count < 2) {
-                        C_jack[j] = obs.specific_heat.value;  // Fallback
-                        continue;
-                    }
-                    
-                    double E_j = E_sum / count;
-                    
-                    // Compute jackknife variance (excluding block j)
-                    double var_j = 0.0;
-                    for (size_t i = 0; i < n_samples; ++i) {
-                        if (i < block_start || i >= block_end) {
-                            double delta = E_total[i] - E_j;
-                            var_j += delta * delta;
-                        }
-                    }
-                    var_j /= count;
-                    var_j = std::max(0.0, var_j);  // Numerical protection
-                    
-                    C_jack[j] = var_j / (T * T * N_sites);
-                }
-                
-                // Compute jackknife error estimate
-                double C_mean = 0.0;
-                for (double c : C_jack) C_mean += c;
-                C_mean /= n_jack;
-                
-                double C_var = 0.0;
-                for (double c : C_jack) C_var += (c - C_mean) * (c - C_mean);
-                C_var *= double(n_jack - 1) / double(n_jack);  // Jackknife variance factor
-                obs.specific_heat.error = std::sqrt(std::max(0.0, C_var));
-            }
-        }
-        
-        // 3. SU(2) sublattice magnetizations with binning analysis
-        if (!measurements[0].sublattice_mags_SU2.empty()) {
-            size_t n_sublattices_SU2 = measurements[0].sublattice_mags_SU2.size();
-            
-            obs.sublattice_magnetization_SU2.resize(n_sublattices_SU2);
-            obs.energy_sublattice_cross_SU2.resize(n_sublattices_SU2);
-            
-            for (size_t alpha = 0; alpha < n_sublattices_SU2; ++alpha) {
-                obs.sublattice_magnetization_SU2[alpha] = MixedVectorObservable(spin_dim_SU2);
-                obs.energy_sublattice_cross_SU2[alpha] = MixedVectorObservable(spin_dim_SU2);
-                
-                for (size_t d = 0; d < spin_dim_SU2; ++d) {
-                    // Extract time series for magnetization component
-                    vector<double> M_alpha_d(n_samples);
-                    for (size_t i = 0; i < n_samples; ++i) {
-                        M_alpha_d[i] = measurements[i].sublattice_mags_SU2[alpha](d);
-                    }
-                    MixedBinningResult M_result = binning_analysis(M_alpha_d);
-                    obs.sublattice_magnetization_SU2[alpha].values[d] = M_result.mean;
-                    obs.sublattice_magnetization_SU2[alpha].errors[d] = M_result.error;
-                    
-                    // Cross term <E * S_α,d> - <E><S_α,d>
-                    vector<double> ES_alpha_d(n_samples);
-                    for (size_t i = 0; i < n_samples; ++i) {
-                        ES_alpha_d[i] = measurements[i].energy * measurements[i].sublattice_mags_SU2[alpha](d);
-                    }
-                    
-                    MixedBinningResult ES_result = binning_analysis(ES_alpha_d);
-                    double E_mean = obs.energy_total.value * double(total_sites);
-                    double S_mean = M_result.mean;
-                    double cross_val = ES_result.mean - E_mean * S_mean;
-                    
-                    // Jackknife for cross-correlation error
-                    size_t n_jack = std::min(n_samples, size_t(100));
-                    size_t block_size = n_samples / n_jack;
-                    vector<double> cross_jack(n_jack);
-                    
-                    for (size_t j = 0; j < n_jack; ++j) {
-                        double E_sum = 0.0, S_sum = 0.0, ES_sum = 0.0;
-                        size_t count = 0;
-                        for (size_t i = 0; i < n_samples; ++i) {
-                            if (i / block_size != j) {
-                                E_sum += measurements[i].energy;
-                                S_sum += measurements[i].sublattice_mags_SU2[alpha](d);
-                                ES_sum += measurements[i].energy * measurements[i].sublattice_mags_SU2[alpha](d);
-                                ++count;
-                            }
-                        }
-                        double E_j = E_sum / count;
-                        double S_j = S_sum / count;
-                        double ES_j = ES_sum / count;
-                        cross_jack[j] = ES_j - E_j * S_j;
-                    }
-                    
-                    double cross_mean = 0.0;
-                    for (double c : cross_jack) cross_mean += c;
-                    cross_mean /= n_jack;
-                    
-                    double cross_var = 0.0;
-                    for (double c : cross_jack) cross_var += (c - cross_mean) * (c - cross_mean);
-                    cross_var *= double(n_jack - 1) / n_jack;
-                    
-                    obs.energy_sublattice_cross_SU2[alpha].values[d] = cross_val;
-                    obs.energy_sublattice_cross_SU2[alpha].errors[d] = std::sqrt(cross_var);
+        obs.energy_total = mc::mean_with_error(e);
+        obs.energy_SU2 = mc::mean_with_error(e2);
+        obs.energy_SU3 = mc::mean_with_error(e3);
+        obs.specific_heat = (T > 0.0) ? mc::scaled_variance(E, 1.0 / (double(total_sites) * T * T))
+                                      : Observable(0.0, 0.0);
+
+        auto sublattices = [&](auto member, size_t dim, vector<VectorObservable>& mag,
+                               vector<VectorObservable>& cross) {
+            const size_t n_sub = (measurements[0].*member).size();
+            mag.assign(n_sub, VectorObservable(dim));
+            cross.assign(n_sub, VectorObservable(dim));
+            vector<double> S(n);
+            for (size_t a = 0; a < n_sub; ++a) {
+                for (size_t d = 0; d < dim; ++d) {
+                    for (size_t i = 0; i < n; ++i) S[i] = (measurements[i].*member)[a](d);
+                    const Observable m = mc::mean_with_error(S), c = mc::covariance(E, S);
+                    mag[a].values[d] = m.value;
+                    mag[a].errors[d] = m.error;
+                    cross[a].values[d] = c.value;
+                    cross[a].errors[d] = c.error;
                 }
             }
-        }
-        
-        // 4. SU(3) sublattice magnetizations with binning analysis
-        if (!measurements[0].sublattice_mags_SU3.empty()) {
-            size_t n_sublattices_SU3 = measurements[0].sublattice_mags_SU3.size();
-            
-            obs.sublattice_magnetization_SU3.resize(n_sublattices_SU3);
-            obs.energy_sublattice_cross_SU3.resize(n_sublattices_SU3);
-            
-            for (size_t alpha = 0; alpha < n_sublattices_SU3; ++alpha) {
-                obs.sublattice_magnetization_SU3[alpha] = MixedVectorObservable(spin_dim_SU3);
-                obs.energy_sublattice_cross_SU3[alpha] = MixedVectorObservable(spin_dim_SU3);
-                
-                for (size_t d = 0; d < spin_dim_SU3; ++d) {
-                    // Extract time series for magnetization component
-                    vector<double> M_alpha_d(n_samples);
-                    for (size_t i = 0; i < n_samples; ++i) {
-                        M_alpha_d[i] = measurements[i].sublattice_mags_SU3[alpha](d);
-                    }
-                    MixedBinningResult M_result = binning_analysis(M_alpha_d);
-                    obs.sublattice_magnetization_SU3[alpha].values[d] = M_result.mean;
-                    obs.sublattice_magnetization_SU3[alpha].errors[d] = M_result.error;
-                    
-                    // Cross term <E * S_α,d> - <E><S_α,d>
-                    vector<double> ES_alpha_d(n_samples);
-                    for (size_t i = 0; i < n_samples; ++i) {
-                        ES_alpha_d[i] = measurements[i].energy * measurements[i].sublattice_mags_SU3[alpha](d);
-                    }
-                    
-                    MixedBinningResult ES_result = binning_analysis(ES_alpha_d);
-                    double E_mean = obs.energy_total.value * double(total_sites);
-                    double S_mean = M_result.mean;
-                    double cross_val = ES_result.mean - E_mean * S_mean;
-                    
-                    // Jackknife for cross-correlation error
-                    size_t n_jack = std::min(n_samples, size_t(100));
-                    size_t block_size = n_samples / n_jack;
-                    vector<double> cross_jack(n_jack);
-                    
-                    for (size_t j = 0; j < n_jack; ++j) {
-                        double E_sum = 0.0, S_sum = 0.0, ES_sum = 0.0;
-                        size_t count = 0;
-                        for (size_t i = 0; i < n_samples; ++i) {
-                            if (i / block_size != j) {
-                                E_sum += measurements[i].energy;
-                                S_sum += measurements[i].sublattice_mags_SU3[alpha](d);
-                                ES_sum += measurements[i].energy * measurements[i].sublattice_mags_SU3[alpha](d);
-                                ++count;
-                            }
-                        }
-                        double E_j = E_sum / count;
-                        double S_j = S_sum / count;
-                        double ES_j = ES_sum / count;
-                        cross_jack[j] = ES_j - E_j * S_j;
-                    }
-                    
-                    double cross_mean = 0.0;
-                    for (double c : cross_jack) cross_mean += c;
-                    cross_mean /= n_jack;
-                    
-                    double cross_var = 0.0;
-                    for (double c : cross_jack) cross_var += (c - cross_mean) * (c - cross_mean);
-                    cross_var *= double(n_jack - 1) / n_jack;
-                    
-                    obs.energy_sublattice_cross_SU3[alpha].values[d] = cross_val;
-                    obs.energy_sublattice_cross_SU3[alpha].errors[d] = std::sqrt(cross_var);
-                }
-            }
-        }
-        
+        };
+        sublattices(&MixedMeasurement::sublattice_mags_SU2, spin_dim_SU2, obs.sublattice_magnetization_SU2,
+                    obs.energy_sublattice_cross_SU2);
+        sublattices(&MixedMeasurement::sublattice_mags_SU3, spin_dim_SU3, obs.sublattice_magnetization_SU3,
+                    obs.energy_sublattice_cross_SU3);
         return obs;
     }
 

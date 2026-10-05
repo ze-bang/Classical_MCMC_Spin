@@ -99,6 +99,7 @@
 #endif
 #include "classical_spin/core/spin_config.h"  // For should_rank_write
 #include "classical_spin/mc/mc_common.h"       // Common MC types and algorithms
+#include "classical_spin/mc/parallel_tempering.h"  // replica-exchange engine + ladder tuning
 
 using std::vector;
 using std::string;
@@ -1793,35 +1794,39 @@ public:
     // PARALLEL TEMPERING & DIAGNOSTICS — delegated to mc::
     // ============================================================
     
-    /** Parallel tempering with MPI (delegates to mc::parallel_tempering). */
-    void parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
+    /**
+     * Parallel tempering on the shared engine (mc::run_parallel_tempering).
+     * The spin MC kernels do not sample the phonon coordinates and only the
+     * spins are exchanged, so the phonon sector is frozen during PT; since the
+     * swap acceptance uses total energies (which include phonon terms), the
+     * engine verifies that the frozen phonon state is identical on all ranks.
+     */
+    mc::PTResult parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
                            size_t overrelaxation_rate, size_t swap_rate, size_t probe_rate,
                            string dir_name, const vector<int>& rank_to_write,
                            bool gaussian_move = true, MPI_Comm comm = MPI_COMM_WORLD,
-                           bool verbose = false, const vector<size_t>& sweeps_per_temp = {}) {
-        // Seed lattice RNG per rank
-        int rank; MPI_Comm_rank(comm, &rank);
-        auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        rng.seed(static_cast<unsigned int>(seed + rank * 1000));
-        mc::parallel_tempering(*this, temp, n_anneal, n_measure,
-            overrelaxation_rate, swap_rate, probe_rate, dir_name, rank_to_write,
-            gaussian_move, comm, verbose, sweeps_per_temp);
+                           bool verbose = false) {
+        (void)verbose;
+        reseed_rng_for_replica(comm);
+        PTReplica replica(*this, overrelaxation_rate, gaussian_move);
+        mc::PTOptions o;
+        o.temperatures = std::move(temp);
+        o.n_equilibration = n_anneal;
+        o.n_measurement = n_measure;
+        o.exchange_every = swap_rate;
+        o.probe_every = probe_rate;
+        o.output_dir = std::move(dir_name);
+        o.ranks_to_write = rank_to_write;
+        return mc::run_parallel_tempering(replica, o, comm);
     }
-    
-    /** Generate optimized temperature grid (delegates to mc::). */
-    mc::OptimizedTempGridResult generate_optimized_temperature_grid_mpi(
-        double Tmin, double Tmax,
-        size_t warmup_sweeps = 500, size_t sweeps_per_iter = 500,
-        size_t feedback_iters = 20, bool gaussian_move = false,
-        size_t overrelaxation_rate = 0, double target_acceptance = 0.45,
-        double convergence_tol = 0.05, MPI_Comm comm = MPI_COMM_WORLD,
-        bool use_gradient = true) {
-        int rank; MPI_Comm_rank(comm, &rank);
-        auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        rng.seed(static_cast<unsigned int>(seed + rank * 12345));
-        return mc::generate_optimized_temperature_grid_mpi(*this, Tmin, Tmax,
-            warmup_sweeps, sweeps_per_iter, feedback_iters, gaussian_move,
-            overrelaxation_rate, target_acceptance, convergence_tol, comm, use_gradient);
+
+    /** Temperature-ladder tuning on the shared engine (mc::tune_temperature_ladder). */
+    mc::LadderTuningResult tune_temperature_ladder(const mc::LadderTuningOptions& options,
+                                                   size_t overrelaxation_rate, bool gaussian_move,
+                                                   MPI_Comm comm = MPI_COMM_WORLD) {
+        reseed_rng_for_replica(comm);
+        PTReplica replica(*this, overrelaxation_rate, gaussian_move);
+        return mc::tune_temperature_ladder(replica, options, comm);
     }
     
     /** Geometric temperature ladder (delegates to mc::). */
@@ -1852,6 +1857,27 @@ public:
     }
     
 private:
+    /// Replica adapter: spins exchanged, frozen phonon state checked for equality.
+    struct PTReplica : mc::SpinLatticeReplica<PhononLattice> {
+        PTReplica(PhononLattice& lat, size_t overrelaxation_rate, bool gaussian_move)
+            : mc::SpinLatticeReplica<PhononLattice>(lat, overrelaxation_rate, gaussian_move, gaussian_move) {}
+        vector<double> replica_invariants() const {
+            vector<double> v(PhononState::N_DOF);
+            lat_.phonons.to_array(v.data());
+            for (const auto& m : lat_.modes) v.insert(v.end(), {m.Q1, m.Q2, m.V1, m.V2});
+            return v;
+        }
+    };
+
+    /// Distinct, reproducible MC stream per replica (derived from the process
+    /// seed and the rank; no wall clock).
+    void reseed_rng_for_replica(MPI_Comm comm) {
+        int rank = 0;
+        MPI_Comm_rank(comm, &rank);
+        rng.seed(static_cast<std::mt19937::result_type>(
+            derive_seed_from_master(0x50484F4E50540000ULL + static_cast<unsigned long long>(rank))));
+    }
+
     // RNG members for reproducible per-rank seeding (needed for parallel tempering)
     std::mt19937 rng;
     std::uniform_real_distribution<double> uniform_dist{0.0, 1.0};

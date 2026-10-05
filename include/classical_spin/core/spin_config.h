@@ -122,8 +122,10 @@ struct SpinConfig {
     
     // Parallel tempering parameters
     size_t num_replicas = 8;
-    size_t pt_sweeps_per_exchange = 10;
-    size_t pt_exchange_frequency = 50;
+    size_t pt_sweeps_per_exchange = 10;  // deprecated alias of pt_exchange_frequency (was never read)
+    size_t pt_exchange_frequency = 50;   // MC steps between DEO exchange rounds (1-10 is usually best)
+    size_t pt_equilibration_steps = 0;   // MC steps before measuring (0 = annealing_steps)
+    size_t pt_measurement_steps = 0;     // MC steps while measuring (0 = annealing_steps)
     size_t overrelaxation_rate = 0;
     size_t probe_rate = 2000;
     vector<int> ranks_to_write = {0};
@@ -132,12 +134,15 @@ struct SpinConfig {
     size_t pt_n_bond_types = 3;               // Number of bond types for dimer correlations
     
     // Optimized temperature grid parameters
-    bool pt_optimize_temperatures = true;          // Use feedback-optimized temperature grid
-    string pt_temperature_optimizer = "gradient";  // "gradient" (Miyata et al. 2024) or "katzgraber" (Katzgraber+Bittner)
-    double pt_target_acceptance = 0.45;            // Target acceptance (0.45 maximizes round-trip rate, Denschlag et al. 2009)
-    size_t pt_optimization_warmup = 500;           // Warmup sweeps for temperature optimization
-    size_t pt_optimization_sweeps = 500;           // Sweeps per feedback iteration
-    size_t pt_optimization_iterations = 20;        // Number of feedback iterations
+    bool pt_optimize_temperatures = true;          // Tune the ladder before the production run
+    string pt_temperature_optimizer = "nrpt";      // "nrpt" (equal rejection, Syed et al. JRSS-B 2022) or
+                                                   // "katzgraber" (label-flow feedback, J. Stat. Mech. P03018);
+                                                   // "gradient" (removed) maps to nrpt with a warning
+    double pt_target_acceptance = 0.45;            // Unused by the tuners (mean acceptance is fixed by R and the range)
+    size_t pt_optimization_warmup = 500;           // Warm-up MC steps before tuning
+    size_t pt_optimization_sweeps = 500;           // MC steps of the first tuning round (doubles per round, up to 16x)
+    size_t pt_optimization_iterations = 20;        // Maximum number of tuning rounds
+    double pt_optimization_tolerance = 0.05;       // Stop when no temperature moves more than this x its spacing
     
     // Pump-probe parameters (SU2 / default)
     string pump_table_file = "";  // Optional two-column pulse table for mixed 2DCS

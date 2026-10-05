@@ -159,7 +159,19 @@ SpinConfig SpinConfig::from_file(const string& filename) {
                 config.num_replicas = stoull(value);
             }
             else if (key == "pt_sweeps_per_exchange") {
+                // Never read before; now an alias of pt_exchange_frequency.
                 config.pt_sweeps_per_exchange = stoull(value);
+                config.pt_exchange_frequency = config.pt_sweeps_per_exchange;
+                cerr << "Warning: pt_sweeps_per_exchange is deprecated; use pt_exchange_frequency" << endl;
+            }
+            else if (key == "pt_equilibration_steps") {
+                config.pt_equilibration_steps = stoull(value);
+            }
+            else if (key == "pt_measurement_steps") {
+                config.pt_measurement_steps = stoull(value);
+            }
+            else if (key == "pt_optimization_tolerance") {
+                config.pt_optimization_tolerance = stod(value);
             }
             else if (key == "pt_exchange_frequency") {
                 config.pt_exchange_frequency = stoull(value);
@@ -553,15 +565,18 @@ void SpinConfig::to_file(const string& filename) const {
     
     file << "# Parallel Tempering Parameters\n";
     file << "pt_exchange_frequency = " << pt_exchange_frequency << "\n";
+    file << "pt_equilibration_steps = " << pt_equilibration_steps << "\n";
+    file << "pt_measurement_steps = " << pt_measurement_steps << "\n";
     file << "overrelaxation_rate = " << overrelaxation_rate << "\n";
     file << "probe_rate = " << probe_rate << "\n";
-    file << "# Optimized temperature grid (Bittner et al., Phys. Rev. Lett. 101, 130603)\n";
+    file << "# Temperature-ladder tuning (nrpt: Syed et al., JRSS-B 84, 321 (2022))\n";
     file << "pt_optimize_temperatures = " << (pt_optimize_temperatures ? "true" : "false") << "\n";
     file << "pt_target_acceptance = " << pt_target_acceptance << "\n";
     file << "pt_temperature_optimizer = " << pt_temperature_optimizer << "\n";
     file << "pt_optimization_warmup = " << pt_optimization_warmup << "\n";
     file << "pt_optimization_sweeps = " << pt_optimization_sweeps << "\n";
-    file << "pt_optimization_iterations = " << pt_optimization_iterations << "\n\n";
+    file << "pt_optimization_iterations = " << pt_optimization_iterations << "\n";
+    file << "pt_optimization_tolerance = " << pt_optimization_tolerance << "\n\n";
     
     file << "# Parameter Sweep Parameters\n";
     file << "sweep_parameter = " << sweep_parameter << "\n";
@@ -668,15 +683,17 @@ void SpinConfig::print() const {
     if (simulation == SimulationType::PARALLEL_TEMPERING) {
         cout << "\nParallel Tempering Settings:\n";
         cout << "  Exchange frequency: " << pt_exchange_frequency << "\n";
+        cout << "  Equilibration / measurement steps: "
+             << (pt_equilibration_steps ? pt_equilibration_steps : annealing_steps) << " / "
+             << (pt_measurement_steps ? pt_measurement_steps : annealing_steps) << "\n";
         cout << "  Overrelaxation rate: " << overrelaxation_rate << "\n";
         cout << "  Probe rate: " << probe_rate << "\n";
-        cout << "  Optimize temperatures: " << (pt_optimize_temperatures ? "yes (Bittner et al.)" : "no (geometric)") << "\n";
+        cout << "  Optimize temperatures: " << (pt_optimize_temperatures ? "yes" : "no (geometric)") << "\n";
         if (pt_optimize_temperatures) {
-            cout << "  Target acceptance rate: " << pt_target_acceptance * 100 << "%\n";
             cout << "  Temperature optimizer: " << pt_temperature_optimizer << "\n";
-            cout << "  Optimization warmup: " << pt_optimization_warmup << " sweeps\n";
-            cout << "  Optimization sweeps: " << pt_optimization_sweeps << " per iteration\n";
-            cout << "  Optimization iterations: " << pt_optimization_iterations << "\n";
+            cout << "  Optimization warmup: " << pt_optimization_warmup << " steps\n";
+            cout << "  Optimization rounds: " << pt_optimization_sweeps << " x 2^r steps, at most "
+                 << pt_optimization_iterations << " rounds, tolerance " << pt_optimization_tolerance << "\n";
         }
     }
     

@@ -165,43 +165,47 @@ save_observables = true
 | 2D Spectroscopy | `2dcs` | Two-pulse coherent spectroscopy |
 | Parameter Sweep | `parameter_sweep` | Systematic parameter exploration |
 
-### Optimized Parallel Tempering
+### Parallel Tempering
 
-Temperature ladder optimization uses a **gradient-based** method by default (industry standard):
+One engine (`include/classical_spin/mc/parallel_tempering.h`) drives Lattice,
+MixedLattice and PhononLattice, one replica per MPI rank:
 
-- **Default: gradient-based optimizer** [Miyata et al., arXiv:2601.13542 (2024)]  
-  Minimizes the *variance* of acceptance rates between adjacent replicas using a reparameterization that strictly preserves monotonic temperature ordering. This typically reduces round-trip time vs geometric spacing and avoids the constraint violations of older schemes.
+- **Deterministic even/odd (non-reversible) exchanges** [Okabe et al., CPL 335, 435 (2001);
+  Syed et al., JRSS-B 84, 321 (2022)]; both partners take the identical decision from a shared
+  counter-based random number. Replica labels travel with the configurations, so round trips,
+  the up-fraction f(T) and the acceptance of every edge are *measured* and reported.
+- Local moves follow `local_update` (heat bath, adaptive Gaussian or uniform Metropolis) with the
+  coloured OpenMP kernels on large lattices; the Gaussian width is adapted per temperature during
+  equilibration only and frozen while measuring.
+- Statistics: Wolff's Gamma method with automatic windowing for means, errors and τ_int; blocked
+  jackknife (blocks ≈ 8 τ_int) for c = Var(E)/(N T²), χ = βN(⟨m²⟩ − ⟨|m|⟩²) and the Binder cumulant.
 
-- **Optional: Katzgraber + Bittner** [Katzgraber et al. J. Stat. Mech. P03018 (2006); Bittner et al. PRL 101, 130603 (2008)]  
-  Feedback rule Δβ ∝ acceptance rate; plus Bittner adaptive sweep schedule. Use `pt_temperature_optimizer = katzgraber` to select.
+Temperature ladders are tuned with the replica chain itself:
 
-- **Target acceptance** default is **0.45** [Denschlag et al. 2009], which maximizes round-trip rate in temperature space.
-
-Configuration options:
+- **Default: `nrpt`** — equal-rejection schedule of Syed et al. (2022): the cumulative
+  communication barrier Λ(β) is interpolated monotonically and inverted at equal spacing over
+  rounds of doubling length. The run reports Λ and the replica count ≈ 2Λ+1 that would be optimal.
+- **`katzgraber`** — flow feedback of Katzgraber, Trebst, Huse, Troyer, J. Stat. Mech. P03018
+  (2006): density of temperatures ∝ sqrt(|df/dT| / ΔT) with f(T) measured from the replica labels.
+- `gradient` was removed (it maps to `nrpt` with a warning; see `docs/MIGRATION.md`).
 
 ```ini
-# Enable optimized temperature grid (default: true)
-pt_optimize_temperatures = true
-
-# Algorithm: "gradient" (default) or "katzgraber"
-pt_temperature_optimizer = gradient
-
-# Target acceptance rate (0.45 maximizes round-trip rate)
-pt_target_acceptance = 0.45
-
-# Optimization parameters
-pt_optimization_warmup = 500      # Warmup sweeps per replica
-pt_optimization_sweeps = 500      # MC sweeps per feedback iteration
-pt_optimization_iterations = 20   # Feedback/gradient iterations
+pt_optimize_temperatures = true   # false: geometric ladder in [T_end, T_start]
+pt_temperature_optimizer = nrpt   # nrpt | katzgraber
+pt_optimization_warmup = 500      # warm-up MC steps
+pt_optimization_sweeps = 500      # steps of the first round (doubles per round, up to 16x)
+pt_optimization_iterations = 20   # maximum number of rounds
+pt_optimization_tolerance = 0.05  # stop when no temperature moves more than 5% of its spacing
+pt_exchange_frequency = 10        # MC steps between exchange rounds (1-10 recommended)
+pt_equilibration_steps = 0        # 0 = annealing_steps
+pt_measurement_steps = 0          # 0 = annealing_steps
+probe_rate = 10                   # MC steps between measurements
 ```
 
-The algorithm outputs diagnostic information including:
-- Final acceptance rates for each temperature pair
-- Local diffusivities D(T) = A(1−A)
-- Estimated round-trip time
-- Convergence status
-
-Set `pt_optimize_temperatures = false` to use simple geometric (logarithmic) spacing instead.
+Outputs: `optimized_temperatures.txt` (tuned ladder), and per trial `pt_summary.txt` and
+`parallel_tempering_aggregated.h5` (per-temperature energy, specific heat, τ_int, order
+parameters with errors, edge acceptance, f(T), round trips, predicted round-trip rate) plus
+`rank_k/` files per temperature.
 
 ## Example Configurations
 
