@@ -670,11 +670,17 @@ void validate_pulse_shape(double amp, double width, double freq, const char* wha
             const double rate = std::sqrt(dS[0] * dS[0] + dS[1] * dS[1] + dS[2] * dS[2]);
             if (scale > 0.0) worst = std::max(worst, rate / scale);
         }
+        const bool damped = damping_rates_SU3.size() == 8 && damping_rates_SU3.cwiseAbs().maxCoeff() > 0.0;
         for (size_t site = 0; site < lattice_size_SU3; ++site) {
             double H[8], dn[8];
             get_local_field_SU3_flat_into(site, state, offset_SU3, 0.0, 0.0, H);
             const double* n = &state[offset_SU3 + site * 8];
             su3_torque(H, n, su3_bracket, dn);
+            // Bloch relaxation towards n_eq also moves a torque-free state.
+            if (damped) {
+                for (int a = 0; a < 8; ++a)
+                    dn[a] -= damping_rates_SU3(a) * (n[a] - equilibrium_SU3[site](a));
+            }
             double h2 = 0.0, n2 = 0.0, r2 = 0.0;
             for (int a = 0; a < 8; ++a) { h2 += H[a] * H[a]; n2 += n[a] * n[a]; r2 += dn[a] * dn[a]; }
             const double scale = su3_bracket * std::sqrt(h2 * n2);
@@ -1154,7 +1160,8 @@ struct MixedLattice::SpectroscopyPlan {
     bool w1 = false;                // synthesise M1 from M0
     string w1_note;                 // why W1 is off (empty when on or not requested)
     bool m01_from_m0 = false;       // continue M01 from stored M0 states
-    double probe_lead = 0.0;        // the probe is negligible before tau - probe_lead
+    double probe_lead = 0.0;        // a pulse is negligible before its centre - probe_lead
+    bool pump_truncated = false;    // the pump (t = 0) already acts at T_start
     vector<size_t> m01_start;       // per delay: grid index where M01 is integrated from
     vector<size_t> checkpoint_indices;  // distinct m01_start > 0 (states kept from the M0 run)
 };
@@ -1282,6 +1289,7 @@ void require_grid_length(const MixedLattice::PumpProbeTrajectory& tr, size_t n, 
             if (pulse_amp_SU3 != 0.0) lead = std::max(lead, classical_spin_pulse_chunking::kPulseWindowSigmas * pulse_width_SU3);
         }
         p.probe_lead = lead;
+        p.pump_truncated = (T_start > -lead);
 
         p.residual = relative_stationarity_residual(spins_to_state());
         if (reuse_m0_for_m1) {
@@ -1296,7 +1304,7 @@ void require_grid_length(const MixedLattice::PumpProbeTrajectory& tr, size_t n, 
             else if (p.save_spins) p.w1_note = "spin-state output requested";
             else if (!non_negative) p.w1_note = "negative delays";
             else if (!on_grid) p.w1_note = "delays are not multiples of T_step";
-            else if (T_start > -lead) p.w1_note = "the pump is already on at T_start";
+            else if (p.pump_truncated) p.w1_note = "the pump is already on at T_start";
             else if (!(p.residual <= stationarity_tol)) {
                 std::ostringstream os;
                 os << "initial state not stationary (residual " << p.residual << " > tol " << stationarity_tol << ")";
@@ -1381,8 +1389,12 @@ void require_grid_length(const MixedLattice::PumpProbeTrajectory& tr, size_t n, 
 namespace {
 
 void print_plan(std::ostream& os, size_t n_tau, size_t n_t, double residual, bool w1,
-                const std::string& w1_note, bool m01, size_t n_checkpoints) {
+                const std::string& w1_note, bool m01, size_t n_checkpoints, bool pump_truncated) {
     os << "  Time grid: " << n_t << " samples; delays: " << n_tau << endl;
+    if (pump_truncated) {
+        os << "  WARNING: T_start is inside the pump window (start at least 9 pulse widths before "
+              "t = 0); every trajectory misses the leading part of the pump." << endl;
+    }
     os << "  Ground-state stationarity residual max|dS/dt|/(|H||S|) = " << residual << endl;
     os << "  [W1] M1 from time-shifted M0: " << (w1 ? "on" : "off");
     if (!w1 && !w1_note.empty()) os << " (" << w1_note << ")";
@@ -1435,7 +1447,7 @@ void print_plan(std::ostream& os, size_t n_tau, size_t n_t, double residual, boo
         cout << "Delays: " << tau_start << " -> " << plan.taus.back() << " (step " << tau_step << "); time: "
              << T_start << " -> " << plan.grid.t_end() << " (step " << T_step << ")" << endl;
         print_plan(cout, n_tau, n_t, plan.residual, plan.w1, plan.w1_note, plan.m01_from_m0,
-                   plan.checkpoint_indices.size());
+                   plan.checkpoint_indices.size(), plan.pump_truncated);
 
         // The ground state is never modified by the drivers; restore it anyway
         // on every exit path.
@@ -1720,7 +1732,7 @@ void agree_on_errors(MPI_Comm comm, const std::string& local_error, const char* 
                      << (size - 1) << " workers, dynamic scheduling)\n"
                      << "==========================================" << endl;
                 print_plan(cout, n_tau, n_t, plan->residual, plan->w1, plan->w1_note, plan->m01_from_m0,
-                           plan->checkpoint_indices.size());
+                           plan->checkpoint_indices.size(), plan->pump_truncated);
                 if (plan->distinct_probe) {
                     cout << "  Probe directions differ from the pump directions." << endl;
                 }
@@ -1777,132 +1789,149 @@ void agree_on_errors(MPI_Comm comm, const std::string& local_error, const char* 
         // doubles as its request for the next delay; rank 0 writes each result
         // as soon as it arrives. After the first error rank 0 hands out no more
         // work but keeps serving requests until every worker has stopped.
+        // Expected failures (a worker's integration, rank 0's HDF5 writes) are
+        // reported in-band above; anything escaping (e.g. std::bad_alloc while
+        // a peer is blocked in a matching send/receive) cannot be recovered
+        // without a deadlock, so it aborts the job with a message.
+        auto abort_job = [&](const char* where, const std::exception& e) {
+            std::cerr << "pump_probe_spectroscopy_mpi: fatal error on rank " << rank << " (" << where
+                      << "): " << e.what() << endl;
+            MPI_Abort(comm, 1);
+        };
         if (rank == 0) {
-            size_t next = 0;
-            int active = size - 1;
-            size_t done = 0;
-            const size_t progress_every = std::max<size_t>(1, n_tau / 20);
-            vector<double> buf_M1, buf_M01, buf_s1, buf_s01;
-            while (active > 0) {
-                int64_t hdr[4];
-                MPI_Status st;
-                MPI_Recv(hdr, 4, MPI_INT64_T, MPI_ANY_SOURCE, kTagResult, comm, &st);
-                const int src = st.MPI_SOURCE;
-                if (hdr[0] >= 0) {
-                    const size_t j = static_cast<size_t>(hdr[0]);
-                    if (hdr[1] == 0) {
-                        const size_t k0 = static_cast<size_t>(hdr[2]);
-                        if (!plan->w1) {
-                            buf_M1.resize(n_t * kObsDoubles);
-                            recv_doubles(buf_M1.data(), buf_M1.size(), src, kTagM1, comm);
-                        }
-                        buf_M01.resize((n_t - k0) * kObsDoubles);
-                        recv_doubles(buf_M01.data(), buf_M01.size(), src, kTagM01, comm);
-                        if (plan->save_spins) {
-                            buf_s1.resize(n_t * state_dim);
-                            recv_doubles(buf_s1.data(), buf_s1.size(), src, kTagM1Spins, comm);
-                            buf_s01.resize((n_t - k0) * state_dim);
-                            recv_doubles(buf_s01.data(), buf_s01.size(), src, kTagM01Spins, comm);
-                        }
-                        if (error.empty()) {
-                            try {
-                                PumpProbeTrajectory M1 = plan->w1
-                                    ? synthesize_M1_from_M0(M0, M_ground, plan->taus[j], T_start, T_end, T_step)
-                                    : unflatten_trajectory(buf_M1);
-                                PumpProbeTrajectory M01 = assemble_m01(M0, unflatten_trajectory(buf_M01), k0);
-                                vector<double> M01_spins = plan->save_spins
-                                    ? assemble_m01_spins(M0_spins, std::move(buf_s01), k0, state_dim)
-                                    : vector<double>();
-                                require_grid_length(M1, n_t, "M1");
-                                require_grid_length(M01, n_t, "M01");
+            try {
+                size_t next = 0;
+                int active = size - 1;
+                size_t done = 0;
+                const size_t progress_every = std::max<size_t>(1, n_tau / 20);
+                vector<double> buf_M1, buf_M01, buf_s1, buf_s01;
+                while (active > 0) {
+                    int64_t hdr[4];
+                    MPI_Status st;
+                    MPI_Recv(hdr, 4, MPI_INT64_T, MPI_ANY_SOURCE, kTagResult, comm, &st);
+                    const int src = st.MPI_SOURCE;
+                    if (hdr[0] >= 0) {
+                        const size_t j = static_cast<size_t>(hdr[0]);
+                        if (hdr[1] == 0) {
+                            const size_t k0 = static_cast<size_t>(hdr[2]);
+                            if (!plan->w1) {
+                                buf_M1.resize(n_t * kObsDoubles);
+                                recv_doubles(buf_M1.data(), buf_M1.size(), src, kTagM1, comm);
+                            }
+                            buf_M01.resize((n_t - k0) * kObsDoubles);
+                            recv_doubles(buf_M01.data(), buf_M01.size(), src, kTagM01, comm);
+                            if (plan->save_spins) {
+                                buf_s1.resize(n_t * state_dim);
+                                recv_doubles(buf_s1.data(), buf_s1.size(), src, kTagM1Spins, comm);
+                                buf_s01.resize((n_t - k0) * state_dim);
+                                recv_doubles(buf_s01.data(), buf_s01.size(), src, kTagM01Spins, comm);
+                            }
+                            if (error.empty()) {
+                                try {
+                                    PumpProbeTrajectory M1 = plan->w1
+                                        ? synthesize_M1_from_M0(M0, M_ground, plan->taus[j], T_start, T_end, T_step)
+                                        : unflatten_trajectory(buf_M1);
+                                    PumpProbeTrajectory M01 = assemble_m01(M0, unflatten_trajectory(buf_M01), k0);
+                                    vector<double> M01_spins = plan->save_spins
+                                        ? assemble_m01_spins(M0_spins, std::move(buf_s01), k0, state_dim)
+                                        : vector<double>();
+                                    require_grid_length(M1, n_t, "M1");
+                                    require_grid_length(M01, n_t, "M01");
 #ifdef HDF5_ENABLED
-                                writer->write_tau_trajectory(static_cast<int>(j), plan->taus[j], M1, M01,
-                                                             plan->save_spins ? &buf_s1 : nullptr,
-                                                             plan->save_spins ? &M01_spins : nullptr);
+                                    writer->write_tau_trajectory(static_cast<int>(j), plan->taus[j], M1, M01,
+                                                                 plan->save_spins ? &buf_s1 : nullptr,
+                                                                 plan->save_spins ? &M01_spins : nullptr);
 #endif
-                                if (++done % progress_every == 0 || done == n_tau) {
-                                    cout << "  " << done << "/" << n_tau << " delays written" << endl;
+                                    if (++done % progress_every == 0 || done == n_tau) {
+                                        cout << "  " << done << "/" << n_tau << " delays written" << endl;
+                                    }
+                                } catch (const std::exception& e) {
+                                    error = std::string("writing delay ") + std::to_string(j) + ": " + e.what();
                                 }
-                            } catch (const std::exception& e) {
-                                error = std::string("writing delay ") + std::to_string(j) + ": " + e.what();
+                            }
+                        } else {
+                            std::string msg(static_cast<size_t>(hdr[3]), '\0');
+                            MPI_Recv(msg.data(), static_cast<int>(hdr[3]), MPI_CHAR, src, kTagError, comm,
+                                     MPI_STATUS_IGNORE);
+                            if (error.empty()) {
+                                error = "rank " + std::to_string(src) + ", delay " + std::to_string(j) + ": " + msg;
                             }
                         }
-                    } else {
-                        std::string msg(static_cast<size_t>(hdr[3]), '\0');
-                        MPI_Recv(msg.data(), static_cast<int>(hdr[3]), MPI_CHAR, src, kTagError, comm,
-                                 MPI_STATUS_IGNORE);
-                        if (error.empty()) {
-                            error = "rank " + std::to_string(src) + ", delay " + std::to_string(j) + ": " + msg;
-                        }
+                    }
+                    const int64_t assign = (error.empty() && next < n_tau) ? static_cast<int64_t>(next++) : -1;
+                    MPI_Send(&assign, 1, MPI_INT64_T, src, kTagAssign, comm);
+                    if (assign < 0) {
+                        --active;
+                    } else if (plan->m01_from_m0 && plan->m01_start[static_cast<size_t>(assign)] > 0) {
+                        const size_t k0 = plan->m01_start[static_cast<size_t>(assign)];
+                        const auto it = std::lower_bound(plan->checkpoint_indices.begin(),
+                                                         plan->checkpoint_indices.end(), k0);
+                        const ODEState& cp = checkpoints[static_cast<size_t>(it - plan->checkpoint_indices.begin())];
+                        send_doubles(cp.data(), cp.size(), src, kTagCheckpoint, comm);
                     }
                 }
-                const int64_t assign = (error.empty() && next < n_tau) ? static_cast<int64_t>(next++) : -1;
-                MPI_Send(&assign, 1, MPI_INT64_T, src, kTagAssign, comm);
-                if (assign < 0) {
-                    --active;
-                } else if (plan->m01_from_m0 && plan->m01_start[static_cast<size_t>(assign)] > 0) {
-                    const size_t k0 = plan->m01_start[static_cast<size_t>(assign)];
-                    const auto it = std::lower_bound(plan->checkpoint_indices.begin(),
-                                                     plan->checkpoint_indices.end(), k0);
-                    const ODEState& cp = checkpoints[static_cast<size_t>(it - plan->checkpoint_indices.begin())];
-                    send_doubles(cp.data(), cp.size(), src, kTagCheckpoint, comm);
-                }
-            }
 #ifdef HDF5_ENABLED
-            try {
-                writer->close();
-            } catch (const std::exception& e) {
-                if (error.empty()) error = std::string("closing ") + hdf5_file + ": " + e.what();
-            }
-#endif
-        } else {
-            int64_t hdr[4] = {-1, 0, 0, 0};
-            MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
-            ODEState checkpoint;
-            vector<double> buf;
-            while (true) {
-                int64_t assign = -1;
-                MPI_Recv(&assign, 1, MPI_INT64_T, 0, kTagAssign, comm, MPI_STATUS_IGNORE);
-                if (assign < 0) break;
-                const size_t j = static_cast<size_t>(assign);
-                const size_t k0 = plan->m01_from_m0 ? plan->m01_start[j] : 0;
-                if (k0 > 0) {
-                    checkpoint.resize(ode_dim);
-                    recv_doubles(checkpoint.data(), ode_dim, 0, kTagCheckpoint, comm);
-                }
-                DelayResult r;
-                std::string msg;
                 try {
-                    compute_delay(*plan, j, x_ground, k0 > 0 ? &checkpoint : nullptr, r);
-                    // Rank 0 sizes its receives from (n_t, k0): check before sending.
-                    if (!plan->w1) require_grid_length(r.M1, n_t, "M1");
-                    if (r.M01.size() != n_t - k0) throw std::runtime_error("M01 has an unexpected number of samples");
-                    if (plan->save_spins &&
-                        (r.M1_spins.size() != n_t * state_dim || r.M01_spins.size() != (n_t - k0) * state_dim)) {
-                        throw std::runtime_error("spin-state trajectory has an unexpected size");
-                    }
+                    writer->close();
                 } catch (const std::exception& e) {
-                    msg = e.what();
-                    if (msg.empty()) msg = "unknown error";
+                    if (error.empty()) error = std::string("closing ") + hdf5_file + ": " + e.what();
                 }
-                if (msg.empty()) {
-                    hdr[0] = assign; hdr[1] = 0; hdr[2] = static_cast<int64_t>(k0); hdr[3] = 0;
-                    MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
-                    if (!plan->w1) {
-                        flatten_trajectory(r.M1, buf);
-                        send_doubles(buf.data(), buf.size(), 0, kTagM1, comm);
+#endif
+            } catch (const std::exception& e) {
+                abort_job("scheduler", e);
+            }
+        } else {
+            try {
+                int64_t hdr[4] = {-1, 0, 0, 0};
+                MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
+                ODEState checkpoint;
+                vector<double> buf;
+                while (true) {
+                    int64_t assign = -1;
+                    MPI_Recv(&assign, 1, MPI_INT64_T, 0, kTagAssign, comm, MPI_STATUS_IGNORE);
+                    if (assign < 0) break;
+                    const size_t j = static_cast<size_t>(assign);
+                    const size_t k0 = plan->m01_from_m0 ? plan->m01_start[j] : 0;
+                    if (k0 > 0) {
+                        checkpoint.resize(ode_dim);
+                        recv_doubles(checkpoint.data(), ode_dim, 0, kTagCheckpoint, comm);
                     }
-                    flatten_trajectory(r.M01, buf);
-                    send_doubles(buf.data(), buf.size(), 0, kTagM01, comm);
-                    if (plan->save_spins) {
-                        send_doubles(r.M1_spins.data(), r.M1_spins.size(), 0, kTagM1Spins, comm);
-                        send_doubles(r.M01_spins.data(), r.M01_spins.size(), 0, kTagM01Spins, comm);
+                    DelayResult r;
+                    std::string msg;
+                    try {
+                        compute_delay(*plan, j, x_ground, k0 > 0 ? &checkpoint : nullptr, r);
+                        // Rank 0 sizes its receives from (n_t, k0): check before sending.
+                        if (!plan->w1) require_grid_length(r.M1, n_t, "M1");
+                        if (r.M01.size() != n_t - k0) throw std::runtime_error("M01 has an unexpected number of samples");
+                        if (plan->save_spins &&
+                            (r.M1_spins.size() != n_t * state_dim || r.M01_spins.size() != (n_t - k0) * state_dim)) {
+                            throw std::runtime_error("spin-state trajectory has an unexpected size");
+                        }
+                    } catch (const std::exception& e) {
+                        msg = e.what();
+                        if (msg.empty()) msg = "unknown error";
                     }
-                } else {
-                    hdr[0] = assign; hdr[1] = 1; hdr[2] = 0; hdr[3] = static_cast<int64_t>(msg.size());
-                    MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
-                    MPI_Send(msg.data(), static_cast<int>(msg.size()), MPI_CHAR, 0, kTagError, comm);
+                    if (msg.empty()) {
+                        hdr[0] = assign; hdr[1] = 0; hdr[2] = static_cast<int64_t>(k0); hdr[3] = 0;
+                        MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
+                        if (!plan->w1) {
+                            flatten_trajectory(r.M1, buf);
+                            send_doubles(buf.data(), buf.size(), 0, kTagM1, comm);
+                        }
+                        flatten_trajectory(r.M01, buf);
+                        send_doubles(buf.data(), buf.size(), 0, kTagM01, comm);
+                        if (plan->save_spins) {
+                            send_doubles(r.M1_spins.data(), r.M1_spins.size(), 0, kTagM1Spins, comm);
+                            send_doubles(r.M01_spins.data(), r.M01_spins.size(), 0, kTagM01Spins, comm);
+                        }
+                    } else {
+                        hdr[0] = assign; hdr[1] = 1; hdr[2] = 0; hdr[3] = static_cast<int64_t>(msg.size());
+                        MPI_Send(hdr, 4, MPI_INT64_T, 0, kTagResult, comm);
+                        MPI_Send(msg.data(), static_cast<int>(msg.size()), MPI_CHAR, 0, kTagError, comm);
+                    }
                 }
+            } catch (const std::exception& e) {
+                abort_job("worker", e);
             }
         }
         agree_on_errors(comm, error, "pump_probe_spectroscopy_mpi: delay scan");

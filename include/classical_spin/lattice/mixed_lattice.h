@@ -2536,12 +2536,10 @@ public:
     // the raw Gell-Mann expectation values n^a = <psi|lambda^a|psi>. The
     // qutrit density matrix is
     //   rho = (1/3) I + (1/2) sum_a n^a lambda^a,
-    // whose trace is identically 1 regardless of |n|. A physical pure
-    // state has |n|^2 = (N^2 - 1)/N = 8/3, i.e. |n| = 2 sqrt(2/3); the
-    // smaller value |n| = 2/sqrt(3) is the partial Casimir matching the
-    // diagonal sector spanned by (lambda_3, lambda_8) on the singlet
-    // basis (e.g. for |E1>: n_3 = 1, n_8 = 1/sqrt(3), so n_3^2 + n_8^2
-    // = 4/3 and the off-diagonal components are zero).
+    // whose trace is identically 1 regardless of |n|. Every pure state has
+    // Tr rho^2 = 1/3 + |n|^2/2 = 1, i.e. |n|^2 = 2(N-1)/N = 4/3 and
+    // |n| = 2/sqrt(3) (e.g. |E1>: n_3 = 1, n_8 = 1/sqrt(3)), and the cubic
+    // Casimir d_abc n^a n^b n^c = 8/9 (su3::casimir2 / su3::casimir3).
     //
     // The `spin_length_SU3` constructor argument does NOT enter these
     // routines: for SU(N>2) it is not a free normalisation knob (no
@@ -4048,8 +4046,10 @@ public:
      * Dimensionless stationarity residual of `state` without any drive:
      *     max_i |dS_i/dt| / (c_i |H_i| |S_i|),
      * the largest sine of the angle between a spin and its local field
-     * (c_i = 1 for SU(2), su3_bracket for SU(3); damping excluded). It is
-     * independent of the energy scale, so one tolerance fits every model.
+     * (c_i = 1 for SU(2), su3_bracket for SU(3)); the SU(3) rate includes the
+     * Bloch relaxation towards n_eq (Gilbert damping vanishes with the
+     * torque). Independent of the energy scale, so one tolerance fits every
+     * model.
      */
     double relative_stationarity_residual(const ODEState& state) const;
 
@@ -6018,29 +6018,13 @@ private:
         // Write trajectory to HDF5
         size_t save_count = 0;
         for (const auto& [t, state_vec] : trajectory) {
-            double M_SU2_arr[8] = {0}, M_SU2_antiferro_arr[8] = {0}, M_SU2_global_arr[8] = {0};
-            double M_SU3_arr[8] = {0}, M_SU3_antiferro_arr[8] = {0}, M_SU3_global_arr[8] = {0};
-            
-            compute_sublattice_magnetizations_from_flat(state_vec.data(), 0, 
-                lattice_size_SU2, spin_dim_SU2, M_SU2_arr, M_SU2_antiferro_arr);
-            compute_magnetization_global_SU2_from_flat(state_vec.data(), M_SU2_global_arr);
-            compute_magnetization_staggered_SU2_from_flat(state_vec.data(), M_SU2_antiferro_arr);
-            
-            size_t SU3_offset = lattice_size_SU2 * spin_dim_SU2;
-            compute_sublattice_magnetizations_from_flat(state_vec.data(), SU3_offset, 
-                lattice_size_SU3, spin_dim_SU3, M_SU3_arr, M_SU3_antiferro_arr);
-            compute_magnetization_global_SU3_from_flat(state_vec.data(), M_SU3_global_arr);
-            
-            SpinVector M_SU2 = Eigen::Map<Eigen::VectorXd>(M_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-            SpinVector M_SU2_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU2_antiferro_arr, spin_dim_SU2);
-            SpinVector M_SU2_global = Eigen::Map<Eigen::VectorXd>(M_SU2_global_arr, spin_dim_SU2);
-            SpinVector M_SU3 = Eigen::Map<Eigen::VectorXd>(M_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            SpinVector M_SU3_antiferro = Eigen::Map<Eigen::VectorXd>(M_SU3_antiferro_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            SpinVector M_SU3_global = Eigen::Map<Eigen::VectorXd>(M_SU3_global_arr, spin_dim_SU3);
+            const Observables o = observe(state_vec.data());
+            const SpinVector& M_SU2 = o.first[1];
+            const SpinVector& M_SU3 = o.second[1];
             
             if (hdf5_writer) {
-                hdf5_writer->write_flat_step(t, M_SU2_antiferro, M_SU2, M_SU2_global, 
-                                            M_SU3_antiferro, M_SU3, M_SU3_global, state_vec.data());
+                hdf5_writer->write_flat_step(t, o.first[0], o.first[1], o.first[2],
+                                            o.second[0], o.second[1], o.second[2], state_vec.data());
                 save_count++;
             }
             
@@ -6091,46 +6075,11 @@ private:
         mixed_gpu::integrate_mixed_gpu(gpu_mixed_handle_, T_start, T_end, step_size,
                                        1, raw_trajectory, method);
         
-        // Convert to magnetization trajectory
-        vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> trajectory;
-        size_t total_SU2 = lattice_size_SU2 * spin_dim_SU2;
-        
+        // Same observables as the CPU drivers (MixedLattice::observe).
+        PumpProbeTrajectory trajectory;
+        trajectory.reserve(raw_trajectory.size());
         for (const auto& [t, state_vec] : raw_trajectory) {
-            double M_local_SU2_arr[8] = {0}, M_antiferro_SU2_arr[8] = {0}, M_global_SU2_arr[8] = {0};
-            double M_local_SU3_arr[8] = {0}, M_antiferro_SU3_arr[8] = {0}, M_global_SU3_arr[8] = {0};
-            
-            compute_sublattice_magnetizations_from_flat(state_vec.data(), 0, 
-                lattice_size_SU2, spin_dim_SU2, M_local_SU2_arr, M_antiferro_SU2_arr);
-            compute_sublattice_magnetizations_from_flat(state_vec.data(), total_SU2, 
-                lattice_size_SU3, spin_dim_SU3, M_local_SU3_arr, M_antiferro_SU3_arr);
-            
-            // Global frame transformation (simplified)
-            for (size_t i = 0; i < lattice_size_SU2; ++i) {
-                size_t atom = i % N_atoms_SU2;
-                for (size_t mu = 0; mu < spin_dim_SU2; ++mu) {
-                    for (size_t nu = 0; nu < spin_dim_SU2; ++nu) {
-                        M_global_SU2_arr[mu] += sublattice_frames_SU2[atom](mu, nu) * state_vec[i * spin_dim_SU2 + nu];
-                    }
-                }
-            }
-            for (size_t i = 0; i < lattice_size_SU3; ++i) {
-                size_t atom = i % N_atoms_SU3;
-                for (size_t mu = 0; mu < spin_dim_SU3; ++mu) {
-                    for (size_t nu = 0; nu < spin_dim_SU3; ++nu) {
-                        M_global_SU3_arr[mu] += sublattice_frames_SU3[atom](mu, nu) * state_vec[total_SU2 + i * spin_dim_SU3 + nu];
-                    }
-                }
-            }
-            
-            SpinVector M_local_SU2 = Eigen::Map<Eigen::VectorXd>(M_local_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-            SpinVector M_antiferro_SU2 = Eigen::Map<Eigen::VectorXd>(M_antiferro_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-            SpinVector M_global_SU2 = Eigen::Map<Eigen::VectorXd>(M_global_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-            SpinVector M_local_SU3 = Eigen::Map<Eigen::VectorXd>(M_local_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            SpinVector M_antiferro_SU3 = Eigen::Map<Eigen::VectorXd>(M_antiferro_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            SpinVector M_global_SU3 = Eigen::Map<Eigen::VectorXd>(M_global_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            
-            trajectory.push_back({t, {{M_antiferro_SU2, M_local_SU2, M_global_SU2}, 
-                                      {M_antiferro_SU3, M_local_SU3, M_global_SU3}}});
+            trajectory.emplace_back(t, observe(state_vec.data()));
         }
         
         reset_pulse();
@@ -6172,45 +6121,11 @@ private:
         mixed_gpu::integrate_mixed_gpu(gpu_mixed_handle_, T_start, T_end, step_size,
                                        1, raw_trajectory, method);
         
-        // Convert to magnetization trajectory (same as single_pulse_drive_gpu)
-        vector<pair<double, pair<array<SpinVector, 3>, array<SpinVector, 3>>>> trajectory;
-        size_t total_SU2 = lattice_size_SU2 * spin_dim_SU2;
-        
+        // Same observables as the CPU drivers (MixedLattice::observe).
+        PumpProbeTrajectory trajectory;
+        trajectory.reserve(raw_trajectory.size());
         for (const auto& [t, state_vec] : raw_trajectory) {
-            double M_local_SU2_arr[8] = {0}, M_antiferro_SU2_arr[8] = {0}, M_global_SU2_arr[8] = {0};
-            double M_local_SU3_arr[8] = {0}, M_antiferro_SU3_arr[8] = {0}, M_global_SU3_arr[8] = {0};
-            
-            compute_sublattice_magnetizations_from_flat(state_vec.data(), 0, 
-                lattice_size_SU2, spin_dim_SU2, M_local_SU2_arr, M_antiferro_SU2_arr);
-            compute_sublattice_magnetizations_from_flat(state_vec.data(), total_SU2, 
-                lattice_size_SU3, spin_dim_SU3, M_local_SU3_arr, M_antiferro_SU3_arr);
-            
-            for (size_t i = 0; i < lattice_size_SU2; ++i) {
-                size_t atom = i % N_atoms_SU2;
-                for (size_t mu = 0; mu < spin_dim_SU2; ++mu) {
-                    for (size_t nu = 0; nu < spin_dim_SU2; ++nu) {
-                        M_global_SU2_arr[mu] += sublattice_frames_SU2[atom](mu, nu) * state_vec[i * spin_dim_SU2 + nu];
-                    }
-                }
-            }
-            for (size_t i = 0; i < lattice_size_SU3; ++i) {
-                size_t atom = i % N_atoms_SU3;
-                for (size_t mu = 0; mu < spin_dim_SU3; ++mu) {
-                    for (size_t nu = 0; nu < spin_dim_SU3; ++nu) {
-                        M_global_SU3_arr[mu] += sublattice_frames_SU3[atom](mu, nu) * state_vec[total_SU2 + i * spin_dim_SU3 + nu];
-                    }
-                }
-            }
-            
-            SpinVector M_local_SU2 = Eigen::Map<Eigen::VectorXd>(M_local_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-            SpinVector M_antiferro_SU2 = Eigen::Map<Eigen::VectorXd>(M_antiferro_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-            SpinVector M_global_SU2 = Eigen::Map<Eigen::VectorXd>(M_global_SU2_arr, spin_dim_SU2) / double(lattice_size_SU2);
-            SpinVector M_local_SU3 = Eigen::Map<Eigen::VectorXd>(M_local_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            SpinVector M_antiferro_SU3 = Eigen::Map<Eigen::VectorXd>(M_antiferro_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            SpinVector M_global_SU3 = Eigen::Map<Eigen::VectorXd>(M_global_SU3_arr, spin_dim_SU3) / double(lattice_size_SU3);
-            
-            trajectory.push_back({t, {{M_antiferro_SU2, M_local_SU2, M_global_SU2}, 
-                                      {M_antiferro_SU3, M_local_SU3, M_global_SU3}}});
+            trajectory.emplace_back(t, observe(state_vec.data()));
         }
         
         reset_pulse();

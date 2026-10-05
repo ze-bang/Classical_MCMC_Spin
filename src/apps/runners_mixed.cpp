@@ -228,8 +228,24 @@ void run_parallel_tempering_mixed(MixedLattice& lattice, const SpinConfig& confi
 // Dynamics configuration shared by every MD-type runner (MD, pump-probe,
 // 2DCS); defined below.
 static void configure_dynamics(MixedLattice& lattice, const SpinConfig& config, int rank);
+static bool apply_trilinear_reference(MixedLattice& lattice, const SpinConfig& config, int rank,
+                                      bool requench);
 
 namespace {
+
+// Copy rank 0's spins to every rank.
+void broadcast_spins(MixedLattice& lattice, int rank) {
+    vector<double> buf = lattice.spins_to_state();
+    buf.resize(lattice.spin_state_size());
+    MPI_Bcast(buf.data(), static_cast<int>(buf.size()), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+        MixedLattice::SpinConfigSU2 s2;
+        MixedLattice::SpinConfigSU3 s3;
+        lattice.state_to_spins(buf, s2, s3);
+        lattice.spins_SU2 = std::move(s2);
+        lattice.spins_SU3 = std::move(s3);
+    }
+}
 
 // Initial configuration of a trial. With a loaded configuration every trial
 // starts from it (previously only the first trial on each rank did; the
@@ -337,9 +353,10 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
             cout << "Skipping equilibration (using loaded spin configuration)" << endl;
         }
         
-        // Save initial spin configuration before time evolution
-        lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+        apply_trilinear_reference(lattice, config, rank, /*requench=*/true);
         configure_dynamics(lattice, config, rank);
+        // Save the initial spin configuration of the time evolution
+        lattice.save_spin_config(trial_dir + "/initial_spins.txt");
         
         // Run MD
         if (rank == 0) {
@@ -595,9 +612,10 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
             cout << "Skipping equilibration (using loaded spin configuration)" << endl;
         }
         
-        // Save initial spin configuration before time evolution
-        lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
+        apply_trilinear_reference(lattice, config, rank, /*requench=*/true);
         configure_dynamics(lattice, config, rank);
+        // Save the initial spin configuration of the time evolution
+        lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
         
         // Setup pump field directions
         if (rank == 0) {
@@ -682,29 +700,38 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
  *   thermal_heat, thermal_cap, thermal_cool
  *       thermal reservoir (only with Bloch damping; see mixed_lattice.h)
  *   linear_drive_torque    ablation: SU(2) drive torque about the current state
- *   tm_trilinear_reference = 1
- *       subtract the current SU(3) state from the SU(3) leg of the Fe-Fe-Tm
- *       trilinear couplings (folded into the Hamiltonian, so MC, energy and MD
- *       agree), then re-minimise so the dynamics starts from a stationary state.
- *       This replaces the old implicit subtraction of the Bloch-damping
- *       equilibrium in the MD field only (docs/MIGRATION.md).
  * The SU(3) bracket convention (su3_legacy_convention) is part of the unit
- * cell and needs nothing here.
+ * cell and needs nothing here; see apply_trilinear_reference for
+ * tm_trilinear_reference.
  */
-static void configure_dynamics(MixedLattice& lattice, const SpinConfig& config, int rank) {
-    lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.0);
-    if (rank == 0 && lattice.alpha_gilbert != 0.0) {
-        cout << "SU(2) Gilbert damping alpha = " << lattice.alpha_gilbert << endl;
-    }
-
-    if (config.get_param("tm_trilinear_reference", 0.0) != 0.0) {
-        lattice.set_mixed_trilinear_reference_SU3(lattice.spins_SU3);
+/**
+ * tm_trilinear_reference = 1: subtract the current SU(3) state r from the SU(3)
+ * leg of the Fe-Fe-Tm trilinear couplings, T(S_i, S_j, n_k - r_k), folded into
+ * the Hamiltonian so MC, energy and MD agree (this replaces the old implicit
+ * subtraction of the Bloch-damping equilibrium in the MD field only; see
+ * docs/MIGRATION.md). With `requench` the state is then re-minimised, so the
+ * dynamics starts from a stationary state of the modified Hamiltonian.
+ * Returns true if the reference was applied.
+ */
+static bool apply_trilinear_reference(MixedLattice& lattice, const SpinConfig& config, int rank,
+                                      bool requench) {
+    if (config.get_param("tm_trilinear_reference", 0.0) == 0.0) return false;
+    lattice.set_mixed_trilinear_reference_SU3(lattice.spins_SU3);
+    if (requench) {
         lattice.greedy_quench();
         if (rank == 0) {
             cout << "Fe-Fe-Tm trilinear couples to n - n_ref (n_ref = annealed SU(3) state); "
                  << "re-minimised, stationarity residual = "
                  << lattice.relative_stationarity_residual(lattice.spins_to_state()) << endl;
         }
+    }
+    return true;
+}
+
+static void configure_dynamics(MixedLattice& lattice, const SpinConfig& config, int rank) {
+    lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.0);
+    if (rank == 0 && lattice.alpha_gilbert != 0.0) {
+        cout << "SU(2) Gilbert damping alpha = " << lattice.alpha_gilbert << endl;
     }
 
     const double gamma_uniform = config.get_param("gamma_su3", 0.0);
@@ -1109,50 +1136,18 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         // Wait for rank 0 to finish annealing
         MPI_Barrier(MPI_COMM_WORLD);
         
-        // Synchronize SU2 spins across all ranks
-        vector<double> spin_buffer_su2(lattice.lattice_size_SU2 * lattice.spin_dim_SU2);
-        if (rank == 0) {
-            for (size_t i = 0; i < lattice.lattice_size_SU2; ++i) {
-                for (size_t d = 0; d < lattice.spin_dim_SU2; ++d) {
-                    spin_buffer_su2[i * lattice.spin_dim_SU2 + d] = lattice.spins_SU2[i](d);
-                }
-            }
+        broadcast_spins(lattice, rank);
+        // Optional trilinear reference: every rank folds the same broadcast
+        // state, rank 0 re-minimises and the result is broadcast again.
+        if (apply_trilinear_reference(lattice, config, rank, /*requench=*/rank == 0)) {
+            broadcast_spins(lattice, rank);
         }
-        MPI_Bcast(spin_buffer_su2.data(), spin_buffer_su2.size(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        if (rank != 0) {
-            for (size_t i = 0; i < lattice.lattice_size_SU2; ++i) {
-                for (size_t d = 0; d < lattice.spin_dim_SU2; ++d) {
-                    lattice.spins_SU2[i](d) = spin_buffer_su2[i * lattice.spin_dim_SU2 + d];
-                }
-            }
-        }
-        
-        // Synchronize SU3 spins across all ranks
-        vector<double> spin_buffer_su3(lattice.lattice_size_SU3 * lattice.spin_dim_SU3);
-        if (rank == 0) {
-            for (size_t i = 0; i < lattice.lattice_size_SU3; ++i) {
-                for (size_t d = 0; d < lattice.spin_dim_SU3; ++d) {
-                    spin_buffer_su3[i * lattice.spin_dim_SU3 + d] = lattice.spins_SU3[i](d);
-                }
-            }
-        }
-        MPI_Bcast(spin_buffer_su3.data(), spin_buffer_su3.size(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
-        if (rank != 0) {
-            for (size_t i = 0; i < lattice.lattice_size_SU3; ++i) {
-                for (size_t d = 0; d < lattice.spin_dim_SU3; ++d) {
-                    lattice.spins_SU3[i](d) = spin_buffer_su3[i * lattice.spin_dim_SU3 + d];
-                }
-            }
-        }
-        
-        // Save initial spin configuration before time evolution (rank 0 only)
+        // Damping / ablation setup from the synchronized ground state,
+        // identically on every rank.
+        configure_dynamics(lattice, config, rank);
         if (rank == 0) {
             lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
         }
-
-        // Damping / ablation / reference setup from the just-synchronized
-        // ground state, identically on every rank.
-        configure_dynamics(lattice, config, rank);
 
         if (rank == 0) {
             cout << "\n[2/2] Running MPI-parallel pump-probe spectroscopy..." << endl;
@@ -1262,10 +1257,10 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
                 config.twist_sweep_count
             );
             
-            // Save initial spin configuration before time evolution
-            lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
-            
+            apply_trilinear_reference(lattice, config, rank, /*requench=*/true);
             configure_dynamics(lattice, config, rank);
+            // Save the initial spin configuration of the time evolution
+            lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
 
             if (rank == 0 || config.num_trials == 1) {
                 cout << "\n[2/3] Pulse configuration:" << endl;                cout << "  SU2 Pulse: amplitude=" << config.pump_amplitude 
