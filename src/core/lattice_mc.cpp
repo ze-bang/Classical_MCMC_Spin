@@ -66,6 +66,7 @@
             double saved_angle = twist_angles[d];
             twist_matrices[d] = R_new;
             twist_angles[d] = angle_new;
+            sync_twist_state();
 
             // Energy after the move
             double E_after = 0.0;
@@ -73,11 +74,15 @@
                 E_after += site_energy(spins[idx], idx);
             }
 
-            double dE = E_after - E_before;
+            // Every wrapped bond has both ends in boundary_sites_per_dim[d],
+            // so the boundary-site sum counts each twisted bond twice (all
+            // other terms cancel in the difference).
+            double dE = 0.5 * (E_after - E_before);
             bool accept = (dE < 0) || (random_double_lehman(0, 1) < std::exp(-dE / T));
             if (!accept) {
                 twist_matrices[d] = saved_R;
                 twist_angles[d] = saved_angle;
+                sync_twist_state();
             } else {
                 accepted++;
                 ++twist_n_accept[d];
@@ -125,12 +130,14 @@
             double saved_angle = twist_angles[d];
             twist_matrices[d] = rotation_from_axis_angle(rotation_axis[d], theta);
             twist_angles[d] = theta;
+            sync_twist_state();
             double E = 0.0;
             for (size_t idx : boundary_sites_per_dim[d]) {
                 E += site_energy(spins[idx], idx);
             }
             twist_matrices[d] = saved_R;
             twist_angles[d] = saved_angle;
+            sync_twist_state();
             return E;
         };
 
@@ -189,6 +196,7 @@
                 while (theta_opt < -M_PI) theta_opt += 2.0 * M_PI;
                 twist_matrices[d] = rotation_from_axis_angle(rotation_axis[d], theta_opt);
                 twist_angles[d] = theta_opt;
+                sync_twist_state();
             }
         }
     }
@@ -331,7 +339,7 @@
         for (size_t i = 0; i < prelim_samples; ++i) {
             metropolis(T_final, gaussian_move, sigma);
             if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                overrelaxation();
+                overrelaxation(T_final);
             }
             if (i % prelim_interval == 0) {
                 prelim_energies.push_back(total_energy(spins));
@@ -363,7 +371,7 @@
         for (size_t i = 0; i < n_measure; ++i) {
             metropolis(T_final, gaussian_move, sigma);
             if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                overrelaxation();
+                overrelaxation(T_final);
             }
             
             if (i % acf.sampling_interval == 0) {
@@ -535,7 +543,7 @@
         // Perform MC sweeps with interleaved twist updates
         for (size_t i = 0; i < n_sweeps; ++i) {
             if (overrelaxation_rate > 0) {
-                overrelaxation();
+                overrelaxation(T);
                 if (i % overrelaxation_rate == 0) {
                     acc_sum += metropolis(T, gaussian_move, sigma);
                 }

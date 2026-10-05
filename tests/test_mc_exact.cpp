@@ -110,6 +110,39 @@ void test_heisenberg_ring() {
     }
 }
 
+// ------------------------------------------- cluster moves, FM ring + field
+void test_cluster_ferromagnet() {
+    std::printf("\n== Cluster moves on the FM ring in a field ==\n");
+    // FM Heisenberg ring in a field has no closed form at finite N, so use
+    // plain Metropolis (validated above) as the reference.
+    const double J = -1.0, T = 0.7;
+    UnitCell uc = chain_cell(J * Eigen::Matrix3d::Identity(), Eigen::Vector3d(0, 0, 0.3));
+    Lattice lat(uc, 32, 1, 1, 1.0f);
+    seed_lehman(55);
+    auto ref = sample_energy_density(lat, 2000, 60000, [&] { lat.metropolis(T); lat.overrelaxation(); });
+    struct K { const char* name; std::function<void()> f; };
+    std::vector<K> ks = {
+        {"wolff(ghost)", [&] { lat.wolff_sweep(T, 4, true); }},
+        {"wolff(no ghost, filtered)", [&] { lat.wolff_sweep(T, 4, false); lat.metropolis(T); }},
+        {"swendsen_wang(ghost)", [&] { lat.swendsen_wang_sweep(T, true); }},
+        {"swendsen_wang(no ghost, filtered)", [&] { lat.swendsen_wang_sweep(T, false); }},
+    };
+    for (auto& k : ks) {
+        lat.init_random();
+        auto r = sample_energy_density(lat, 2000, 60000, k.f);
+        const double err = std::sqrt(r.err * r.err + ref.err * ref.err);
+        check_stat(r.mean, err, ref.mean, std::string(k.name) + " vs metropolis", kSigma);
+    }
+    // Clusters must actually form for a zero-field ferromagnet at low T
+    // (the sign error fixed in wolff_update produced single-site clusters).
+    Lattice fm(chain_cell(J * Eigen::Matrix3d::Identity()), 32, 1, 1, 1.0f);
+    fm.init_ferromagnetic(Eigen::Vector3d(0, 0, 1));
+    size_t total = 0;
+    for (int i = 0; i < 200; ++i) total += fm.wolff_update(0.2, false);
+    check(total > 200 * 4, "wolff clusters grow for a ferromagnet (mean size " +
+                               std::to_string(total / 200.0) + ")");
+}
+
 // ----------------------------------------------------- two-site general model
 struct TwoSiteModel {
     Eigen::Matrix3d J, A;
@@ -183,7 +216,19 @@ void run_two_site_case(const TwoSiteModel& m, const std::string& label, bool or_
         if (or_valid) {
             r = sample_energy_density(lat, 2000, 200000, [&] { lat.overrelaxation(); lat.metropolis(T); });
             check_stat(r.mean, r.err, exact, "metropolis+overrelaxation " + tag, kSigma, 1e-4);
+            r = sample_energy_density(lat, 2000, 200000, [&] { lat.overrelaxation(T); lat.metropolis(T); });
+            check_stat(r.mean, r.err, exact, "metropolis+overrelaxation(T) " + tag, kSigma, 1e-4);
         }
+        // Cluster moves: the embedded-Ising part is exact only for isotropic
+        // exchange; everything else must be absorbed by the residual filter.
+        r = sample_energy_density(lat, 2000, 200000, [&] { lat.wolff_update(T, false); lat.metropolis(T); });
+        check_stat(r.mean, r.err, exact, "wolff+metropolis " + tag, kSigma, 1e-4);
+        r = sample_energy_density(lat, 2000, 200000, [&] { lat.wolff_update(T, true); lat.metropolis(T); });
+        check_stat(r.mean, r.err, exact, "wolff(ghost)+metropolis " + tag, kSigma, 1e-4);
+        r = sample_energy_density(lat, 2000, 200000, [&] { lat.swendsen_wang_sweep(T, true); lat.metropolis(T); });
+        check_stat(r.mean, r.err, exact, "swendsen_wang(ghost)+metropolis " + tag, kSigma, 1e-4);
+        r = sample_energy_density(lat, 2000, 200000, [&] { lat.swendsen_wang_sweep(T, false); });
+        check_stat(r.mean, r.err, exact, "swendsen_wang only " + tag, kSigma, 1e-4);
     }
 }
 
@@ -294,6 +339,8 @@ void test_three_site_trilinear() {
         r = sample_energy_density(lat, 2000, 150000, [&] { lat.overrelaxation(); lat.metropolis(T); });
         check_stat(r.mean, r.err, exact, "trilinear metropolis+overrelaxation T=" + std::to_string(T),
                    kSigma, 2e-4);
+        r = sample_energy_density(lat, 2000, 150000, [&] { lat.wolff_update(T); lat.metropolis(T); });
+        check_stat(r.mean, r.err, exact, "trilinear wolff+metropolis T=" + std::to_string(T), kSigma, 2e-4);
     }
 }
 
@@ -335,6 +382,7 @@ int main(int argc, char** argv) {
     test_colouring();
     test_free_spins();
     test_heisenberg_ring();
+    test_cluster_ferromagnet();
     test_two_site();
     test_three_site_trilinear();
     const int rc = finish("test_mc_exact");

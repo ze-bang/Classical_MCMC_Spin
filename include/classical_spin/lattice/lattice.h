@@ -580,6 +580,23 @@ public:
     mutable vector<int>     uf_size;              // Union-Find subtree size
     mutable vector<uint8_t> uf_forbid_flip;       // SW: ghost-bonded clusters
     mutable vector<uint8_t> uf_flip_root;         // SW: per-root flip flag
+    mutable vector<size_t>  cluster_members_buf;  // members of the current cluster
+
+    // True iff some twist matrix differs from the identity. Twisted-bond
+    // cold paths are taken only when this is set; keep it in sync through
+    // sync_twist_state() whenever twist_matrices change.
+    bool twist_active = false;
+
+    // Cached result of cluster_embedding_is_exact() (-1 = unknown).
+    mutable int8_t cluster_exact_cache = -1;
+
+    void sync_twist_state() {
+        cluster_exact_cache = -1;
+        twist_active = false;
+        if (spin_dim != 3) return;
+        for (size_t d = 0; d < 3; ++d)
+            if (!twist_matrices[d].isIdentity(1e-15)) twist_active = true;
+    }
 
     /**
      * Check if lattice is a pyrochlore type (pyrochlore or pyrochlore_non_kramer)
@@ -786,7 +803,16 @@ public:
                             else if (pk >= (int)dim3) { pk -= dim3; wrap[2] = +1; }
                             
                             size_t partner_idx = flatten_index(pi, pj, pk, bi.partner);
-                            
+
+                            // A bond onto the site's own periodic image (lattice
+                            // extent 1 along a bonded direction) is the single-ion
+                            // term S^T J S: fold it into the on-site matrix so the
+                            // energy, ΔE, local field and dynamics all count it once.
+                            if (partner_idx == site_idx) {
+                                onsite_interaction[site_idx] += bi.interaction;
+                                continue;
+                            }
+
                             // Add forward interaction: site_idx -> partner_idx with J
                             bilinear_interaction[site_idx].push_back(bi.interaction);
                             bilinear_partners[site_idx].push_back(partner_idx);
@@ -817,6 +843,13 @@ public:
                                                                k + tri.offset2[2], 
                                                                tri.partner2);
                             
+                            if (p1 == site_idx || p2 == site_idx || p1 == p2) {
+                                throw std::invalid_argument(
+                                    "Lattice: trilinear coupling maps two of its sites onto the "
+                                    "same lattice site; enlarge the lattice along the coupled "
+                                    "direction(s)");
+                            }
+
                             // Add forward interaction: T[i,j,k] with (site_idx, p1, p2)
                             trilinear_interaction[site_idx].push_back(tri.interaction);
                             trilinear_partners[site_idx].push_back({p1, p2});
@@ -866,6 +899,7 @@ public:
      * a 32x32x1 honeycomb with spin_dim=3 (negligible).
      */
     void build_flat_bilinear_tables() {
+        cluster_exact_cache = -1;
         bi_flat_D2 = spin_dim * spin_dim;
 
         bi_flat_offset.assign(lattice_size + 1, 0);
@@ -896,8 +930,10 @@ public:
 
                 const auto& wrap = bilinear_wrap_dir[i][n];
                 bi_flat_wrap[k] = wrap;
+                // Twists are SO(3) rotations: only spin_dim == 3 bonds can carry one.
                 bi_flat_needs_twist[k] =
-                    (wrap[0] != 0 || wrap[1] != 0 || wrap[2] != 0) ? uint8_t(1) : uint8_t(0);
+                    (spin_dim == 3 && (wrap[0] != 0 || wrap[1] != 0 || wrap[2] != 0))
+                        ? uint8_t(1) : uint8_t(0);
             }
         }
     }
@@ -1037,6 +1073,7 @@ public:
           rotation_axis(other.rotation_axis),
           twist_angles(other.twist_angles),
           bilinear_wrap_dir(other.bilinear_wrap_dir),
+          twist_active(other.twist_active),
           boundary_sites_per_dim(other.boundary_sites_per_dim),
           boundary_thickness(other.boundary_thickness),
           field_drive(other.field_drive),
@@ -1194,6 +1231,7 @@ public:
             twist_angles[d] = 0.0;
             twist_matrices[d] = rotation_from_axis_angle(rotation_axis[d], 0.0);
         }
+        sync_twist_state();
     }
 
     /**
@@ -1264,537 +1302,382 @@ public:
      */
     double site_energy_diff(const SpinVector& new_spin, const SpinVector& old_spin, 
                            size_t site_index) const {
-        SpinVector delta = new_spin - old_spin;
-        double dE = 0.0;
-        
-        // Zeeman
-        dE -= delta.dot(field[site_index]);
-        
-        // On-site
-        dE += new_spin.dot(onsite_interaction[site_index] * new_spin) 
-            - old_spin.dot(onsite_interaction[site_index] * old_spin);
-        
-        // Bilinear
-        size_t n_bi = bilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_bi; ++n) {
-            size_t partner = bilinear_partners[site_index][n];
-            SpinVector partner_spin = apply_twist_to_partner_spin(
-                spins[partner], bilinear_wrap_dir[site_index][n]);
-            dE += delta.dot(bilinear_interaction[site_index][n] * partner_spin);
+        return site_energy_diff_flat(new_spin.data(), old_spin.data(), site_index);
+    }
+
+    // ------------------------------------------------------------------
+    // Local-field kernel layer.
+    //
+    // Every local quantity — Metropolis ΔE, the overrelaxation axis, the
+    // T = 0 quench, the LLG right-hand side and the total energy — is built
+    // from the same two primitives below, so a coupling is either right
+    // everywhere or wrong everywhere (previously five hand-copied loops had
+    // drifted apart: the Eigen `get_local_field` used an ad-hoc trilinear
+    // term, and the twisted-bond branches overran 3-element buffers for
+    // spin_dim > 3).
+    //
+    // `spin_of(j)` returns a pointer to the spin_dim components of site j,
+    // so the kernels serve both the live configuration (SpinsView) and the
+    // flat ODE state vectors (FlatView).
+    // ------------------------------------------------------------------
+    static constexpr size_t MAX_SPIN_DIM = 16;
+
+    struct SpinsView {
+        const SpinConfig& s;
+        const double* operator()(size_t j) const { return s[j].data(); }
+    };
+    struct FlatView {
+        const double* x;
+        size_t dim;
+        const double* operator()(size_t j) const { return x + j * dim; }
+    };
+    SpinsView spins_view() const { return SpinsView{spins}; }
+    FlatView flat_view(const double* x) const { return FlatView{x, spin_dim}; }
+
+    /**
+     * Partner spin seen across a twisted periodic boundary: R_d for a +1
+     * wrap, R_d^T for a -1 wrap, applied dimension by dimension. Twists are
+     * SO(3) rotations, so only spin_dim == 3 bonds are ever flagged.
+     */
+    inline void twist_partner_spin_flat(const double* P, const array<int8_t, 3>& wrap,
+                                        double* out) const {
+        double v[3] = {P[0], P[1], P[2]};
+        for (size_t dim = 0; dim < 3; ++dim) {
+            if (wrap[dim] == 0) continue;
+            const auto& R = twist_matrices[dim];
+            double t[3];
+            if (wrap[dim] > 0) {
+                for (size_t d = 0; d < 3; ++d) t[d] = R(d, 0) * v[0] + R(d, 1) * v[1] + R(d, 2) * v[2];
+            } else {
+                for (size_t d = 0; d < 3; ++d) t[d] = R(0, d) * v[0] + R(1, d) * v[1] + R(2, d) * v[2];
+            }
+            v[0] = t[0]; v[1] = t[1]; v[2] = t[2];
         }
-        
-        // Trilinear
-        size_t n_tri = trilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_tri; ++n) {
-            size_t p1 = trilinear_partners[site_index][n][0];
-            size_t p2 = trilinear_partners[site_index][n][1];
-            dE += contract_trilinear(trilinear_interaction[site_index][n],
-                                    delta,
-                                    spins[p1],
-                                    spins[p2]);
-        }
-        
-        return dE;
+        out[0] = v[0]; out[1] = v[1]; out[2] = v[2];
     }
 
     /**
-     * Zero-allocation Δenergy for a proposed Metropolis move.
+     * H_out += Σ_n J_n S_{p(n)} + Σ_t T_t : (S_{p1(t)} ⊗ S_{p2(t)}),
+     * the gradient ∂E/∂S_i of every term LINEAR in S_i (bilinear exchange,
+     * twisted at wrapped bonds when a twist is active, and trilinear
+     * couplings). Zeeman (-B) and the quadratic on-site term (2 A S_i) are
+     * added by the callers that need them.
+     */
+    template<typename SpinOf>
+    inline void accumulate_exchange_field(size_t site, const SpinOf& spin_of,
+                                          double* __restrict H_out) const {
+        const size_t D = spin_dim;
+        const size_t bi_end = bi_flat_offset[site + 1];
+        for (size_t k = bi_flat_offset[site]; k < bi_end; ++k) {
+            const double* P = spin_of(bi_flat_partner[k]);
+            double tw[3];
+            if (__builtin_expect(twist_active && bi_flat_needs_twist[k], 0)) {
+                twist_partner_spin_flat(P, bi_flat_wrap[k], tw);
+                P = tw;
+            }
+            const double* __restrict J = &bi_flat_J[k * bi_flat_D2];
+            for (size_t a = 0; a < D; ++a) {
+                double row = 0.0;
+                for (size_t b = 0; b < D; ++b) row += J[a * D + b] * P[b];
+                H_out[a] += row;
+            }
+        }
+        const size_t n_tri = trilinear_partners[site].size();
+        for (size_t n = 0; n < n_tri; ++n) {
+            const double* S_j = spin_of(trilinear_partners[site][n][0]);
+            const double* S_k = spin_of(trilinear_partners[site][n][1]);
+            const auto& T = trilinear_interaction[site][n];
+            for (size_t a = 0; a < D; ++a) {
+                const auto& Ta = T[a];
+                double acc = 0.0;
+                for (size_t b = 0; b < D; ++b) {
+                    double row = 0.0;
+                    for (size_t c = 0; c < D; ++c) row += Ta(b, c) * S_k[c];
+                    acc += S_j[b] * row;
+                }
+                H_out[a] += acc;
+            }
+        }
+    }
+
+    /// g = -B_i + Σ J S_j + trilinear: the S_i-independent part of ∂E/∂S_i.
+    template<typename SpinOf>
+    inline void linear_field(size_t site, const SpinOf& spin_of, double* g) const {
+        const double* B = field[site].data();
+        for (size_t d = 0; d < spin_dim; ++d) g[d] = -B[d];
+        accumulate_exchange_field(site, spin_of, g);
+    }
+
+    /// S^T A S for the on-site matrix of `site`.
+    inline double onsite_energy(size_t site, const double* S) const {
+        const auto& A = onsite_interaction[site];
+        double e = 0.0;
+        for (size_t a = 0; a < spin_dim; ++a) {
+            double row = 0.0;
+            for (size_t b = 0; b < spin_dim; ++b) row += A(a, b) * S[b];
+            e += S[a] * row;
+        }
+        return e;
+    }
+
+    /**
+     * True when S^T A S is constant on the sphere, i.e. the symmetric part
+     * of the on-site matrix is a multiple of the identity (this includes
+     * A = 0). Such terms exert no torque and are skipped by overrelaxation
+     * and the quench.
+     */
+    inline bool onsite_is_scalar(size_t site) const {
+        const auto& A = onsite_interaction[site];
+        double diag_mean = 0.0, scale = 0.0;
+        for (size_t a = 0; a < spin_dim; ++a) diag_mean += A(a, a);
+        diag_mean /= double(spin_dim);
+        for (size_t a = 0; a < spin_dim; ++a)
+            for (size_t b = 0; b < spin_dim; ++b) scale = std::max(scale, std::abs(A(a, b)));
+        const double tol = 1e-13 * std::max(scale, 1.0);
+        for (size_t a = 0; a < spin_dim; ++a) {
+            if (std::abs(A(a, a) - diag_mean) > tol) return false;
+            for (size_t b = a + 1; b < spin_dim; ++b)
+                if (std::abs(A(a, b) + A(b, a)) > 2.0 * tol) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Exact minimiser of e(S) = S^T A S + g^T S on the sphere |S| = s.
      *
-     * `new_spin_buf` and `old_spin_buf` are raw double pointers (typically
-     * stack buffers in the Metropolis hot loop and `spins[site].data()`).
-     * Avoids constructing two Eigen::VectorXd temporaries (heap allocation +
-     * Eigen expression-template overhead) per proposed move, which is the
-     * single biggest CPU win for a Metropolis sweep on small spin_dim.
+     * This is the trust-region subproblem. With A_sym = Q diag(a) Q^T and
+     * c = Q^T g, stationary points are S = -Q (A_sym + λ)^{-1} c / 2 with
+     *     φ(λ) = Σ_k c_k² / (4 (a_k + λ)²) = s²,
+     * and the global minimum is the root with λ ≥ -a_min (A_sym + λ PSD).
+     * φ decreases monotonically on (-a_min, ∞) and φ(-a_min + |c|/(2s)) ≤ s²,
+     * so a safeguarded Newton/bisection solve is robust. In the "hard case"
+     * (c has no weight on the lowest eigenvector) λ = -a_min and the
+     * remaining norm goes into the a_min eigenspace, oriented along the
+     * current spin `S_cur` for continuity.
+     */
+    static void minimize_quadratic_on_sphere(const Eigen::MatrixXd& A, const double* g,
+                                             double s, const double* S_cur, double* S_out,
+                                             size_t n) {
+        const Eigen::MatrixXd A_sym = 0.5 * (A + A.transpose());
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(A_sym);
+        const Eigen::VectorXd& a = es.eigenvalues();          // ascending
+        const Eigen::MatrixXd& Q = es.eigenvectors();
+        const Eigen::VectorXd c = Q.transpose() * Eigen::Map<const Eigen::VectorXd>(g, n);
+        const double a_min = a(0);
+        const double spread = std::max(1e-300, a(n - 1) - a_min);
+        const double deg_tol = 1e-10 * std::max(spread, std::abs(a_min));
+
+        auto phi = [&](double lam) {
+            double sum = 0.0;
+            for (size_t k = 0; k < n; ++k) {
+                const double d = a(k) + lam;
+                sum += c(k) * c(k) / (4.0 * d * d);
+            }
+            return sum - s * s;
+        };
+
+        // Weight of g on the lowest eigenspace decides easy vs hard case.
+        double c_low2 = 0.0, c_norm2 = 0.0;
+        for (size_t k = 0; k < n; ++k) {
+            c_norm2 += c(k) * c(k);
+            if (a(k) - a_min <= deg_tol) c_low2 += c(k) * c(k);
+        }
+        const double c_norm = std::sqrt(c_norm2);
+
+        Eigen::VectorXd y(n);  // solution in the eigenbasis
+        bool hard = (c_low2 <= 1e-28 * std::max(1.0, c_norm2));
+        if (hard) {
+            double rest2 = 0.0;
+            for (size_t k = 0; k < n; ++k) {
+                if (a(k) - a_min <= deg_tol) { y(k) = 0.0; continue; }
+                y(k) = -c(k) / (2.0 * (a(k) - a_min));
+                rest2 += y(k) * y(k);
+            }
+            if (rest2 > s * s) hard = false;  // a genuine root exists above -a_min
+            else {
+                // Fill the a_min eigenspace along the current spin.
+                const Eigen::VectorXd cur = Q.transpose() * Eigen::Map<const Eigen::VectorXd>(S_cur, n);
+                double proj2 = 0.0;
+                for (size_t k = 0; k < n; ++k)
+                    if (a(k) - a_min <= deg_tol) proj2 += cur(k) * cur(k);
+                const double tau = std::sqrt(std::max(0.0, s * s - rest2));
+                if (proj2 > 1e-30) {
+                    const double scale = tau / std::sqrt(proj2);
+                    for (size_t k = 0; k < n; ++k)
+                        if (a(k) - a_min <= deg_tol) y(k) = scale * cur(k);
+                } else {
+                    y(0) = tau;
+                }
+            }
+        }
+        if (!hard) {
+            double lo = -a_min, hi = -a_min + c_norm / (2.0 * s) + 1e-300;
+            double lam = hi;
+            for (int it = 0; it < 200; ++it) {
+                const double f = phi(lam);
+                if (std::abs(f) <= 1e-15 * s * s) break;
+                if (f > 0.0) lo = lam; else hi = lam;
+                // Newton step on φ, kept inside the bracket.
+                double df = 0.0;
+                for (size_t k = 0; k < n; ++k) {
+                    const double d = a(k) + lam;
+                    df -= c(k) * c(k) / (2.0 * d * d * d);
+                }
+                double next = (df < 0.0) ? lam - f / df : 0.5 * (lo + hi);
+                if (!(next > lo && next < hi)) next = 0.5 * (lo + hi);
+                if (hi - lo <= 1e-16 * std::max(1.0, std::abs(lam))) { lam = next; break; }
+                lam = next;
+            }
+            for (size_t k = 0; k < n; ++k) y(k) = -c(k) / (2.0 * (a(k) + lam));
+            const double yn = y.norm();
+            if (yn > 0.0) y *= s / yn;  // remove residual root-finding error
+        }
+        Eigen::Map<Eigen::VectorXd>(S_out, n) = Q * y;
+    }
+
+    /**
+     * Zero-allocation Δenergy for a proposed single-site move.
      *
-     * Equivalent to site_energy_diff(new, old, site).
+     * `new_spin_buf` / `old_spin_buf` are raw pointers (stack buffers in
+     * the Metropolis loop and `spins[site].data()`). Exact for every term:
+     * ΔE = δ·g + (new^T A new - old^T A old) with g the linear field.
      */
     double site_energy_diff_flat(const double* __restrict new_spin_buf,
                                  const double* __restrict old_spin_buf,
                                  size_t site_index) const {
-        // Stack scratch — spin_dim is at most 8 for SU(3); 16 leaves headroom.
-        constexpr size_t MAX_SPIN_DIM = 16;
-        double delta_buf[MAX_SPIN_DIM];
-        for (size_t d = 0; d < spin_dim; ++d) {
-            delta_buf[d] = new_spin_buf[d] - old_spin_buf[d];
-        }
-
+        double g[MAX_SPIN_DIM];
+        linear_field(site_index, spins_view(), g);
         double dE = 0.0;
+        for (size_t d = 0; d < spin_dim; ++d) dE += (new_spin_buf[d] - old_spin_buf[d]) * g[d];
+        return dE + onsite_energy(site_index, new_spin_buf) - onsite_energy(site_index, old_spin_buf);
+    }
 
-        // Zeeman: -delta · B
-        const double* B = field[site_index].data();
-        for (size_t d = 0; d < spin_dim; ++d) dE -= delta_buf[d] * B[d];
+    /**
+     * Total energy of a configuration accessed through `spin_of`:
+     * Zeeman + on-site per site, each bilinear bond once (partner > i),
+     * each trilinear triple once (both partners > i). Self-bonds never
+     * reach the bond tables (they are folded into the on-site term at
+     * construction), so the partner > i rule is exact.
+     */
+    template<typename SpinOf>
+    double total_energy_impl(const SpinOf& spin_of) const {
+        const size_t D = spin_dim;
+        double E = 0.0;
+        for (size_t i = 0; i < lattice_size; ++i) {
+            const double* S_i = spin_of(i);
+            const double* B = field[i].data();
+            for (size_t d = 0; d < D; ++d) E -= B[d] * S_i[d];
+            E += onsite_energy(i, S_i);
 
-        // On-site: new^T A new - old^T A old
-        const auto& A = onsite_interaction[site_index];
-        for (size_t a = 0; a < spin_dim; ++a) {
-            double row_new = 0.0, row_old = 0.0;
-            for (size_t b = 0; b < spin_dim; ++b) {
-                row_new += A(a, b) * new_spin_buf[b];
-                row_old += A(a, b) * old_spin_buf[b];
-            }
-            dE += new_spin_buf[a] * row_new - old_spin_buf[a] * row_old;
-        }
-
-        // Bilinear: delta^T J S_partner.
-        //
-        // Hot path: read partners and J matrices straight from the flat
-        // SoA tables (built once in initialize()). This eliminates the
-        // two pointer indirections of vector<vector<Eigen::Matrix3d>>
-        // and lets each site's J matrices stream from L1 cache.
-        //
-        // The twist-BC branch is taken only at the lattice boundary AND
-        // only when twist angles are nonzero, so __builtin_expect drives
-        // the branch predictor toward the no-twist path.
-        const size_t bi_base = bi_flat_offset[site_index];
-        const size_t bi_end  = bi_flat_offset[site_index + 1];
-        const size_t D2      = bi_flat_D2;
-        for (size_t k = bi_base; k < bi_end; ++k) {
-            const size_t partner = bi_flat_partner[k];
-            const double* __restrict P = spins[partner].data();
-            const double* __restrict J = &bi_flat_J[k * D2];
-
-            if (__builtin_expect(bi_flat_needs_twist[k] != 0, 0)) {
-                // Cold path: apply twist transform to the partner spin.
-                double twist_buf[3] = {P[0], P[1], P[2]};
-                const auto& wrap = bi_flat_wrap[k];
-                for (size_t dim = 0; dim < 3; ++dim) {
-                    if (wrap[dim] == 0) continue;
-                    double tmp[3] = {0.0, 0.0, 0.0};
-                    if (wrap[dim] > 0) {
-                        for (size_t d = 0; d < 3; ++d) {
-                            tmp[d] = twist_matrices[dim](d, 0) * twist_buf[0]
-                                   + twist_matrices[dim](d, 1) * twist_buf[1]
-                                   + twist_matrices[dim](d, 2) * twist_buf[2];
-                        }
-                    } else {
-                        for (size_t d = 0; d < 3; ++d) {
-                            tmp[d] = twist_matrices[dim](0, d) * twist_buf[0]
-                                   + twist_matrices[dim](1, d) * twist_buf[1]
-                                   + twist_matrices[dim](2, d) * twist_buf[2];
-                        }
-                    }
-                    twist_buf[0] = tmp[0]; twist_buf[1] = tmp[1]; twist_buf[2] = tmp[2];
+            const size_t bi_end = bi_flat_offset[i + 1];
+            for (size_t k = bi_flat_offset[i]; k < bi_end; ++k) {
+                const size_t j = bi_flat_partner[k];
+                if (j <= i) continue;
+                const double* P = spin_of(j);
+                double tw[3];
+                if (__builtin_expect(twist_active && bi_flat_needs_twist[k], 0)) {
+                    twist_partner_spin_flat(P, bi_flat_wrap[k], tw);
+                    P = tw;
                 }
-                for (size_t a = 0; a < spin_dim; ++a) {
+                const double* J = &bi_flat_J[k * bi_flat_D2];
+                for (size_t a = 0; a < D; ++a) {
                     double row = 0.0;
-                    for (size_t b = 0; b < spin_dim; ++b)
-                        row += J[a * spin_dim + b] * twist_buf[b];
-                    dE += delta_buf[a] * row;
-                }
-            } else {
-                // Common case: tight matrix-vector multiply, all loads
-                // from contiguous memory. Auto-vectorizable.
-                for (size_t a = 0; a < spin_dim; ++a) {
-                    double row = 0.0;
-                    for (size_t b = 0; b < spin_dim; ++b)
-                        row += J[a * spin_dim + b] * P[b];
-                    dE += delta_buf[a] * row;
+                    for (size_t b = 0; b < D; ++b) row += J[a * D + b] * P[b];
+                    E += S_i[a] * row;
                 }
             }
-        }
 
-        // Trilinear: delta . (T : S_j ⊗ S_k)
-        const size_t n_tri = trilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_tri; ++n) {
-            const size_t p1 = trilinear_partners[site_index][n][0];
-            const size_t p2 = trilinear_partners[site_index][n][1];
-            const double* S_j = spins[p1].data();
-            const double* S_k = spins[p2].data();
-            const auto& T = trilinear_interaction[site_index][n];
-
-            // Cache S_j[b] * S_k[c] outer product (small spin_dim)
-            double S_jk[64]; // up to spin_dim=8
-            for (size_t b = 0; b < spin_dim; ++b) {
-                for (size_t c = 0; c < spin_dim; ++c) {
-                    S_jk[b * spin_dim + c] = S_j[b] * S_k[c];
-                }
-            }
-            for (size_t a = 0; a < spin_dim; ++a) {
-                double sum_a = 0.0;
-                for (size_t b = 0; b < spin_dim; ++b) {
-                    for (size_t c = 0; c < spin_dim; ++c) {
-                        sum_a += T[a](b, c) * S_jk[b * spin_dim + c];
+            const size_t n_tri = trilinear_partners[i].size();
+            for (size_t n = 0; n < n_tri; ++n) {
+                const size_t p1 = trilinear_partners[i][n][0];
+                const size_t p2 = trilinear_partners[i][n][1];
+                if (p1 <= i || p2 <= i) continue;
+                const double* S_j = spin_of(p1);
+                const double* S_k = spin_of(p2);
+                const auto& T = trilinear_interaction[i][n];
+                for (size_t a = 0; a < D; ++a) {
+                    double acc = 0.0;
+                    for (size_t b = 0; b < D; ++b) {
+                        double row = 0.0;
+                        for (size_t c = 0; c < D; ++c) row += T[a](b, c) * S_k[c];
+                        acc += S_j[b] * row;
                     }
+                    E += S_i[a] * acc;
                 }
-                dE += delta_buf[a] * sum_a;
             }
         }
-
-        return dE;
+        return E;
     }
 
     /**
      * Compute total energy of configuration
      */
     double total_energy(const SpinConfig& config) const {
-        double E = 0.0;
-        
-        for (size_t i = 0; i < lattice_size; ++i) {
-            // Zeeman
-            E -= config[i].dot(field[i]);
-            
-            // On-site
-            E += config[i].dot(onsite_interaction[i] * config[i]);
-            
-            // Bilinear (count each pair once)
-            size_t n_bi = bilinear_partners[i].size();
-            for (size_t n = 0; n < n_bi; ++n) {
-                size_t partner = bilinear_partners[i][n];
-                if (partner > i) { // Avoid double counting
-                    SpinVector partner_spin = apply_twist_to_partner_spin(
-                        config[partner], bilinear_wrap_dir[i][n]);
-                    E += config[i].dot(bilinear_interaction[i][n] * partner_spin);
-                }
-            }
-            
-            // Trilinear (count each triple once)
-            size_t n_tri = trilinear_partners[i].size();
-            for (size_t n = 0; n < n_tri; ++n) {
-                size_t p1 = trilinear_partners[i][n][0];
-                size_t p2 = trilinear_partners[i][n][1];
-                if (p1 > i && p2 > i) { // Avoid double counting
-                    E += contract_trilinear(trilinear_interaction[i][n],
-                                           config[i],
-                                           config[p1],
-                                           config[p2]);
-                }
-            }
-        }
-        
-        return E;
+        return total_energy_impl(SpinsView{config});
     }
 
     /**
      * Total energy of current spin configuration (no-arg wrapper)
      */
     double total_energy() const {
-        return total_energy(spins);
+        return total_energy_impl(spins_view());
     }
 
     /**
      * Energy per site
      */
     double energy_density() const {
-        return total_energy(spins) / lattice_size;
+        return total_energy() / lattice_size;
     }
 
     /**
-     * Compute total energy directly from flat state array (zero-allocation version)
-     * Includes all interaction terms with proper double-counting avoidance
+     * Total energy directly from a flat state array (zero allocation).
      */
     double total_energy_flat(const double* state_flat) const {
-        double E = 0.0;
-        
-        for (size_t i = 0; i < lattice_size; ++i) {
-            const double* S_i = &state_flat[i * spin_dim];
-            
-            // Zeeman: -B·S
-            for (size_t d = 0; d < spin_dim; ++d) {
-                E -= field[i](d) * S_i[d];
-            }
-            
-            // On-site: S^T A S
-            for (size_t d = 0; d < spin_dim; ++d) {
-                for (size_t d2 = 0; d2 < spin_dim; ++d2) {
-                    E += S_i[d] * onsite_interaction[i](d, d2) * S_i[d2];
-                }
-            }
-            
-            // Bilinear: S_i^T J S_j (count each pair once)
-            size_t n_bi = bilinear_partners[i].size();
-            for (size_t n = 0; n < n_bi; ++n) {
-                size_t partner = bilinear_partners[i][n];
-                if (partner > i) { // Avoid double counting
-                    const double* S_j = &state_flat[partner * spin_dim];
-                    
-                    // Apply twist if needed
-                    const auto& wrap = bilinear_wrap_dir[i][n];
-                    if (spin_dim == 3 && (wrap[0] != 0 || wrap[1] != 0 || wrap[2] != 0)) {
-                        double S_j_twisted[3];
-                        std::copy(S_j, S_j + 3, S_j_twisted);
-                        
-                        for (size_t d = 0; d < 3; ++d) {
-                            if (wrap[d] != 0) {
-                                double twisted[3] = {0, 0, 0};
-                                // For positive wrap, apply twist_matrices[d]
-                                // For negative wrap, apply transpose (inverse for rotations)
-                                if (wrap[d] > 0) {
-                                    for (size_t d2 = 0; d2 < 3; ++d2) {
-                                        twisted[d2] += twist_matrices[d](d2, 0) * S_j_twisted[0];
-                                        twisted[d2] += twist_matrices[d](d2, 1) * S_j_twisted[1];
-                                        twisted[d2] += twist_matrices[d](d2, 2) * S_j_twisted[2];
-                                    }
-                                } else {
-                                    // Apply transpose: R^T[d2, d3] = R[d3, d2]
-                                    for (size_t d2 = 0; d2 < 3; ++d2) {
-                                        twisted[d2] += twist_matrices[d](0, d2) * S_j_twisted[0];
-                                        twisted[d2] += twist_matrices[d](1, d2) * S_j_twisted[1];
-                                        twisted[d2] += twist_matrices[d](2, d2) * S_j_twisted[2];
-                                    }
-                                }
-                                std::copy(twisted, twisted + 3, S_j_twisted);
-                            }
-                        }
-                        
-                        // S_i^T * J * S_j_twisted
-                        for (size_t d = 0; d < spin_dim; ++d) {
-                            for (size_t d2 = 0; d2 < spin_dim; ++d2) {
-                                E += S_i[d] * bilinear_interaction[i][n](d, d2) * S_j_twisted[d2];
-                            }
-                        }
-                    } else {
-                        // No twist needed
-                        for (size_t d = 0; d < spin_dim; ++d) {
-                            for (size_t d2 = 0; d2 < spin_dim; ++d2) {
-                                E += S_i[d] * bilinear_interaction[i][n](d, d2) * S_j[d2];
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Trilinear: contract(T, S_i, S_j, S_k) (count each triple once)
-            size_t n_tri = trilinear_partners[i].size();
-            for (size_t n = 0; n < n_tri; ++n) {
-                size_t p1 = trilinear_partners[i][n][0];
-                size_t p2 = trilinear_partners[i][n][1];
-                
-                if (p1 > i && p2 > i) { // Avoid double counting
-                    const double* S_j = &state_flat[p1 * spin_dim];
-                    const double* S_k = &state_flat[p2 * spin_dim];
-                    const auto& T = trilinear_interaction[i][n];
-                    
-                    // Contract tensor: E += sum_{abc} T[a][b,c] * S_i[a] * S_j[b] * S_k[c]
-                    // Optimize by caching S_j[b] * S_k[c] products
-                    if (spin_dim <= 3) {
-                        // Small dimension: unroll and cache products
-                        double S_jk[9]; // max 3x3 = 9 products
-                        for (size_t b = 0; b < spin_dim; ++b) {
-                            for (size_t c = 0; c < spin_dim; ++c) {
-                                S_jk[b * spin_dim + c] = S_j[b] * S_k[c];
-                            }
-                        }
-                        
-                        for (size_t a = 0; a < spin_dim; ++a) {
-                            double temp = 0.0;
-                            for (size_t b = 0; b < spin_dim; ++b) {
-                                for (size_t c = 0; c < spin_dim; ++c) {
-                                    temp += T[a](b, c) * S_jk[b * spin_dim + c];
-                                }
-                            }
-                            E += S_i[a] * temp;
-                        }
-                    } else {
-                        // Larger dimension: optimize for cache locality
-                        // Strategy: compute matrix-vector products incrementally
-                        for (size_t a = 0; a < spin_dim; ++a) {
-                            double sum_a = 0.0;
-                            const auto& T_a = T[a]; // T[a] is a spin_dim x spin_dim matrix
-                            
-                            // Compute T_a * outer(S_j, S_k) contracted with basis vectors
-                            // This is: sum_{b,c} T_a(b,c) * S_j[b] * S_k[c]
-                            for (size_t b = 0; b < spin_dim; ++b) {
-                                double temp = 0.0;
-                                // Inner loop: accumulate over c with S_j[b] factored out
-                                for (size_t c = 0; c < spin_dim; ++c) {
-                                    temp += T_a(b, c) * S_k[c];
-                                }
-                                sum_a += S_j[b] * temp;
-                            }
-                            
-                            E += S_i[a] * sum_a;
-                        }
-                    }
-                }
-            }
-        }
-        
-        return E;
+        return total_energy_impl(flat_view(state_flat));
     }
 
     /**
-     * Compute local field at a site: H_eff = -dE/dS
+     * Energy gradient at a site, H = ∂E/∂S_i = -B + 2 A S_i + Σ J S_j + trilinear.
+     *
+     * Note the sign: this is the gradient, i.e. minus the physical effective
+     * field. The LLG right-hand side is dS/dt = H × S = S × B_eff.
      */
     SpinVector get_local_field(size_t site_index) const {
-        SpinVector H = -field[site_index];
-        
-        // On-site contribution
-        H += 2.0 * onsite_interaction[site_index] * spins[site_index];
-        
-        // Bilinear
-        size_t n_bi = bilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_bi; ++n) {
-            size_t partner = bilinear_partners[site_index][n];
-            SpinVector partner_spin = apply_twist_to_partner_spin(
-                spins[partner], bilinear_wrap_dir[site_index][n]);
-            H += bilinear_interaction[site_index][n] * partner_spin;
-        }
-        
-        // Trilinear (simplified - approximate field contribution)
-        size_t n_tri = trilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_tri; ++n) {
-            size_t p1 = trilinear_partners[site_index][n][0];
-            size_t p2 = trilinear_partners[site_index][n][1];
-            // Approximate: treat as coupling between spin products
-            double coupling = contract_trilinear(trilinear_interaction[site_index][n],
-                                                SpinVector::Ones(spin_dim),
-                                                spins[p1],
-                                                spins[p2]);
-            H += coupling * spins[site_index];
-        }
-        
+        SpinVector H(spin_dim);
+        get_local_field_flat_impl(spins_view(), site_index, H.data());
         return H;
     }
 
-
     /**
-     * Compute local field from flat state array (zero-allocation version for ODE integration)
+     * Energy gradient ∂E/∂S_i from a flat state array (zero allocation; the
+     * LLG hot path).
      */
     void get_local_field_flat(const double* state_flat, size_t site_index, double* H_out) const {
-        // Initialize H = -B
-        for (size_t d = 0; d < spin_dim; ++d) {
-            H_out[d] = -field[site_index](d);
-        }
-        
-        // On-site: H += 2*A*S
-        const double* S_i = &state_flat[site_index * spin_dim];
-        for (size_t d = 0; d < spin_dim; ++d) {
-            for (size_t d2 = 0; d2 < spin_dim; ++d2) {
-                H_out[d] += 2.0 * onsite_interaction[site_index](d, d2) * S_i[d2];
-            }
-        }
-        
-        // Bilinear: H += J * S_partner.
-        // Hot path uses the SoA bilinear table built in initialize().
-        const size_t bi_base = bi_flat_offset[site_index];
-        const size_t bi_end  = bi_flat_offset[site_index + 1];
-        const size_t D2      = bi_flat_D2;
-        for (size_t k = bi_base; k < bi_end; ++k) {
-            const size_t partner = bi_flat_partner[k];
-            const double* __restrict S_partner = &state_flat[partner * spin_dim];
-            const double* __restrict J         = &bi_flat_J[k * D2];
+        get_local_field_flat_impl(flat_view(state_flat), site_index, H_out);
+    }
 
-            if (__builtin_expect(bi_flat_needs_twist[k] != 0, 0)) {
-                double S_twisted[8] = {0.0};
-                for (size_t d = 0; d < 3; ++d) S_twisted[d] = S_partner[d];
-                const auto& wrap = bi_flat_wrap[k];
-                for (size_t dim = 0; dim < 3; ++dim) {
-                    if (wrap[dim] == 0) continue;
-                    double temp[3] = {0.0, 0.0, 0.0};
-                    if (wrap[dim] > 0) {
-                        for (size_t d = 0; d < 3; ++d) {
-                            for (size_t d2 = 0; d2 < 3; ++d2)
-                                temp[d] += twist_matrices[dim](d, d2) * S_twisted[d2];
-                        }
-                    } else {
-                        for (size_t d = 0; d < 3; ++d) {
-                            for (size_t d2 = 0; d2 < 3; ++d2)
-                                temp[d] += twist_matrices[dim](d2, d) * S_twisted[d2];
-                        }
-                    }
-                    for (size_t d = 0; d < 3; ++d) S_twisted[d] = temp[d];
-                }
-                for (size_t d = 0; d < spin_dim; ++d) {
-                    double row = 0.0;
-                    for (size_t d2 = 0; d2 < spin_dim; ++d2)
-                        row += J[d * spin_dim + d2] * S_twisted[d2];
-                    H_out[d] += row;
-                }
-            } else {
-                for (size_t d = 0; d < spin_dim; ++d) {
-                    double row = 0.0;
-                    for (size_t d2 = 0; d2 < spin_dim; ++d2)
-                        row += J[d * spin_dim + d2] * S_partner[d2];
-                    H_out[d] += row;
-                }
-            }
-        }
-        
-        // Trilinear: H += dE/dS_i from trilinear terms
-        // For E = sum_{abc} T[a](b,c) * S_i[a] * S_j[b] * S_k[c]
-        // dE/dS_i[a] = sum_{bc} T[a](b,c) * S_j[b] * S_k[c]
-        size_t n_tri = trilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_tri; ++n) {
-            size_t p1 = trilinear_partners[site_index][n][0];
-            size_t p2 = trilinear_partners[site_index][n][1];
-            
-            const double* S_j = &state_flat[p1 * spin_dim];
-            const double* S_k = &state_flat[p2 * spin_dim];
-            const auto& T = trilinear_interaction[site_index][n];
-            
-            // Compute field contribution: H[a] += sum_{bc} T[a](b,c) * S_j[b] * S_k[c]
-            if (spin_dim <= 3) {
-                // Small dimension: cache S_j[b] * S_k[c] products
-                double S_jk[9];
-                for (size_t b = 0; b < spin_dim; ++b) {
-                    for (size_t c = 0; c < spin_dim; ++c) {
-                        S_jk[b * spin_dim + c] = S_j[b] * S_k[c];
-                    }
-                }
-                
-                for (size_t a = 0; a < spin_dim; ++a) {
-                    double temp = 0.0;
-                    for (size_t b = 0; b < spin_dim; ++b) {
-                        for (size_t c = 0; c < spin_dim; ++c) {
-                            temp += T[a](b, c) * S_jk[b * spin_dim + c];
-                        }
-                    }
-                    H_out[a] += temp;
-                }
-            } else {
-                // Larger dimension: cache-friendly pattern
-                for (size_t a = 0; a < spin_dim; ++a) {
-                    double sum_a = 0.0;
-                    const auto& T_a = T[a];
-                    
-                    for (size_t b = 0; b < spin_dim; ++b) {
-                        double temp = 0.0;
-                        for (size_t c = 0; c < spin_dim; ++c) {
-                            temp += T_a(b, c) * S_k[c];
-                        }
-                        sum_a += S_j[b] * temp;
-                    }
-                    
-                    H_out[a] += sum_a;
-                }
-            }
+    template<typename SpinOf>
+    inline void get_local_field_flat_impl(const SpinOf& spin_of, size_t site_index,
+                                          double* H_out) const {
+        linear_field(site_index, spin_of, H_out);
+        const auto& A = onsite_interaction[site_index];
+        const double* S_i = spin_of(site_index);
+        for (size_t a = 0; a < spin_dim; ++a) {
+            double row = 0.0;
+            for (size_t b = 0; b < spin_dim; ++b) row += (A(a, b) + A(b, a)) * S_i[b];
+            H_out[a] += row;
         }
     }
-    
+
     /**
-     * Compute local field at a site: H_eff = -dE/dS
+     * Energy gradient of site `site_index` in an arbitrary configuration.
      */
-    SpinVector get_local_field_lattice(SpinConfig curr_spins, size_t site_index) const {
-        SpinVector H = -field[site_index];
-        
-        // On-site contribution
-        H += 2.0 * onsite_interaction[site_index] * curr_spins[site_index];
-        
-        // Bilinear
-        size_t n_bi = bilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_bi; ++n) {
-            size_t partner = bilinear_partners[site_index][n];
-            SpinVector partner_spin = apply_twist_to_partner_spin(
-                curr_spins[partner], bilinear_wrap_dir[site_index][n]);
-            H += bilinear_interaction[site_index][n] * partner_spin;
-        }
-        
-        // Trilinear (simplified - approximate field contribution)
-        size_t n_tri = trilinear_partners[site_index].size();
-        for (size_t n = 0; n < n_tri; ++n) {
-            size_t p1 = trilinear_partners[site_index][n][0];
-            size_t p2 = trilinear_partners[site_index][n][1];
-            // Approximate: treat as coupling between spin products
-            double coupling = contract_trilinear(trilinear_interaction[site_index][n],
-                                                SpinVector::Ones(spin_dim),
-                                                curr_spins[p1],
-                                                curr_spins[p2]);
-            H += coupling * curr_spins[site_index];
-        }
-        
+    SpinVector get_local_field_lattice(const SpinConfig& curr_spins, size_t site_index) const {
+        SpinVector H(spin_dim);
+        get_local_field_flat_impl(SpinsView{curr_spins}, site_index, H.data());
         return H;
     }
-
 
     // ============================================================
     // AUTOCORRELATION ANALYSIS
@@ -2784,103 +2667,56 @@ public:
     }
 
     /**
-     * Over-relaxation sweep (microcanonical, zero acceptance rate).
-     * Reflects each spin across its local field direction.
+     * Overrelaxation move at one site: reflect S_i about its linear field g
+     * (Zeeman + exchange + trilinear), S' = 2 (S·g) g / |g|² - S.
      *
-     * Now sequential (was random with replacement → ~37% sites missed per
-     * sweep due to coupon-collector). Ergodicity unchanged; thermodynamic
-     * averages unaffected.
+     * The reflection conserves every term linear in S_i exactly, so it is a
+     * valid microcanonical move whenever the on-site term is constant on the
+     * sphere. An anisotropic on-site term S^T A S is NOT conserved; for such
+     * sites the reflection (an involution, hence a symmetric proposal) is
+     * accepted with min(1, exp(-ΔE_onsite / T)) when T > 0 and skipped when
+     * T <= 0, which keeps detailed balance in both cases. (The previous
+     * version reflected about g + 2 A S_i, which conserves neither and
+     * biased every model with single-ion anisotropy.)
+     *
+     * Returns true if the spin changed.
      */
-    void overrelaxation() {
-        constexpr size_t MAX_SPIN_DIM = 16;
-        double H_buf[MAX_SPIN_DIM];
-        for (size_t site = 0; site < lattice_size; ++site) {
-            const double* B = field[site].data();
-            for (size_t d = 0; d < spin_dim; ++d) H_buf[d] = -B[d];
-
-            const auto& A = onsite_interaction[site];
-            const double* S = spins[site].data();
-            for (size_t a = 0; a < spin_dim; ++a) {
-                double acc = 0.0;
-                for (size_t b = 0; b < spin_dim; ++b) acc += A(a, b) * S[b];
-                H_buf[a] += 2.0 * acc;
-            }
-
-            // Bilinear contribution — SoA hot path, twist BC is cold.
-            const size_t bi_base = bi_flat_offset[site];
-            const size_t bi_end  = bi_flat_offset[site + 1];
-            const size_t D2      = bi_flat_D2;
-            for (size_t k = bi_base; k < bi_end; ++k) {
-                const size_t partner = bi_flat_partner[k];
-                const double* __restrict P = spins[partner].data();
-                const double* __restrict J = &bi_flat_J[k * D2];
-
-                if (__builtin_expect(bi_flat_needs_twist[k] != 0, 0)) {
-                    double tw[3] = {P[0], P[1], P[2]};
-                    const auto& wrap = bi_flat_wrap[k];
-                    for (size_t dim = 0; dim < 3; ++dim) {
-                        if (wrap[dim] == 0) continue;
-                        double tmp[3] = {0, 0, 0};
-                        if (wrap[dim] > 0) {
-                            for (size_t d = 0; d < 3; ++d)
-                                tmp[d] = twist_matrices[dim](d, 0) * tw[0]
-                                       + twist_matrices[dim](d, 1) * tw[1]
-                                       + twist_matrices[dim](d, 2) * tw[2];
-                        } else {
-                            for (size_t d = 0; d < 3; ++d)
-                                tmp[d] = twist_matrices[dim](0, d) * tw[0]
-                                       + twist_matrices[dim](1, d) * tw[1]
-                                       + twist_matrices[dim](2, d) * tw[2];
-                        }
-                        tw[0] = tmp[0]; tw[1] = tmp[1]; tw[2] = tmp[2];
-                    }
-                    for (size_t a = 0; a < spin_dim; ++a) {
-                        double acc = 0.0;
-                        for (size_t b = 0; b < spin_dim; ++b)
-                            acc += J[a * spin_dim + b] * tw[b];
-                        H_buf[a] += acc;
-                    }
-                } else {
-                    for (size_t a = 0; a < spin_dim; ++a) {
-                        double acc = 0.0;
-                        for (size_t b = 0; b < spin_dim; ++b)
-                            acc += J[a * spin_dim + b] * P[b];
-                        H_buf[a] += acc;
-                    }
-                }
-            }
-
-            const size_t n_tri = trilinear_partners[site].size();
-            for (size_t n = 0; n < n_tri; ++n) {
-                const size_t p1 = trilinear_partners[site][n][0];
-                const size_t p2 = trilinear_partners[site][n][1];
-                const double* S_j = spins[p1].data();
-                const double* S_k = spins[p2].data();
-                const auto& T = trilinear_interaction[site][n];
-                double S_jk[64];
-                for (size_t b = 0; b < spin_dim; ++b)
-                    for (size_t c = 0; c < spin_dim; ++c)
-                        S_jk[b * spin_dim + c] = S_j[b] * S_k[c];
-                for (size_t a = 0; a < spin_dim; ++a) {
-                    double acc = 0.0;
-                    for (size_t b = 0; b < spin_dim; ++b)
-                        for (size_t c = 0; c < spin_dim; ++c)
-                            acc += T[a](b, c) * S_jk[b * spin_dim + c];
-                    H_buf[a] += acc;
-                }
-            }
-
-            // Reflect: S' = 2 (S·H) H / |H|^2 - S
-            double norm_sq = 0.0;
-            for (size_t d = 0; d < spin_dim; ++d) norm_sq += H_buf[d] * H_buf[d];
-            if (norm_sq <= 0.0) continue;
-
-            double S_dot_H = 0.0;
-            double* Sw = spins[site].data();
-            for (size_t d = 0; d < spin_dim; ++d) S_dot_H += Sw[d] * H_buf[d];
-            const double k = 2.0 * S_dot_H / norm_sq;
-            for (size_t d = 0; d < spin_dim; ++d) Sw[d] = k * H_buf[d] - Sw[d];
+    inline bool overrelax_site(size_t site, double T) {
+        double g[MAX_SPIN_DIM];
+        linear_field(site, spins_view(), g);
+        double norm_sq = 0.0, S_dot_g = 0.0;
+        double* S = spins[site].data();
+        for (size_t d = 0; d < spin_dim; ++d) {
+            norm_sq += g[d] * g[d];
+            S_dot_g += S[d] * g[d];
         }
+        if (norm_sq <= 0.0) return false;
+        const double k = 2.0 * S_dot_g / norm_sq;
+        if (onsite_is_scalar(site)) {
+            for (size_t d = 0; d < spin_dim; ++d) S[d] = k * g[d] - S[d];
+            return true;
+        }
+        if (T <= 0.0) return false;
+        double S_new[MAX_SPIN_DIM];
+        for (size_t d = 0; d < spin_dim; ++d) S_new[d] = k * g[d] - S[d];
+        const double dE = onsite_energy(site, S_new) - onsite_energy(site, S);
+        if (dE <= 0.0 || random_double_lehman(0.0, 1.0) < std::exp(-dE / T)) {
+            std::memcpy(S, S_new, spin_dim * sizeof(double));
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Overrelaxation sweep over all sites in natural order.
+     *
+     * Microcanonical (zero rejection) for models without single-ion
+     * anisotropy. With anisotropic on-site terms pass the simulation
+     * temperature so that those sites receive a Metropolis-corrected
+     * reflection; with the default T = 0 they are left untouched.
+     */
+    void overrelaxation(double T = 0.0) {
+        for (size_t site = 0; site < lattice_size; ++site) overrelax_site(site, T);
     }
 
     /**
@@ -2895,15 +2731,13 @@ public:
      * Falls back to the serial `overrelaxation()` if no colour partition
      * is built or only one thread is available.
      */
-    void overrelaxation_parallel() {
-        if (n_colors == 0) { overrelaxation(); return; }
+    void overrelaxation_parallel(double T = 0.0) {
+        if (n_colors == 0) { overrelaxation(T); return; }
 #ifdef _OPENMP
-        if (omp_get_max_threads() <= 1) { overrelaxation(); return; }
+        if (omp_get_max_threads() <= 1) { overrelaxation(T); return; }
 #else
-        overrelaxation(); return;
+        overrelaxation(T); return;
 #endif
-
-        constexpr size_t MAX_SPIN_DIM = 16;
 
         // PERSISTENT OpenMP region: one fork/join for the whole sweep,
         // with #pragma omp barrier between colour passes. See the
@@ -2912,142 +2746,201 @@ public:
         #pragma omp parallel
 #endif
         {
-            double H_buf[MAX_SPIN_DIM];
-
             for (size_t c = 0; c < n_colors; ++c) {
                 const size_t off_lo = sites_by_color_csr_off[c];
                 const size_t off_hi = sites_by_color_csr_off[c + 1];
-
 #ifdef _OPENMP
                 #pragma omp for schedule(static) nowait
 #endif
-                for (size_t off = off_lo; off < off_hi; ++off) {
-                    const size_t site = sites_by_color_csr[off];
-                    const double* B = field[site].data();
-                    for (size_t d = 0; d < spin_dim; ++d) H_buf[d] = -B[d];
-
-                    const auto& A = onsite_interaction[site];
-                    const double* S = spins[site].data();
-                    for (size_t a = 0; a < spin_dim; ++a) {
-                        double acc = 0.0;
-                        for (size_t b = 0; b < spin_dim; ++b) acc += A(a, b) * S[b];
-                        H_buf[a] += 2.0 * acc;
-                    }
-
-                    const size_t bi_base = bi_flat_offset[site];
-                    const size_t bi_end  = bi_flat_offset[site + 1];
-                    const size_t D2      = bi_flat_D2;
-                    for (size_t k = bi_base; k < bi_end; ++k) {
-                        const size_t partner = bi_flat_partner[k];
-                        const double* __restrict P = spins[partner].data();
-                        const double* __restrict J = &bi_flat_J[k * D2];
-
-                        if (__builtin_expect(bi_flat_needs_twist[k] != 0, 0)) {
-                            double tw[3] = {P[0], P[1], P[2]};
-                            const auto& wrap = bi_flat_wrap[k];
-                            for (size_t dim = 0; dim < 3; ++dim) {
-                                if (wrap[dim] == 0) continue;
-                                double tmp[3] = {0, 0, 0};
-                                if (wrap[dim] > 0) {
-                                    for (size_t d = 0; d < 3; ++d)
-                                        tmp[d] = twist_matrices[dim](d, 0) * tw[0]
-                                               + twist_matrices[dim](d, 1) * tw[1]
-                                               + twist_matrices[dim](d, 2) * tw[2];
-                                } else {
-                                    for (size_t d = 0; d < 3; ++d)
-                                        tmp[d] = twist_matrices[dim](0, d) * tw[0]
-                                               + twist_matrices[dim](1, d) * tw[1]
-                                               + twist_matrices[dim](2, d) * tw[2];
-                                }
-                                tw[0] = tmp[0]; tw[1] = tmp[1]; tw[2] = tmp[2];
-                            }
-                            for (size_t a = 0; a < spin_dim; ++a) {
-                                double acc = 0.0;
-                                for (size_t b = 0; b < spin_dim; ++b)
-                                    acc += J[a * spin_dim + b] * tw[b];
-                                H_buf[a] += acc;
-                            }
-                        } else {
-                            for (size_t a = 0; a < spin_dim; ++a) {
-                                double acc = 0.0;
-                                for (size_t b = 0; b < spin_dim; ++b)
-                                    acc += J[a * spin_dim + b] * P[b];
-                                H_buf[a] += acc;
-                            }
-                        }
-                    }
-
-                    const size_t n_tri = trilinear_partners[site].size();
-                    for (size_t n = 0; n < n_tri; ++n) {
-                        const size_t p1 = trilinear_partners[site][n][0];
-                        const size_t p2 = trilinear_partners[site][n][1];
-                        const double* S_j = spins[p1].data();
-                        const double* S_k = spins[p2].data();
-                        const auto& T = trilinear_interaction[site][n];
-                        double S_jk[64];
-                        for (size_t b = 0; b < spin_dim; ++b)
-                            for (size_t cc = 0; cc < spin_dim; ++cc)
-                                S_jk[b * spin_dim + cc] = S_j[b] * S_k[cc];
-                        for (size_t a = 0; a < spin_dim; ++a) {
-                            double acc = 0.0;
-                            for (size_t b = 0; b < spin_dim; ++b)
-                                for (size_t cc = 0; cc < spin_dim; ++cc)
-                                    acc += T[a](b, cc) * S_jk[b * spin_dim + cc];
-                            H_buf[a] += acc;
-                        }
-                    }
-
-                    double norm_sq = 0.0;
-                    for (size_t d = 0; d < spin_dim; ++d) norm_sq += H_buf[d] * H_buf[d];
-                    if (norm_sq <= 0.0) continue;
-
-                    double S_dot_H = 0.0;
-                    double* Sw = spins[site].data();
-                    for (size_t d = 0; d < spin_dim; ++d) S_dot_H += Sw[d] * H_buf[d];
-                    const double k_refl = 2.0 * S_dot_H / norm_sq;
-                    for (size_t d = 0; d < spin_dim; ++d)
-                        Sw[d] = k_refl * H_buf[d] - Sw[d];
-                }
+                for (size_t off = off_lo; off < off_hi; ++off)
+                    overrelax_site(sites_by_color_csr[off], T);
                 // Synchronise threads before moving to the next colour.
 #ifdef _OPENMP
                 #pragma omp barrier
 #endif
-            } // end colour loop
-        } // end omp parallel
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cluster moves for continuous spins (Wolff 1989, Swendsen-Wang 1987).
+    //
+    // A random unit vector r defines the reflection R = 1 - 2 r r^T.
+    // Writing S_i = S_i^⊥ + s_i r with s_i = S_i·r, a bond energy
+    // S_i^T J S_j contains the embedded Ising term x_ij = K_ij s_i s_j with
+    // K_ij = r^T J r. Remember E = +S^T J S here (J > 0 antiferromagnetic),
+    // so a bond is *satisfied* when x_ij < 0, and the Fortuin-Kasteleyn
+    // construction activates it with probability
+    //     p_ij = 1 - exp(-2 β |x_ij|)   if x_ij < 0,   0 otherwise.
+    // (The previous implementation activated *unsatisfied* bonds, i.e. had
+    // the sign of the coupling reversed — no clusters at all for
+    // ferromagnets, wrong ones for antiferromagnets — and used exp(-β|x|)
+    // for the ghost bond instead of exp(-2β|x|).)
+    //
+    // Everything that is not of the embedded form is exact-corrected: the
+    // residual ΔE_res = ΔE_true - ΔE_embedded of a cluster flip (anisotropic
+    // or DM parts of J, anisotropic on-site terms, trilinear couplings,
+    // twisted bonds, and the Zeeman term when no ghost spin is used) enters
+    // a Metropolis filter min(1, exp(-β ΔE_res)). Flipping a whole FK
+    // cluster leaves the joint bond-spin weight invariant, so the filtered
+    // move satisfies detailed balance for any Hamiltonian; for isotropic
+    // Heisenberg exchange ΔE_res ≡ 0 and the filter is skipped entirely.
+    // ------------------------------------------------------------------
+
+    /// K = r^T J r for bond slot k, or 0 for bonds that cannot be embedded
+    /// exactly (twisted boundary bonds when a twist is active).
+    inline double embedded_coupling(size_t k, const double* r) const {
+        if (twist_active && bi_flat_needs_twist[k]) return 0.0;
+        const double* J = &bi_flat_J[k * bi_flat_D2];
+        double K = 0.0;
+        for (size_t a = 0; a < spin_dim; ++a) {
+            double row = 0.0;
+            for (size_t b = 0; b < spin_dim; ++b) row += J[a * spin_dim + b] * r[b];
+            K += r[a] * row;
+        }
+        return K;
+    }
+
+    /// True if every coupling is invariant under any reflection: scalar
+    /// (isotropic, DM-free) exchange, scalar on-site terms, no trilinear
+    /// couplings and no active twist. The Zeeman term is checked separately.
+    bool cluster_embedding_is_exact() const {
+        if (cluster_exact_cache < 0) cluster_exact_cache = compute_cluster_embedding_is_exact() ? 1 : 0;
+        return cluster_exact_cache == 1;
+    }
+
+    bool compute_cluster_embedding_is_exact() const {
+        if (twist_active) return false;
+        for (size_t i = 0; i < lattice_size; ++i) {
+            if (!trilinear_partners[i].empty() || !onsite_is_scalar(i)) return false;
+        }
+        const size_t D = spin_dim;
+        for (size_t k = 0; k < bi_flat_partner.size(); ++k) {
+            const double* J = &bi_flat_J[k * bi_flat_D2];
+            const double c = J[0];
+            const double tol = 1e-13 * std::max(1.0, std::abs(c));
+            for (size_t a = 0; a < D; ++a)
+                for (size_t b = 0; b < D; ++b)
+                    if (std::abs(J[a * D + b] - (a == b ? c : 0.0)) > tol) return false;
+        }
+        return true;
+    }
+
+    bool has_nonzero_field() const {
+        for (const auto& B : field)
+            if (B.squaredNorm() > 0.0) return true;
+        return false;
     }
 
     /**
-     * Wolff cluster update - single cluster flip. Returns cluster size.
+     * Residual energy ΔE_true - ΔE_embedded of reflecting every site of the
+     * cluster `members` (flagged in `in_cluster`) about r. `proj` holds the
+     * pre-flip projections s_i = S_i·r. Spins are NOT modified.
+     */
+    double cluster_residual_energy(const vector<size_t>& members, const uint8_t* in_cluster,
+                                   const double* r, const double* proj, bool ghost) const {
+        const size_t D = spin_dim;
+        auto reflected = [&](size_t j, double* out) {
+            const double* S = spins[j].data();
+            for (size_t d = 0; d < D; ++d) out[d] = S[d] - 2.0 * proj[j] * r[d];
+        };
+        double dE_true = 0.0, dE_emb = 0.0;
+        double Si_new[MAX_SPIN_DIM], Pj[MAX_SPIN_DIM], Pj_new[MAX_SPIN_DIM], tmp[MAX_SPIN_DIM];
+        for (size_t i : members) {
+            const double* Si = spins[i].data();
+            reflected(i, Si_new);
+            const double* B = field[i].data();
+            double B_r = 0.0;
+            for (size_t d = 0; d < D; ++d) B_r += B[d] * r[d];
+            dE_true += 2.0 * proj[i] * B_r;                       // Zeeman
+            if (ghost) dE_emb += 2.0 * proj[i] * B_r;
+            dE_true += onsite_energy(i, Si_new) - onsite_energy(i, Si);
+
+            const size_t bi_end = bi_flat_offset[i + 1];
+            for (size_t k = bi_flat_offset[i]; k < bi_end; ++k) {
+                const size_t j = bi_flat_partner[k];
+                const bool twisted = twist_active && bi_flat_needs_twist[k];
+                const double* J = &bi_flat_J[k * bi_flat_D2];
+                const double* Sj = spins[j].data();
+                if (twisted) twist_partner_spin_flat(Sj, bi_flat_wrap[k], Pj);
+                else std::memcpy(Pj, Sj, D * sizeof(double));
+                if (!in_cluster[j]) {
+                    // Boundary bond: (S_i' - S_i)^T J P_j = -2 s_i r^T J P_j.
+                    double rJP = 0.0, sj_t = 0.0;
+                    for (size_t a = 0; a < D; ++a) {
+                        double row = 0.0;
+                        for (size_t b = 0; b < D; ++b) row += J[a * D + b] * Pj[b];
+                        rJP += r[a] * row;
+                        sj_t += r[a] * Pj[a];
+                    }
+                    dE_true += -2.0 * proj[i] * rJP;
+                    dE_emb += -2.0 * embedded_coupling(k, r) * proj[i] * sj_t;
+                } else {
+                    // Internal bond, visited from both ends: half each time.
+                    reflected(j, tmp);
+                    if (twisted) twist_partner_spin_flat(tmp, bi_flat_wrap[k], Pj_new);
+                    else std::memcpy(Pj_new, tmp, D * sizeof(double));
+                    double e_new = 0.0, e_old = 0.0;
+                    for (size_t a = 0; a < D; ++a) {
+                        double rn = 0.0, ro = 0.0;
+                        for (size_t b = 0; b < D; ++b) {
+                            rn += J[a * D + b] * Pj_new[b];
+                            ro += J[a * D + b] * Pj[b];
+                        }
+                        e_new += Si_new[a] * rn;
+                        e_old += Si[a] * ro;
+                    }
+                    dE_true += 0.5 * (e_new - e_old);
+                }
+            }
+
+            const size_t n_tri = trilinear_partners[i].size();
+            for (size_t n = 0; n < n_tri; ++n) {
+                const size_t p1 = trilinear_partners[i][n][0];
+                const size_t p2 = trilinear_partners[i][n][1];
+                const double m = 1.0 + (in_cluster[p1] ? 1.0 : 0.0) + (in_cluster[p2] ? 1.0 : 0.0);
+                double S1n[MAX_SPIN_DIM], S2n[MAX_SPIN_DIM];
+                const double* S1 = spins[p1].data();
+                const double* S2 = spins[p2].data();
+                if (in_cluster[p1]) reflected(p1, S1n); else std::memcpy(S1n, S1, D * sizeof(double));
+                if (in_cluster[p2]) reflected(p2, S2n); else std::memcpy(S2n, S2, D * sizeof(double));
+                const auto& T = trilinear_interaction[i][n];
+                double e_new = 0.0, e_old = 0.0;
+                for (size_t a = 0; a < D; ++a)
+                    for (size_t b = 0; b < D; ++b)
+                        for (size_t c = 0; c < D; ++c) {
+                            e_new += T[a](b, c) * Si_new[a] * S1n[b] * S2n[c];
+                            e_old += T[a](b, c) * Si[a] * S1[b] * S2[c];
+                        }
+                dE_true += (e_new - e_old) / m;
+            }
+        }
+        return dE_true - dE_emb;
+    }
+
+    /**
+     * Wolff single-cluster update. Returns the number of spins flipped
+     * (0 if the cluster touched the ghost spin or was rejected by the
+     * residual filter).
      *
-     * Performance refactor (post-audit):
-     *  - Uses **persistent member buffers** (cluster_proj_buf,
-     *    cluster_in_cluster, cluster_stack_buf) instead of allocating
-     *    vector<double>(N) / vector<uint8_t>(N) on every call. For a
-     *    27 648-site pyrochlore at ~10⁵ Wolff updates this saves several GB
-     *    of cumulative malloc traffic and the corresponding TLB/page-fault
-     *    overhead.
-     *  - Inlined J·r·r as a 3×3×3 unrolled dot for spin_dim==3 to dodge
-     *    Eigen's dynamic matrix-vector dispatch on every neighbour visit.
-     *  - Spin reflection is in-place via raw double pointers.
+     * @param use_ghost_field  embed the Zeeman term as a coupling to a fixed
+     *        ghost spin (clusters bonded to it are not flipped); otherwise
+     *        the field enters the residual filter.
      */
     size_t wolff_update(double T, bool use_ghost_field = false) {
         if (T <= 0) return 0;
-
         const double beta = 1.0 / T;
 
         const size_t seed = random_int_lehman(lattice_size);
         SpinVector r = random_unit_vector();
         const double* r_data = r.data();
 
-        // Reuse persistent buffers (allocate-on-grow semantics).
         if (cluster_proj_buf.size()   < lattice_size) cluster_proj_buf.resize(lattice_size);
         if (cluster_in_cluster.size() < lattice_size) cluster_in_cluster.assign(lattice_size, 0);
         else std::fill(cluster_in_cluster.begin(), cluster_in_cluster.begin() + lattice_size, 0);
         cluster_stack_buf.clear();
-        if (cluster_stack_buf.capacity() < lattice_size / 8 + 16)
-            cluster_stack_buf.reserve(lattice_size / 8 + 16);
+        cluster_members_buf.clear();
 
-        // Precompute projections S_i · r (sequential for cache locality).
         for (size_t i = 0; i < lattice_size; ++i) {
             const double* S = spins[i].data();
             double acc = 0.0;
@@ -3058,123 +2951,68 @@ public:
         bool attached_to_ghost = false;
         cluster_in_cluster[seed] = 1;
         cluster_stack_buf.push_back(seed);
+        cluster_members_buf.push_back(seed);
 
         while (!cluster_stack_buf.empty()) {
             const size_t i = cluster_stack_buf.back();
             cluster_stack_buf.pop_back();
+            const double s_i = cluster_proj_buf[i];
 
-            const size_t n_bi = bilinear_partners[i].size();
-            for (size_t n = 0; n < n_bi; ++n) {
-                const size_t j = bilinear_partners[i][n];
+            const size_t bi_end = bi_flat_offset[i + 1];
+            for (size_t k = bi_flat_offset[i]; k < bi_end; ++k) {
+                const size_t j = bi_flat_partner[k];
                 if (cluster_in_cluster[j]) continue;
-
-                // r · J · r  (scalar coupling along the reflection plane normal)
-                const auto& J = bilinear_interaction[i][n];
-                double K_r = 0.0;
-                for (size_t a = 0; a < spin_dim; ++a) {
-                    double row = 0.0;
-                    for (size_t b = 0; b < spin_dim; ++b) row += J(a, b) * r_data[b];
-                    K_r += r_data[a] * row;
-                }
-                if (K_r <= 0.0) continue;
-
-                // Partner projection along r, including twist BC.
-                double proj_j;
-                const auto& wrap = bilinear_wrap_dir[i][n];
-                if (spin_dim == 3 && (wrap[0] != 0 || wrap[1] != 0 || wrap[2] != 0)) {
-                    double tw[3] = { spins[j].data()[0], spins[j].data()[1], spins[j].data()[2] };
-                    for (size_t dim = 0; dim < 3; ++dim) {
-                        if (wrap[dim] == 0) continue;
-                        double tmp[3] = {0,0,0};
-                        if (wrap[dim] > 0) {
-                            for (size_t d = 0; d < 3; ++d)
-                                tmp[d] = twist_matrices[dim](d,0)*tw[0]
-                                       + twist_matrices[dim](d,1)*tw[1]
-                                       + twist_matrices[dim](d,2)*tw[2];
-                        } else {
-                            for (size_t d = 0; d < 3; ++d)
-                                tmp[d] = twist_matrices[dim](0,d)*tw[0]
-                                       + twist_matrices[dim](1,d)*tw[1]
-                                       + twist_matrices[dim](2,d)*tw[2];
-                        }
-                        tw[0]=tmp[0]; tw[1]=tmp[1]; tw[2]=tmp[2];
-                    }
-                    proj_j = tw[0]*r_data[0] + tw[1]*r_data[1] + tw[2]*r_data[2];
-                } else {
-                    proj_j = cluster_proj_buf[j];
-                }
-
-                const double prod = cluster_proj_buf[i] * proj_j;
-                if (prod <= 0.0) continue;
-                const double P_add = 1.0 - std::exp(-2.0 * beta * K_r * prod);
-                if (random_double_lehman(0.0, 1.0) < P_add) {
+                const double x = embedded_coupling(k, r_data) * s_i * cluster_proj_buf[j];
+                if (x >= 0.0) continue;  // unsatisfied (or non-embedded) bond
+                if (random_double_lehman(0.0, 1.0) < 1.0 - std::exp(2.0 * beta * x)) {
                     cluster_in_cluster[j] = 1;
                     cluster_stack_buf.push_back(j);
+                    cluster_members_buf.push_back(j);
                 }
             }
 
-            if (use_ghost_field) {
-                // Use field·field via raw pointer to skip Eigen .norm() temp.
+            if (use_ghost_field && !attached_to_ghost) {
                 const double* B = field[i].data();
-                double Bnorm_sq = 0.0;
-                for (size_t d = 0; d < spin_dim; ++d) Bnorm_sq += B[d] * B[d];
-                if (Bnorm_sq > 1e-20) {
-                    double K_field = 0.0;
-                    for (size_t d = 0; d < spin_dim; ++d) K_field += r_data[d] * B[d];
-                    const double prod = K_field * cluster_proj_buf[i];
-                    if (prod > 0.0) {
-                        const double P_ghost = 1.0 - std::exp(-beta * std::abs(prod));
-                        if (random_double_lehman(0.0, 1.0) < P_ghost) {
-                            attached_to_ghost = true;
-                        }
-                    }
-                }
+                double B_r = 0.0;
+                for (size_t d = 0; d < spin_dim; ++d) B_r += B[d] * r_data[d];
+                const double x_g = -B_r * s_i;   // Zeeman energy of the embedded spin
+                if (x_g < 0.0 && random_double_lehman(0.0, 1.0) < 1.0 - std::exp(2.0 * beta * x_g))
+                    attached_to_ghost = true;
             }
         }
+        if (attached_to_ghost) return 0;
 
-        size_t cluster_size = 0;
-        if (!attached_to_ghost) {
-            for (size_t i = 0; i < lattice_size; ++i) {
-                if (cluster_in_cluster[i]) {
-                    double* S = spins[i].data();
-                    const double two_proj = 2.0 * cluster_proj_buf[i];
-                    for (size_t d = 0; d < spin_dim; ++d) S[d] -= two_proj * r_data[d];
-                    ++cluster_size;
-                }
-            }
+        const bool exact = cluster_embedding_is_exact() && (use_ghost_field || !has_nonzero_field());
+        if (!exact) {
+            const double dE_res = cluster_residual_energy(cluster_members_buf, cluster_in_cluster.data(),
+                                                          r_data, cluster_proj_buf.data(), use_ghost_field);
+            if (dE_res > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE_res)) return 0;
         }
 
-        return cluster_size;
+        for (size_t i : cluster_members_buf) {
+            double* S = spins[i].data();
+            const double two_proj = 2.0 * cluster_proj_buf[i];
+            for (size_t d = 0; d < spin_dim; ++d) S[d] -= two_proj * r_data[d];
+        }
+        return cluster_members_buf.size();
     }
 
     /**
      * Generate random unit vector
      */
     SpinVector random_unit_vector() const {
-        SpinVector v = const_cast<Lattice*>(this)->gen_random_spin(1.0);
-        double norm = v.norm();
-        if (norm < 1e-10) {
-            v = SpinVector::Zero(spin_dim);
-            v(0) = 1.0;
-            return v;
-        }
-        return v / norm;
+        SpinVector v(spin_dim);
+        gen_random_spin_into(v.data(), 1.0f);
+        return v;
     }
 
     /**
-     * Swendsen-Wang sweep - build and flip all clusters.
-     * Returns number of clusters flipped.
-     *
-     * Performance refactor (post-audit):
-     *  - Persistent Union-Find buffers (uf_parent, uf_size, uf_forbid_flip,
-     *    uf_flip_root) reused across calls — was four `vector<...>(N)` per
-     *    sweep.
-     *  - **Iterative** path-compression `find()` (was a recursive
-     *    `std::function<int(int)>` lambda → up to N stack frames + virtual
-     *    indirection per call; clang/gcc can't inline through std::function).
-     *    Two-pass iterative compression is the textbook implementation.
-     *  - Inlined r·J·r and r·field via raw pointers.
-     *  - In-place spin reflection (no Eigen temporaries).
+     * Swendsen-Wang sweep: build all FK clusters of the embedded Ising model
+     * and propose flipping each with probability 1/2 (clusters bonded to the
+     * ghost spin are frozen). For non-embeddable Hamiltonians each proposed
+     * flip is filtered sequentially with min(1, exp(-β ΔE_res)), which is
+     * exact because a cluster flip leaves the FK bond weights invariant.
+     * Returns the number of clusters flipped.
      */
     size_t swendsen_wang_sweep(double T, bool use_ghost_field = false) {
         if (T <= 0) return 0;
@@ -3183,7 +3021,6 @@ public:
         SpinVector r = random_unit_vector();
         const double* r_data = r.data();
 
-        // Persistent buffers
         if (cluster_proj_buf.size() < lattice_size) cluster_proj_buf.resize(lattice_size);
         if (uf_parent.size()        < lattice_size) uf_parent.resize(lattice_size);
         if (uf_size.size()          < lattice_size) uf_size.resize(lattice_size);
@@ -3195,7 +3032,6 @@ public:
         std::iota(uf_parent.begin(), uf_parent.begin() + lattice_size, 0);
         std::fill(uf_size.begin(), uf_size.begin() + lattice_size, 1);
 
-        // Precompute projections
         for (size_t i = 0; i < lattice_size; ++i) {
             const double* S = spins[i].data();
             double acc = 0.0;
@@ -3203,11 +3039,9 @@ public:
             cluster_proj_buf[i] = acc;
         }
 
-        // Iterative path-compression find (two-pass).
         auto find_root = [&](int x) noexcept -> int {
             int root = x;
             while (uf_parent[root] != root) root = uf_parent[root];
-            // Path compression
             while (uf_parent[x] != root) {
                 int next = uf_parent[x];
                 uf_parent[x] = root;
@@ -3215,93 +3049,84 @@ public:
             }
             return root;
         };
-
         auto unite = [&](int a, int b) noexcept {
             a = find_root(a);
             b = find_root(b);
             if (a == b) return;
             if (uf_size[a] < uf_size[b]) std::swap(a, b);
             uf_parent[b] = a;
-            uf_size[a]  += uf_size[b];
+            uf_size[a] += uf_size[b];
         };
 
-        // Build clusters via bond percolation.
+        // Bond percolation: each bond once (j > i), satisfied bonds only.
         for (size_t i = 0; i < lattice_size; ++i) {
-            const size_t n_bi = bilinear_partners[i].size();
-            for (size_t n = 0; n < n_bi; ++n) {
-                const size_t j = bilinear_partners[i][n];
-                if (j <= i) continue;  // each bond once
-
-                const auto& J = bilinear_interaction[i][n];
-                double K_r = 0.0;
-                for (size_t a = 0; a < spin_dim; ++a) {
-                    double row = 0.0;
-                    for (size_t b = 0; b < spin_dim; ++b) row += J(a, b) * r_data[b];
-                    K_r += r_data[a] * row;
-                }
-                if (K_r <= 0.0) continue;
-
-                double proj_j;
-                const auto& wrap = bilinear_wrap_dir[i][n];
-                if (spin_dim == 3 && (wrap[0] != 0 || wrap[1] != 0 || wrap[2] != 0)) {
-                    double tw[3] = { spins[j].data()[0], spins[j].data()[1], spins[j].data()[2] };
-                    for (size_t dim = 0; dim < 3; ++dim) {
-                        if (wrap[dim] == 0) continue;
-                        double tmp[3] = {0,0,0};
-                        if (wrap[dim] > 0) {
-                            for (size_t d = 0; d < 3; ++d)
-                                tmp[d] = twist_matrices[dim](d,0)*tw[0]
-                                       + twist_matrices[dim](d,1)*tw[1]
-                                       + twist_matrices[dim](d,2)*tw[2];
-                        } else {
-                            for (size_t d = 0; d < 3; ++d)
-                                tmp[d] = twist_matrices[dim](0,d)*tw[0]
-                                       + twist_matrices[dim](1,d)*tw[1]
-                                       + twist_matrices[dim](2,d)*tw[2];
-                        }
-                        tw[0]=tmp[0]; tw[1]=tmp[1]; tw[2]=tmp[2];
-                    }
-                    proj_j = tw[0]*r_data[0] + tw[1]*r_data[1] + tw[2]*r_data[2];
-                } else {
-                    proj_j = cluster_proj_buf[j];
-                }
-
-                const double prod = cluster_proj_buf[i] * proj_j;
-                if (prod <= 0.0) continue;
-                const double P_bond = 1.0 - std::exp(-2.0 * beta * K_r * prod);
-                if (random_double_lehman(0.0, 1.0) < P_bond) {
+            const size_t bi_end = bi_flat_offset[i + 1];
+            for (size_t k = bi_flat_offset[i]; k < bi_end; ++k) {
+                const size_t j = bi_flat_partner[k];
+                if (j <= i) continue;
+                const double x = embedded_coupling(k, r_data) * cluster_proj_buf[i] * cluster_proj_buf[j];
+                if (x >= 0.0) continue;
+                if (random_double_lehman(0.0, 1.0) < 1.0 - std::exp(2.0 * beta * x))
                     unite(static_cast<int>(i), static_cast<int>(j));
-                }
             }
         }
 
-        // Ghost bonds (prevent flipping clusters with strong field overlap).
         if (use_ghost_field) {
             for (size_t i = 0; i < lattice_size; ++i) {
                 const double* B = field[i].data();
-                double Bnorm_sq = 0.0;
-                for (size_t d = 0; d < spin_dim; ++d) Bnorm_sq += B[d] * B[d];
-                if (Bnorm_sq <= 1e-20) continue;
-                double K_field = 0.0;
-                for (size_t d = 0; d < spin_dim; ++d) K_field += r_data[d] * B[d];
-                const double prod = K_field * cluster_proj_buf[i];
-                if (prod <= 0.0) continue;
-                const double P_ghost = 1.0 - std::exp(-beta * std::abs(prod));
-                if (random_double_lehman(0.0, 1.0) < P_ghost) {
+                double B_r = 0.0;
+                for (size_t d = 0; d < spin_dim; ++d) B_r += B[d] * r_data[d];
+                const double x_g = -B_r * cluster_proj_buf[i];
+                if (x_g < 0.0 && random_double_lehman(0.0, 1.0) < 1.0 - std::exp(2.0 * beta * x_g))
                     uf_forbid_flip[find_root(static_cast<int>(i))] = 1;
-                }
             }
         }
 
-        // Decide per-root flip with probability 1/2.
         for (size_t i = 0; i < lattice_size; ++i) {
             const int root = find_root(static_cast<int>(i));
-            if (static_cast<int>(i) == root && !uf_forbid_flip[root]) {
+            if (static_cast<int>(i) == root && !uf_forbid_flip[root])
                 uf_flip_root[root] = (random_double_lehman(0.0, 1.0) < 0.5) ? 1 : 0;
-            }
         }
 
-        // Apply flips and count flipped roots.
+        const bool exact = cluster_embedding_is_exact() && (use_ghost_field || !has_nonzero_field());
+        if (!exact) {
+            // Group members by root (counting sort), then filter each
+            // proposed flip against the current configuration.
+            if (cluster_in_cluster.size() < lattice_size) cluster_in_cluster.assign(lattice_size, 0);
+            else std::fill(cluster_in_cluster.begin(), cluster_in_cluster.begin() + lattice_size, 0);
+            vector<size_t> offset(lattice_size + 1, 0), order(lattice_size);
+            for (size_t i = 0; i < lattice_size; ++i) ++offset[find_root(static_cast<int>(i)) + 1];
+            for (size_t i = 0; i < lattice_size; ++i) offset[i + 1] += offset[i];
+            vector<size_t> cursor(offset.begin(), offset.end() - 1);
+            for (size_t i = 0; i < lattice_size; ++i) order[cursor[find_root(static_cast<int>(i))]++] = i;
+
+            size_t flipped = 0;
+            for (size_t root = 0; root < lattice_size; ++root) {
+                if (!uf_flip_root[root]) continue;
+                cluster_members_buf.assign(order.begin() + offset[root], order.begin() + offset[root + 1]);
+                for (size_t i : cluster_members_buf) cluster_in_cluster[i] = 1;
+                // Projections of the current (partially updated) configuration.
+                for (size_t i : cluster_members_buf) {
+                    const double* S = spins[i].data();
+                    double acc = 0.0;
+                    for (size_t d = 0; d < spin_dim; ++d) acc += S[d] * r_data[d];
+                    cluster_proj_buf[i] = acc;
+                }
+                const double dE_res = cluster_residual_energy(cluster_members_buf, cluster_in_cluster.data(),
+                                                              r_data, cluster_proj_buf.data(), use_ghost_field);
+                const bool accept = dE_res <= 0.0 || random_double_lehman(0.0, 1.0) < std::exp(-beta * dE_res);
+                for (size_t i : cluster_members_buf) {
+                    cluster_in_cluster[i] = 0;
+                    if (!accept) continue;
+                    double* S = spins[i].data();
+                    const double two_proj = 2.0 * cluster_proj_buf[i];
+                    for (size_t d = 0; d < spin_dim; ++d) S[d] -= two_proj * r_data[d];
+                }
+                if (accept) ++flipped;
+            }
+            return flipped;
+        }
+
         size_t flipped_clusters = 0;
         for (size_t i = 0; i < lattice_size; ++i) {
             const int root = find_root(static_cast<int>(i));
@@ -3312,7 +3137,6 @@ public:
                 if (static_cast<int>(i) == root) ++flipped_clusters;
             }
         }
-
         return flipped_clusters;
     }
 
@@ -3328,39 +3152,59 @@ public:
     }
 
     /**
-     * Deterministic sweep: align each spin antiparallel to its local field
-     * This is a zero-temperature relaxation step that randomly selects sites
+     * Zero-temperature block-coordinate descent: visit every site in order
+     * and replace S_i by the exact minimiser of E with all other spins held
+     * fixed. For a linear local energy that is S_i = -s g/|g|; with an
+     * anisotropic on-site term S^T A S it is the trust-region solution of
+     * `minimize_quadratic_on_sphere`. Each step can only lower the energy,
+     * so repeated sweeps converge monotonically to a local minimum.
+     *
+     * (The previous version set S_i = -s H/|H| with H including 2 A S_i,
+     * a fixed-point iteration that can climb in energy — it drove an
+     * easy-plane model from E/N = -0.62 to +0.73 — and drew sites with
+     * replacement, looping forever if every local field vanished.)
+     *
+     * Returns the largest change |ΔS_i| of the last sweep.
      */
-    void deterministic_sweep(size_t num_sweeps) {
+    double deterministic_sweep(size_t num_sweeps = 1) {
+        const double s = double(spin_length);
+        double max_change = 0.0;
+        double g[MAX_SPIN_DIM], S_new[MAX_SPIN_DIM];
         for (size_t sweep = 0; sweep < num_sweeps; ++sweep) {
-            size_t count = 0;
-            while (count < lattice_size) {
-                size_t i = random_int_lehman(lattice_size);
-                SpinVector local_field = get_local_field(i);
-                double norm = local_field.norm();
-                
-                if (norm < 1e-15) {
-                    continue;
+            max_change = 0.0;
+            for (size_t i = 0; i < lattice_size; ++i) {
+                linear_field(i, spins_view(), g);
+                double* S = spins[i].data();
+                if (onsite_is_scalar(i)) {
+                    double norm = 0.0;
+                    for (size_t d = 0; d < spin_dim; ++d) norm += g[d] * g[d];
+                    norm = std::sqrt(norm);
+                    if (norm < 1e-300) continue;  // no torque: leave the spin
+                    for (size_t d = 0; d < spin_dim; ++d) S_new[d] = -s * g[d] / norm;
                 } else {
-                    spins[i] = -local_field / norm * spin_length;
+                    minimize_quadratic_on_sphere(onsite_interaction[i], g, s, S, S_new, spin_dim);
                 }
-                count++;
+                double change = 0.0;
+                for (size_t d = 0; d < spin_dim; ++d) change += (S_new[d] - S[d]) * (S_new[d] - S[d]);
+                max_change = std::max(max_change, std::sqrt(change));
+                std::memcpy(S, S_new, spin_dim * sizeof(double));
             }
         }
+        return max_change;
     }
 
     /**
-     * Zero-temperature greedy quench with convergence check
+     * Zero-temperature quench to a local minimum: repeat descent sweeps
+     * until the energy change per sweep falls below rel_tol·|E| and no spin
+     * moves by more than sqrt(rel_tol)·s.
      */
     void greedy_quench(double rel_tol = 1e-12, size_t max_sweeps = 10000) {
-        double E_prev = total_energy(spins);
-        
+        double E_prev = total_energy();
         for (size_t sweep = 0; sweep < max_sweeps; ++sweep) {
-            deterministic_sweep(1);
-            
-            // Check convergence
-            double E_curr = total_energy(spins);
-            if (std::abs(E_curr - E_prev) <= rel_tol * (std::abs(E_prev) + 1e-18)) {
+            const double max_change = deterministic_sweep(1);
+            const double E_curr = total_energy();
+            if (std::abs(E_curr - E_prev) <= rel_tol * (std::abs(E_prev) + 1e-18) &&
+                max_change <= std::sqrt(rel_tol) * double(spin_length)) {
                 break;
             }
             E_prev = E_curr;

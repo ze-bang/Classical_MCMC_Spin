@@ -473,7 +473,7 @@
         
         for (size_t i = 0; i < n_samples; ++i) {
             if (overrelaxation_rate > 0) {
-                overrelaxation();
+                overrelaxation(T);
                 if (i % overrelaxation_rate == 0) {
                     metropolis(T, gaussian_move, sigma);
                 }

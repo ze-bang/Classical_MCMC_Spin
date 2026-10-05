@@ -128,7 +128,7 @@
         cout << "Rank " << rank << ": Equilibrating..." << endl;
         for (size_t i = 0; i < n_anneal; ++i) {
             if (overrelaxation_rate > 0) {
-                overrelaxation();
+                overrelaxation(curr_Temp);
                 if (i % overrelaxation_rate == 0) {
                     curr_accept += metropolis(curr_Temp, gaussian_move, sigma);
                 }
@@ -151,7 +151,7 @@
             pilot_energies.reserve(pilot_samples / pilot_interval + 1);
             for (size_t i = 0; i < pilot_samples; ++i) {
                 if (overrelaxation_rate > 0) {
-                    overrelaxation();
+                    overrelaxation(curr_Temp);
                     if (i % overrelaxation_rate == 0) {
                         metropolis(curr_Temp, gaussian_move, sigma);
                     }
@@ -192,7 +192,7 @@
         cout << "Rank " << rank << ": Measuring..." << endl;
         for (size_t i = 0; i < n_measure; ++i) {
             if (overrelaxation_rate > 0) {
-                overrelaxation();
+                overrelaxation(curr_Temp);
                 if (i % overrelaxation_rate == 0) {
                     curr_accept += metropolis(curr_Temp, gaussian_move, sigma);
                 }
@@ -658,7 +658,7 @@
                 for (size_t i = 0; i < warmup_sweeps; ++i) {
                     L.metropolis(T_k, gaussian_move, local_sigma);
                     if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                        L.overrelaxation();
+                        L.overrelaxation(T_k);
                     }
                 }
             });
@@ -706,7 +706,7 @@
                     run_on_replica(k, [&](Lattice& L) {
                         L.metropolis(T_k, gaussian_move, local_sigma);
                         if (overrelaxation_rate > 0 && sweep % overrelaxation_rate == 0) {
-                            L.overrelaxation();
+                            L.overrelaxation(T_k);
                         }
                     });
                 }
@@ -826,7 +826,7 @@
                 for (size_t i = 0; i < tau_samples; ++i) {
                     L.metropolis(T_k, gaussian_move, local_sigma);
                     if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                        L.overrelaxation();
+                        L.overrelaxation(T_k);
                     }
                     energy_series.push_back(L.total_energy(L.spins));
                 }
@@ -994,7 +994,7 @@
         for (size_t i = 0; i < warmup_sweeps; ++i) {
             metropolis(my_T, gaussian_move, sigma);
             if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                overrelaxation();
+                overrelaxation(my_T);
             }
         }
         MPI_Barrier(comm);
@@ -1021,7 +1021,7 @@
                 // Local MC update
                 metropolis(my_T, gaussian_move, sigma);
                 if (overrelaxation_rate > 0 && sweep % overrelaxation_rate == 0) {
-                    overrelaxation();
+                    overrelaxation(my_T);
                 }
                 
                 // Attempt replica exchanges using checkerboard pattern
@@ -1240,7 +1240,7 @@
         for (size_t i = 0; i < tau_samples; ++i) {
             metropolis(my_T, gaussian_move, sigma);
             if (overrelaxation_rate > 0 && i % overrelaxation_rate == 0) {
-                overrelaxation();
+                overrelaxation(my_T);
             }
             energy_series.push_back(total_energy(spins));
         }
