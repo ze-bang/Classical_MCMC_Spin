@@ -303,6 +303,7 @@ set(CLASSICAL_SPIN_HEADERS
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/lattice.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/mixed_lattice.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/phonon_lattice.h
+    ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/phonon_config.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/lattice/kitaev_bonds.h
     ${CLASSICAL_SPIN_INCLUDE_DIR}/classical_spin/io/hdf5_io.h
 )
@@ -322,6 +323,7 @@ set(CORE_SOURCES
     src/core/unitcell_builders.cpp
     src/core/spin_config.cpp
     src/core/phonon_lattice.cpp
+    src/core/phonon_config.cpp
     src/core/gneb.cpp
     # Per-concern TUs split out of the `lattice.h` / `mixed_lattice.h`
     # god-object headers. Each one hosts a topical slice of the class so
@@ -505,27 +507,27 @@ add_optimized_executable(test_e1_phonon_regressions src/apps/test_e1_phonon_regr
 
 # 3Q / zigzag operating point and static magnetoelastic bias: T=0 quench from a
 # seed at frozen E1 amplitude, over a J7 grid.
-add_optimized_executable(ncto_operating_point src/apps/ncto_operating_point.cpp src/apps/runners_phonon.cpp)
+add_optimized_executable(ncto_operating_point src/apps/ncto_operating_point.cpp)
 
 # THz pulse scan: does one pulse convert 3Q into zigzag, as a function of J7,
 # field amplitude and polarization?  Reports the M-point order parameters vs time.
-add_optimized_executable(ncto_pulse_scan src/apps/ncto_pulse_scan.cpp src/apps/runners_phonon.cpp)
+add_optimized_executable(ncto_pulse_scan src/apps/ncto_pulse_scan.cpp)
 
 # Same pulse at FINITE temperature (Langevin). Barrier crossing is impossible in the
 # T=0 deterministic dynamics, so nucleation can only be tested here.
-add_optimized_executable(ncto_pulse_thermal src/apps/ncto_pulse_thermal.cpp src/apps/runners_phonon.cpp)
+add_optimized_executable(ncto_pulse_thermal src/apps/ncto_pulse_thermal.cpp)
 
 # Same, but with the Bose-coloured thermostat, an uninterrupted noise stream, and the
 # linear (E-channel) tilt emitted directly as spin_phonon_energy()/N.  Supersedes
 # ncto_pulse_thermal; see the header comment there for why all three matter.
-add_optimized_executable(ncto_pulse_thermal2 src/apps/ncto_pulse_thermal2.cpp src/apps/runners_phonon.cpp)
+add_optimized_executable(ncto_pulse_thermal2 src/apps/ncto_pulse_thermal2.cpp)
 
 # Exact PhononLattice energy evaluator for offline reaction-coordinate diagnostics.
-add_optimized_executable(evaluate_phonon_energy_path src/apps/evaluate_phonon_energy_path.cpp src/apps/runners_phonon.cpp)
+add_optimized_executable(evaluate_phonon_energy_path src/apps/evaluate_phonon_energy_path.cpp)
 
 # GNEB force/energy evaluator: per-site effective field + energy + strain force
 # for a batch of band images (real geodesic nudged elastic band, driven from Python).
-add_optimized_executable(gneb_field_eval src/apps/gneb_field_eval.cpp src/apps/runners_phonon.cpp)
+add_optimized_executable(gneb_field_eval src/apps/gneb_field_eval.cpp)
 
 # Regression tests for mixed SU2-SU3 trilinear bookkeeping
 add_optimized_executable(test_mixed_trilinear_regressions src/apps/test_mixed_trilinear_regressions.cpp)
@@ -577,6 +579,10 @@ add_optimized_executable(bench_mc src/apps/bench_mc.cpp)
 # bench_mc but for the time-evolution side of the library.
 add_optimized_executable(bench_md src/apps/bench_md.cpp)
 
+# PhononLattice (NCTO spin-phonon) hot-path micro-benchmark: coupled RHS,
+# Metropolis / overrelaxation sweeps, local field, total energy.
+add_optimized_executable(bench_phonon src/apps/bench_phonon.cpp)
+
 # Integrator-level micro-benchmark for Ingredient XVIII (pump-probe
 # default tolerance relaxation + rk54 dispatch fix). Times
 # single_pulse_drive() on a small TmFeO3 mixed lattice across method
@@ -590,6 +596,9 @@ add_optimized_executable(bench_integrators src/apps/bench_integrators.cpp)
 # methods (euler/rk2/rk4/ssprk53/dopri5). No-op when built without CUDA.
 add_optimized_executable(test_mixed_gpu_cpu_equivalence src/apps/test_mixed_gpu_cpu_equivalence.cpp)
 
+# MPI driver test of the spin-phonon model (registered below, run with 2 and 3 ranks)
+add_optimized_executable(test_phonon_mpi tests/test_phonon_mpi.cpp)
+
 # Physics validation suite (tests/): every kernel is checked against a result
 # known independently of the code -- closed-form statistical mechanics, exact
 # Boltzmann quadrature for tiny clusters, analytic precession / magnon
@@ -600,6 +609,7 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_mc_exact
     test_md_exact
     test_sa_ground_state
+    test_phonon_dynamics
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
@@ -621,6 +631,26 @@ if(BUILD_TESTING)
     set_tests_properties(pulse_chunking_alignment PROPERTIES TIMEOUT 30)
     add_test(NAME mixed_gpu_cpu_equivalence COMMAND test_mixed_gpu_cpu_equivalence)
     set_tests_properties(mixed_gpu_cpu_equivalence PROPERTIES TIMEOUT 300)
+    # PhononLattice MPI drivers: tau-parallel 2DCS file == serial file, replica exchange
+    # carries the lattice sector; and the spin_solver NCTO 2DCS runner terminates under MPI
+    # (it deadlocked: a COMM_WORLD collective was called from rank 0 only).
+    if(MPIEXEC_EXECUTABLE)
+        foreach(np 2 3)
+            add_test(NAME mpi_phonon_drivers_np${np}
+                     COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${np} --oversubscribe
+                             --allow-run-as-root $<TARGET_FILE:test_phonon_mpi>)
+            set_tests_properties(mpi_phonon_drivers_np${np} PROPERTIES TIMEOUT 180 LABELS mpi
+                                 ENVIRONMENT "OMP_NUM_THREADS=1"
+                                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        endforeach()
+        add_test(NAME mpi_ncto_2dcs
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 --oversubscribe --allow-run-as-root
+                         $<TARGET_FILE:spin_solver> ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/ncto_2dcs_mpi.param)
+        set_tests_properties(mpi_ncto_2dcs PROPERTIES TIMEOUT 180 LABELS mpi
+                             PASS_REGULAR_EXPRESSION "PhononLattice 2DCS completed"
+                             ENVIRONMENT "OMP_NUM_THREADS=1"
+                             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    endif()
     add_test(NAME hdf5_pt_writer_smoke COMMAND test_hdf5_pt)
     set_tests_properties(hdf5_pt_writer_smoke PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}

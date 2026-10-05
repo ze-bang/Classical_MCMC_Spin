@@ -1,0 +1,35 @@
+# Tiny NCTO 2DCS run for the MPI CTest (tests/CMake: mpi_ncto_2dcs). With one trial and
+# several ranks the delay points are distributed over the ranks (collective driver); the
+# run must terminate (no deadlock) and write the full spectroscopy file.
+system = ncto
+simulation_mode = 2dcs
+lattice_size = 3,3,1
+seed = 12345
+num_trials = 1
+output_dir = mpi_ncto_2dcs_out
+
+# short anneal of the spins, lattice relaxed jointly
+T_start = 2.0
+T_end = 0.05
+cooling_rate = 0.7
+annealing_steps = 20
+T_zero = true
+n_deterministics = 50
+relax_phonons = true
+
+# NCTO couplings: defaults + a linear E1 channel so the pulse reaches the spins
+lambda_E1_K_1 = 2.0
+
+# THz pulse and delay scan
+pump_amplitude = 2.0
+pump_width = 0.3
+tau_start = 0.0
+tau_end = 3.0
+tau_step = 1.0
+parallel_tau = true
+reuse_m0_for_m1 = false
+
+md_time_start = 0.0
+md_time_end = 3.0
+md_timestep = 0.05
+md_integrator = rk4

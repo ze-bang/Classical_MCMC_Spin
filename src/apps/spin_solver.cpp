@@ -18,6 +18,7 @@
 #include "classical_spin/lattice/lattice.h"
 #include "classical_spin/lattice/mixed_lattice.h"
 #include "classical_spin/lattice/phonon_lattice.h"
+#include "classical_spin/lattice/phonon_config.h"
 
 #include <mpi.h>
 #include <iostream>
@@ -111,85 +112,10 @@ int main(int argc, char** argv) {
                 cout << "\nBuilding PhononLattice spin-phonon lattice..." << endl;
             }
             
-            UnitCell phonon_uc = build_phonon_honeycomb(config);
-            PhononLattice phonon_lattice(phonon_uc,
-                                         config.lattice_size[0],
-                                         config.lattice_size[1],
-                                         config.lattice_size[2],
-                                         config.spin_length);
-            
-            // Build parameters from config
-            SpinPhononCouplingParams sp_params;
-            PhononParams ph_params;
-            DriveParams dr_params;
-            TimeDependentSpinPhononParams td_sp_params;
-            build_phonon_params(config, sp_params, ph_params, dr_params, td_sp_params);
-            
-            // Set parameters (this builds the interaction matrices)
-            phonon_lattice.set_parameters(sp_params, ph_params, dr_params);
-            build_lattice_modes(config, phonon_lattice);
-            if (!config.nn_exchange_disorder_config.empty()) {
-                phonon_lattice.apply_nn_exchange_disorder_from_file(
-                    config.nn_exchange_disorder_config);
-            }
-            if (!config.nn_exchange_channel_disorder_config.empty()) {
-                phonon_lattice.apply_nn_exchange_channel_disorder_from_file(
-                    config.nn_exchange_channel_disorder_config);
-            }
-            if (!config.plaquette_j7_disorder_config.empty()) {
-                phonon_lattice.apply_plaquette_j7_disorder_from_file(
-                    config.plaquette_j7_disorder_config);
-            }
-            
-            // Set time-dependent spin-phonon coupling parameters
-            phonon_lattice.set_time_dependent_spin_phonon(td_sp_params);
-            
-            // Set Gilbert damping if specified
-            phonon_lattice.alpha_gilbert = config.get_param("alpha_gilbert", 0.05);
-            
-            // Set magnetic field
-            Eigen::Vector3d B;
-            B << config.field_strength * config.field_direction[0],
-                 config.field_strength * config.field_direction[1],
-                 config.field_strength * config.field_direction[2];
-            phonon_lattice.set_field(B);
-            if (!config.pinning_field_config.empty()) {
-                phonon_lattice.add_pinning_fields_from_file(config.pinning_field_config);
-            }
-            
-            // Initialize spins
-            if (config.use_ferromagnetic_init) {
-                Eigen::Vector3d dir;
-                dir << config.ferromagnetic_direction[0],
-                       config.ferromagnetic_direction[1],
-                       config.ferromagnetic_direction[2];
-                phonon_lattice.init_ferromagnetic(dir);
-            } else if (!config.initial_spin_config.empty()) {
-                phonon_lattice.load_spin_config(config.initial_spin_config);
-            } else {
-                phonon_lattice.init_random();
-            }
-
-            // Optional: prescribe a non-zero initial E1 phonon displacement.
-            // Useful for probing the curvature of the BO surface at ε=0
-            // (cooperative pseudo-Jahn-Teller test).
-            const double init_eps_x = config.get_param("initial_eps_x", 0.0);
-            const double init_eps_y = config.get_param("initial_eps_y", 0.0);
-            const double init_v_x   = config.get_param("initial_v_x",   0.0);
-            const double init_v_y   = config.get_param("initial_v_y",   0.0);
-            if (init_eps_x != 0.0 || init_eps_y != 0.0 ||
-                init_v_x   != 0.0 || init_v_y   != 0.0) {
-                phonon_lattice.phonons.Q_x_E1 = init_eps_x;
-                phonon_lattice.phonons.Q_y_E1 = init_eps_y;
-                phonon_lattice.phonons.V_x_E1 = init_v_x;
-                phonon_lattice.phonons.V_y_E1 = init_v_y;
-                if (rank == 0) {
-                    cout << "  Prescribed initial phonon: ε=("
-                         << init_eps_x << ", " << init_eps_y
-                         << "), V=(" << init_v_x << ", " << init_v_y << ")"
-                         << endl;
-                }
-            }
+            // One construction path for the NCTO model (also used by the parameter
+            // sweep and the ncto_* tools): couplings, modes, disorder, fields, damping,
+            // initial state.
+            PhononLattice phonon_lattice = make_ncto_lattice(config);
 
             // Run simulation
             switch (config.simulation) {
@@ -209,11 +135,8 @@ int main(int argc, char** argv) {
                     run_parameter_sweep(config, rank, size);
                     break;
                 default:
-                    if (rank == 0) {
-                        cerr << "Simulation type not supported for PhononLattice. "
-                             << "Supported: SA, MD, pump_probe, 2dcs, parameter_sweep" << endl;
-                    }
-                    break;
+                    throw std::invalid_argument("simulation type not supported for PhononLattice "
+                                                "(supported: SA, MD, pump_probe, 2dcs, parameter_sweep)");
             }
         } else if (config.system == SystemType::TMFEO3) {
             // Mixed SU(2)+SU(3) system
@@ -378,9 +301,9 @@ int main(int argc, char** argv) {
             }
         }
     } catch (const exception& e) {
-        if (rank == 0) {
-            cerr << "Error during simulation: " << e.what() << endl;
-        }
+        cerr << "[Rank " << rank << "] Error during simulation: " << e.what() << endl;
+        // Other ranks may be blocked in a collective: never finalize from one rank alone.
+        if (size > 1) MPI_Abort(MPI_COMM_WORLD, 1);
         MPI_Finalize();
         return 1;
     }

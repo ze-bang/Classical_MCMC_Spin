@@ -30,6 +30,7 @@
  */
 
 #include "classical_spin/core/unitcell_builders.h"
+#include "classical_spin/lattice/kitaev_bonds.h"
 
 #include <array>
 #include <cmath>
@@ -195,21 +196,13 @@ UnitCell build_kitaev_honeycomb(const SpinConfig& config) {
     // Use HoneyComb class from unitcell.h
     HoneyComb atoms(3);
     
-    // Kitaev interactions following molecular_dynamic_kitaev_honeycomb.cpp pattern
-    Eigen::Matrix3d Jx;
-    Jx << J + K, Gammap, Gammap,
-          Gammap, J, Gamma,
-          Gammap, Gamma, J;
-    
-    Eigen::Matrix3d Jy;
-    Jy << J, Gammap, Gamma,
-          Gammap, J + K, Gammap,
-          Gamma, Gammap, J;
-    
-    Eigen::Matrix3d Jz;
-    Jz << J, Gamma, Gammap,
-          Gamma, J, Gammap,
-          Gammap, Gammap, J + K;
+    // Bond exchange matrices in the cubic Kitaev frame (shared with PhononLattice):
+    // spins of this model are STORED in the cubic frame, so field_direction is a cubic
+    // direction ((1,1,1)/√3 = c*), see kitaev_bonds.h.
+    namespace kb = classical_spin::kitaev;
+    const Eigen::Matrix3d Jx = kb::make_Jx_local(J, K, Gamma, Gammap);
+    const Eigen::Matrix3d Jy = kb::make_Jy_local(J, K, Gamma, Gammap);
+    const Eigen::Matrix3d Jz = kb::make_Jz_local(J, K, Gamma, Gammap);
     
     // Set nearest neighbor bonds (following exact pattern from legacy code)
     atoms.set_bilinear_interaction(Jx, 0, 1, Eigen::Vector3i(0, -1, 0));
@@ -257,18 +250,13 @@ UnitCell build_kitaev_honeycomb(const SpinConfig& config) {
         atoms.set_onsite_interaction(K_mat, 1);
     }
     
-    // Set Kitaev local frame for honeycomb sublattices
-    // Transforms from local Kitaev basis to global cubic frame:
-    // Local basis: x' = (1,1,-2)/√6, y' = (-1,1,0)/√2, z' = (1,1,1)/√3
-    // S_global = R * S_local where columns of R are the local basis vectors
-    Eigen::Matrix3d kitaev_frame;
-    kitaev_frame << 1.0/std::sqrt(6.0), -1.0/std::sqrt(2.0), 1.0/std::sqrt(3.0),
-                    1.0/std::sqrt(6.0),  1.0/std::sqrt(2.0), 1.0/std::sqrt(3.0),
-                   -2.0/std::sqrt(6.0),  0.0,                1.0/std::sqrt(3.0);
-    
-    // Both honeycomb sublattices use the same local frame
-    atoms.set_sublattice_frame(kitaev_frame, 0);
-    atoms.set_sublattice_frame(kitaev_frame, 1);
+    // "Global" outputs (M_global, M_antiferro) in crystal components (a, b, c*):
+    // S_crystal = Rᵀ S_cubic. (Before 2026-10 the frame was R, which rotated the cubic
+    // spins a second time instead of expressing them in crystal axes.)
+    const Eigen::Matrix3d crystal_from_cubic = kb::crystal_from_storage(kb::Frame::Cubic);
+    atoms.set_sublattice_frame(crystal_from_cubic, 0);
+    atoms.set_sublattice_frame(crystal_from_cubic, 1);
+    atoms.set_afm_sublattice_signs({1.0, -1.0});   // honeycomb Néel staggering
     
     // Set magnetic field (with g-factor anisotropy)
     Eigen::Vector3d field;
@@ -1187,81 +1175,62 @@ UnitCell build_phonon_honeycomb(const SpinConfig& config) {
 
     // 3rd NN (isotropic Heisenberg)
     const double J3 = config.get_param("J3", 0.52);
-    
+
+    // Spin storage frame: crystal (a, b, c*) by default — c* along z and the in-plane axes
+    // those of the HoneyComb positions — or the pre-2026-10 R·cubic frame with
+    // `legacy_kitaev_frame = 1` (see kitaev_bonds.h and docs/MIGRATION.md).
+    namespace kb = classical_spin::kitaev;
+    const kb::Frame frame = kb::ncto_frame_from_flag(config.get_param(kb::kLegacyFrameKey, 0.0));
+
     // Use HoneyComb class from unitcell.h
     HoneyComb atoms(3);
-    
-    // Bond-dependent Kitaev-Heisenberg-Γ-Γ' exchange matrices in LOCAL Kitaev frame
-    Eigen::Matrix3d Jx;
-    Jx << J + K, Gammap, Gammap,
-          Gammap, J, Gamma,
-          Gammap, Gamma, J;
-    
-    Eigen::Matrix3d Jy;
-    Jy << J, Gammap, Gamma,
-          Gammap, J + K, Gammap,
-          Gamma, Gammap, J;
-    
-    Eigen::Matrix3d Jz;
-    Jz << J, Gamma, Gammap,
-          Gamma, J, Gammap,
-          Gammap, Gammap, J + K;
-    
-    // Transform to global Cartesian frame: J_global = R * J_local * R^T
-    Eigen::Matrix3d R;
-    R << 1.0/std::sqrt(6.0), -1.0/std::sqrt(2.0), 1.0/std::sqrt(3.0),
-         1.0/std::sqrt(6.0),  1.0/std::sqrt(2.0), 1.0/std::sqrt(3.0),
-        -2.0/std::sqrt(6.0),  0.0,                1.0/std::sqrt(3.0);
-    
-    Eigen::Matrix3d Jx_global = R * Jx * R.transpose();
-    Eigen::Matrix3d Jy_global = R * Jy * R.transpose();
-    Eigen::Matrix3d Jz_global = R * Jz * R.transpose();
-    
-    // Set NN bonds with bond_type metadata (x=0, y=1, z=2)
+
+    // NN bonds with bond_type metadata (x=0, y=1, z=2), exchange in the storage frame:
+    // J_storage = U J_cubic Uᵀ (U = Rᵀ crystal, R legacy).
     // x-bond: A(i,j) -> B(i, j-1)
-    atoms.set_bilinear_interaction(Jx_global, 0, 1, Eigen::Vector3i(0, -1, 0), 0);
+    atoms.set_bilinear_interaction(kb::to_storage_frame(kb::make_Jx_local(J, K, Gamma, Gammap), frame),
+                                   0, 1, Eigen::Vector3i(0, -1, 0), 0);
     // y-bond: A(i,j) -> B(i+1, j-1)
-    atoms.set_bilinear_interaction(Jy_global, 0, 1, Eigen::Vector3i(1, -1, 0), 1);
+    atoms.set_bilinear_interaction(kb::to_storage_frame(kb::make_Jy_local(J, K, Gamma, Gammap), frame),
+                                   0, 1, Eigen::Vector3i(1, -1, 0), 1);
     // z-bond: A(i,j) -> B(i, j) (same unit cell)
-    atoms.set_bilinear_interaction(Jz_global, 0, 1, Eigen::Vector3i(0, 0, 0), 2);
-    
-    // 2nd NN interactions (isotropic Heisenberg, sublattice-dependent)
-    if (std::abs(J2_A) > 1e-12 || std::abs(J2_B) > 1e-12) {
-        Eigen::Matrix3d J2A_mat = J2_A * Eigen::Matrix3d::Identity();
-        Eigen::Matrix3d J2B_mat = J2_B * Eigen::Matrix3d::Identity();
-        
-        // A-sublattice 2nd NN (bond_type = -1, no phonon coupling)
-        atoms.set_bilinear_interaction(J2A_mat, 0, 0, Eigen::Vector3i(1, 0, 0));
-        atoms.set_bilinear_interaction(J2A_mat, 0, 0, Eigen::Vector3i(0, 1, 0));
-        atoms.set_bilinear_interaction(J2A_mat, 0, 0, Eigen::Vector3i(1, -1, 0));
-        
-        // B-sublattice 2nd NN
-        atoms.set_bilinear_interaction(J2B_mat, 1, 1, Eigen::Vector3i(1, 0, 0));
-        atoms.set_bilinear_interaction(J2B_mat, 1, 1, Eigen::Vector3i(0, 1, 0));
-        atoms.set_bilinear_interaction(J2B_mat, 1, 1, Eigen::Vector3i(1, -1, 0));
-    }
-    
-    // 3rd NN interactions (isotropic Heisenberg, A↔B)
-    if (std::abs(J3) > 1e-12) {
-        Eigen::Matrix3d J3_mat = J3 * Eigen::Matrix3d::Identity();
-        
-        // 3rd NN from A to B
-        atoms.set_bilinear_interaction(J3_mat, 0, 1, Eigen::Vector3i(1, -2, 0));
-        atoms.set_bilinear_interaction(J3_mat, 0, 1, Eigen::Vector3i(-1, 0, 0));
-        atoms.set_bilinear_interaction(J3_mat, 0, 1, Eigen::Vector3i(1, 0, 0));
-    }
-    
-    // Set Kitaev local frame for both sublattices
-    atoms.set_sublattice_frame(R, 0);
-    atoms.set_sublattice_frame(R, 1);
-    
-    // Set magnetic field
+    atoms.set_bilinear_interaction(kb::to_storage_frame(kb::make_Jz_local(J, K, Gamma, Gammap), frame),
+                                   0, 1, Eigen::Vector3i(0, 0, 0), 2);
+
+    // 2nd NN (isotropic, sublattice-dependent) and 3rd NN (isotropic, A↔B) bonds are
+    // registered whatever their values: the bond lists also carry the second-neighbour
+    // springs of the spin–lattice dynamics and the J2/J3 phonon modulations, which must
+    // not disappear when the static J2 or J3 happens to vanish (zero couplings are skipped
+    // in the PhononLattice hot loops).
+    const Eigen::Matrix3d J2A_mat = J2_A * Eigen::Matrix3d::Identity();
+    const Eigen::Matrix3d J2B_mat = J2_B * Eigen::Matrix3d::Identity();
+    atoms.set_bilinear_interaction(J2A_mat, 0, 0, Eigen::Vector3i(1, 0, 0));
+    atoms.set_bilinear_interaction(J2A_mat, 0, 0, Eigen::Vector3i(0, 1, 0));
+    atoms.set_bilinear_interaction(J2A_mat, 0, 0, Eigen::Vector3i(1, -1, 0));
+    atoms.set_bilinear_interaction(J2B_mat, 1, 1, Eigen::Vector3i(1, 0, 0));
+    atoms.set_bilinear_interaction(J2B_mat, 1, 1, Eigen::Vector3i(0, 1, 0));
+    atoms.set_bilinear_interaction(J2B_mat, 1, 1, Eigen::Vector3i(1, -1, 0));
+
+    const Eigen::Matrix3d J3_mat = J3 * Eigen::Matrix3d::Identity();
+    atoms.set_bilinear_interaction(J3_mat, 0, 1, Eigen::Vector3i(1, -2, 0));
+    atoms.set_bilinear_interaction(J3_mat, 0, 1, Eigen::Vector3i(-1, 0, 0));
+    atoms.set_bilinear_interaction(J3_mat, 0, 1, Eigen::Vector3i(1, 0, 0));
+
+    // Sublattice frames map stored spins to crystal components ("global" outputs):
+    // identity in the crystal frame, (Rᵀ)² in the legacy frame.
+    const Eigen::Matrix3d crystal_from_storage = kb::crystal_from_storage(frame);
+    atoms.set_sublattice_frame(crystal_from_storage, 0);
+    atoms.set_sublattice_frame(crystal_from_storage, 1);
+    atoms.set_afm_sublattice_signs({1.0, -1.0});   // honeycomb Néel staggering
+
+    // Magnetic field in the storage frame: field_direction is a crystal direction
+    // ((0,0,1) = c*) in the default frame.
     Eigen::Vector3d field;
     field << config.field_strength * config.field_direction[0],
              config.field_strength * config.field_direction[1],
              config.field_strength * config.field_direction[2];
     atoms.set_field(field, 0);
     atoms.set_field(field, 1);
-    
+
     return atoms;
 }

@@ -16,6 +16,7 @@
 #include "classical_spin/lattice/lattice.h"
 #include "classical_spin/lattice/mixed_lattice.h"
 #include "classical_spin/lattice/phonon_lattice.h"
+#include "classical_spin/lattice/phonon_config.h"
 
 #include <mpi.h>
 #include <iostream>
@@ -398,58 +399,22 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
         // Build unit cell with updated parameters
         if (sweep_config.system == SystemType::NCTO) {
             // PhononLattice spin-phonon coupled system (honeycomb)
-            UnitCell phonon_uc = build_phonon_honeycomb(sweep_config);
-            PhononLattice phonon_lattice(phonon_uc,
-                                         sweep_config.lattice_size[0],
-                                         sweep_config.lattice_size[1],
-                                         sweep_config.lattice_size[2],
-                                         sweep_config.spin_length);
-            
-            // Build parameters from config
-            SpinPhononCouplingParams sp_params;
-            PhononParams ph_params;
-            DriveParams dr_params;
-            TimeDependentSpinPhononParams td_sp_params;
-            build_phonon_params(sweep_config, sp_params, ph_params, dr_params, td_sp_params);
-            
-            // Set parameters
-            phonon_lattice.set_parameters(sp_params, ph_params, dr_params);
-            phonon_lattice.set_time_dependent_spin_phonon(td_sp_params);
-            phonon_lattice.alpha_gilbert = sweep_config.get_param("alpha_gilbert", 0.0);
-            
-            // Set magnetic field
-            Eigen::Vector3d B;
-            B << sweep_config.field_strength * sweep_config.field_direction[0],
-                 sweep_config.field_strength * sweep_config.field_direction[1],
-                 sweep_config.field_strength * sweep_config.field_direction[2];
-            phonon_lattice.set_field(B);
-            
-            // Initialize spins
-            if (sweep_config.use_ferromagnetic_init) {
-                Eigen::Vector3d dir;
-                dir << sweep_config.ferromagnetic_direction[0],
-                       sweep_config.ferromagnetic_direction[1],
-                       sweep_config.ferromagnetic_direction[2];
-                phonon_lattice.init_ferromagnetic(dir);
-            } else if (!sweep_config.initial_spin_config.empty()) {
-                phonon_lattice.load_spin_config(sweep_config.initial_spin_config);
-            } else {
-                phonon_lattice.init_random();
-            }
-            
+            // Same construction path as a direct run (modes, disorder, pinning, damping).
+            PhononLattice phonon_lattice = make_ncto_lattice(sweep_config);
+
             // Run appropriate simulation
             switch (sweep_config.simulation) {
                 case SimulationType::SIMULATED_ANNEALING:
-                    run_simulated_annealing_phonon(phonon_lattice, sweep_config, 0, 1);
+                    run_simulated_annealing_phonon(phonon_lattice, sweep_config, 0, 1, MPI_COMM_SELF);
                     break;
                 case SimulationType::MOLECULAR_DYNAMICS:
-                    run_molecular_dynamics_phonon(phonon_lattice, sweep_config, 0, 1);
+                    run_molecular_dynamics_phonon(phonon_lattice, sweep_config, 0, 1, MPI_COMM_SELF);
                     break;
                 case SimulationType::PUMP_PROBE:
-                    run_pump_probe_phonon(phonon_lattice, sweep_config, 0, 1);
+                    run_pump_probe_phonon(phonon_lattice, sweep_config, 0, 1, MPI_COMM_SELF);
                     break;
                 case SimulationType::TWOD_COHERENT_SPECTROSCOPY:
-                    run_2dcs_phonon(phonon_lattice, sweep_config, 0, 1);
+                    run_2dcs_phonon(phonon_lattice, sweep_config, 0, 1, MPI_COMM_SELF);
                     break;
                 default:
                     cerr << "[Rank " << rank << "] Error: Unsupported base simulation for parameter sweep with PhononLattice" << endl;
