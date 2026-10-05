@@ -352,11 +352,11 @@
         size_t prelim_interval = 10;
         prelim_energies.reserve(prelim_samples / prelim_interval);
         
-        for (size_t i = 0; i < prelim_samples; ++i) {
-            perform_mc_sweeps(1, T_final, gaussian_move, sigma, overrelaxation_rate);
-            if (i % prelim_interval == 0) {
-                prelim_energies.push_back(total_energy(spins));
-            }
+        // Sweep in whole sampling intervals so perform_mc_sweeps keeps its
+        // overrelaxation : local-update ratio across calls.
+        for (size_t i = 0; i < prelim_samples; i += prelim_interval) {
+            prelim_energies.push_back(total_energy(spins));
+            perform_mc_sweeps(prelim_interval, T_final, gaussian_move, sigma, overrelaxation_rate);
         }
         
         AutocorrelationResult acf = compute_autocorrelation(prelim_energies, prelim_interval);
@@ -381,14 +381,11 @@
         magnetizations.reserve(n_samples);
         sublattice_mags.reserve(n_samples);
         
-        for (size_t i = 0; i < n_measure; ++i) {
-            perform_mc_sweeps(1, T_final, gaussian_move, sigma, overrelaxation_rate);
-
-            if (i % acf.sampling_interval == 0) {
-                energies.push_back(total_energy(spins));
-                magnetizations.push_back(magnetization_global());
-                sublattice_mags.push_back(magnetization_sublattice());  // NEW
-            }
+        for (size_t i = 0; i < n_measure; i += acf.sampling_interval) {
+            perform_mc_sweeps(acf.sampling_interval, T_final, gaussian_move, sigma, overrelaxation_rate);
+            energies.push_back(total_energy(spins));
+            magnetizations.push_back(magnetization_global());
+            sublattice_mags.push_back(magnetization_sublattice());
         }
         
         cout << "Collected " << energies.size() << " samples" << endl;

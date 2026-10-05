@@ -45,10 +45,15 @@ inline void set_thread_state(unsigned __int128 state) {
 }
 
 inline void lazy_seed_thread() {
+    // Key the stream on the full OpenMP thread ancestry, not just the
+    // innermost thread number: threads of different outer teams that first
+    // draw inside nested regions must not share a stream.
+    unsigned long long tid = 0;
 #ifdef _OPENMP
-    const unsigned long long tid = static_cast<unsigned long long>(omp_get_thread_num());
-#else
-    const unsigned long long tid = 0;
+    const int level = omp_get_level();
+    for (int l = 1; l <= level; ++l)
+        tid = splitmix64(tid ^ (static_cast<unsigned long long>(omp_get_ancestor_thread_num(l)) +
+                                0x9E3779B97F4A7C15ULL * static_cast<unsigned long long>(l)));
 #endif
     const unsigned long long master = lehman_master_seed.load(std::memory_order_relaxed);
     set_thread_state(expand_seed(master ^ splitmix64(tid + 0x632BE59BD9B4E019ULL)));

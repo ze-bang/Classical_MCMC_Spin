@@ -45,6 +45,26 @@ void test_heat_bath_anneal() {
     check_close(lat.energy_density(), -1.0, 1e-6, "heat-bath SA reaches E/N = -1");
 }
 
+void test_quadratic_minimiser_edge_cases() {
+    std::printf("\n== Single-site minimiser edge cases ==\n");
+    // Strong easy axis with a vanishing linear field (|g| << ulp(a)): the
+    // minimiser must stay finite and on the sphere.
+    bool ok = true;
+    for (double a : {1.0, 100.0, 1000.0}) {
+        for (double gz : {0.0, 1e-16, 1.5e-14, 1e-13, 1e-6, 0.5}) {
+            Eigen::Matrix3d A = Eigen::Vector3d(0, 0, -a).asDiagonal();
+            const double g[3] = {1e-3 * gz, 0.0, gz};
+            const double cur[3] = {0.0, 0.6, 0.8};
+            double S[3];
+            Lattice::minimize_quadratic_on_sphere(A, g, 1.0, cur, S, 3);
+            const double n = std::sqrt(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+            // Optimum: along -sign(gz) z (easy axis), |Sz| ~ 1.
+            if (!std::isfinite(n) || std::abs(n - 1.0) > 1e-12 || std::abs(S[2]) < 0.999) ok = false;
+        }
+    }
+    check(ok, "finite, normalised, easy-axis solutions for |g| down to 0");
+}
+
 void test_schedule_validation() {
     std::printf("\n== Schedule validation ==\n");
     auto sched = mc::annealing_schedule(2.0, 0.3, 0.5);
@@ -90,6 +110,7 @@ int main(int argc, char** argv) {
     test_easy_plane_field();
     test_heat_bath_anneal();
     test_schedule_validation();
+    test_quadratic_minimiser_edge_cases();
     const int rc = finish("test_sa_ground_state");
     MPI_Finalize();
     return rc;

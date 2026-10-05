@@ -308,6 +308,22 @@ void test_geometric_conservation() {
     }
 }
 
+void test_color_split_isotropic_onsite() {
+    std::printf("\n== Colour splitting with an isotropic on-site term (folded self-bond) ==\n");
+    // dim2 = 1 with a y-bond folds 0.7 J S.S into the on-site matrix (A = 0.7 I):
+    // a constant energy that must not change the dynamics.
+    UnitCell uc = chain_cell(-1.0 * Eigen::Matrix3d::Identity(), Eigen::Vector3d(0, 0, 0.3));
+    uc.set_bilinear_interaction(-0.7 * Eigen::Matrix3d::Identity(), 0, 0, Eigen::Vector3i(0, 1, 0));
+    Lattice lat(uc, 8, 1, 1, 1.0f);
+    State x0 = random_state(lat, 41);
+    const double E0 = energy_of(lat, x0);
+    for (const char* m : {"color_split", "color_split4"}) {
+        State x = x0;
+        lat.integrate_geometric(x, 0.0, 50.0, 0.02, [](const State&, double) {}, m);
+        check_close(energy_of(lat, x) - E0, 0.0, 1e-9, std::string(m) + " energy conserved with A = cI");
+    }
+}
+
 void test_langevin_fdt() {
     std::printf("\n== Langevin thermostat samples the Gibbs distribution (FDT) ==\n");
     // Free spins in a field: <E>/N = -h L(h/T) exactly.
@@ -354,6 +370,7 @@ int main(int argc, char** argv) {
     test_library_integrators();
     test_geometric_order();
     test_geometric_conservation();
+    test_color_split_isotropic_onsite();
     test_langevin_fdt();
     const int rc = finish("test_md_exact");
     MPI_Finalize();

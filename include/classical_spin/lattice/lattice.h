@@ -607,6 +607,18 @@ public:
     // Cached result of cluster_embedding_is_exact() (-1 = unknown).
     mutable int8_t cluster_exact_cache = -1;
 
+    // onsite_scalar[i] = 1 when S^T A_i S is constant on the sphere (A_i's
+    // symmetric part is a multiple of the identity). Such terms exert no
+    // torque; the hot kernels skip them. Rebuilt by build_flat_bilinear_tables
+    // (call refresh_onsite_flags() after editing onsite_interaction directly).
+    vector<uint8_t> onsite_scalar;
+
+    void refresh_onsite_flags() {
+        onsite_scalar.assign(lattice_size, 1);
+        for (size_t i = 0; i < lattice_size; ++i) onsite_scalar[i] = onsite_is_scalar(i) ? 1 : 0;
+        cluster_exact_cache = -1;
+    }
+
     void sync_twist_state() {
         cluster_exact_cache = -1;
         twist_active = false;
@@ -988,10 +1000,10 @@ public:
                     (spin_dim == 3 && (wrap[0] != 0 || wrap[1] != 0 || wrap[2] != 0))
                         ? uint8_t(1) : uint8_t(0);
             }
+        }
         bi_flat_J0 = bi_flat_J;
         refresh_twisted_bonds();
-
-        }
+        refresh_onsite_flags();
     }
 
     /**
@@ -1122,6 +1134,7 @@ public:
           bi_flat_wrap(other.bi_flat_wrap),
           bi_flat_J0(other.bi_flat_J0),
           bi_flat_forward(other.bi_flat_forward),
+          onsite_scalar(other.onsite_scalar),
           bi_flat_D2(other.bi_flat_D2),
           color_of_site(other.color_of_site),
           sites_by_color_csr_off(other.sites_by_color_csr_off),
@@ -1441,92 +1454,92 @@ public:
      *
      * This is the trust-region subproblem. With A_sym = Q diag(a) Q^T and
      * c = Q^T g, stationary points are S = -Q (A_sym + λ)^{-1} c / 2 with
-     *     φ(λ) = Σ_k c_k² / (4 (a_k + λ)²) = s²,
+     *     Σ_k c_k² / (4 (a_k + λ)²) = s²,
      * and the global minimum is the root with λ ≥ -a_min (A_sym + λ PSD).
-     * φ decreases monotonically on (-a_min, ∞) and φ(-a_min + |c|/(2s)) ≤ s²,
-     * so a safeguarded Newton/bisection solve is robust. In the "hard case"
-     * (c has no weight on the lowest eigenvector) λ = -a_min and the
-     * remaining norm goes into the a_min eigenspace, oriented along the
-     * current spin `S_cur` for continuity.
+     * The secular equation is solved in δ = λ + a_min ∈ (0, |c|/(2s)],
+     * where d_k = (a_k - a_min) + δ carries no cancellation even when |g| is
+     * far below the scale of A (φ(δ) = Σ c_k²/(4 d_k²) - s² decreases
+     * monotonically and is <= 0 at the upper end). In the "hard case" (no
+     * weight of g on the lowest eigenspace, and the remaining components
+     * fit inside the sphere) δ = 0 and the leftover norm goes into the
+     * a_min eigenspace, oriented along the current spin `S_cur`.
      */
+    template<int N, typename Mat>
+    static void minimize_quadratic_on_sphere_impl(const Mat& A, const double* g, double s,
+                                                  const double* S_cur, double* S_out, size_t n) {
+        using Vec = Eigen::Matrix<double, N, 1>;
+        const Mat A_sym = 0.5 * (A + A.transpose());
+        Eigen::SelfAdjointEigenSolver<Mat> es(A_sym);
+        const Vec a = es.eigenvalues();                          // ascending
+        const Mat& Q = es.eigenvectors();
+        const Vec c = Q.transpose() * Eigen::Map<const Vec>(g, n);
+        const Vec cur = Q.transpose() * Eigen::Map<const Vec>(S_cur, n);
+        const double a_min = a(0);
+        const double deg_tol = 1e-12 * std::max({std::abs(a_min), std::abs(a(n - 1)), 1e-300});
+        double c_low2 = 0.0, c_norm2 = 0.0, rest2 = 0.0;
+        for (size_t k = 0; k < n; ++k) {
+            const double gap = a(k) - a_min;
+            c_norm2 += c(k) * c(k);
+            if (gap <= deg_tol) c_low2 += c(k) * c(k);
+            else rest2 += (c(k) / (2.0 * gap)) * (c(k) / (2.0 * gap));
+        }
+        Vec y(n);
+        if (c_low2 <= 1e-28 * c_norm2 && rest2 <= s * s) {
+            // Hard case: δ = 0.
+            double proj2 = 0.0;
+            for (size_t k = 0; k < n; ++k) {
+                const double gap = a(k) - a_min;
+                y(k) = (gap <= deg_tol) ? 0.0 : -c(k) / (2.0 * gap);
+                if (gap <= deg_tol) proj2 += cur(k) * cur(k);
+            }
+            const double tau = std::sqrt(std::max(0.0, s * s - rest2));
+            for (size_t k = 0; k < n; ++k) {
+                if (a(k) - a_min > deg_tol) continue;
+                y(k) = (proj2 > 1e-30) ? tau * cur(k) / std::sqrt(proj2) : (k == 0 ? tau : 0.0);
+            }
+        } else {
+            auto d_of = [&](size_t k, double delta) { return (a(k) - a_min) + delta; };
+            auto phi = [&](double delta) {
+                double sum = 0.0;
+                for (size_t k = 0; k < n; ++k) {
+                    const double d = d_of(k, delta);
+                    sum += c(k) * c(k) / (4.0 * d * d);
+                }
+                return sum - s * s;
+            };
+            double lo = 0.0, hi = std::sqrt(c_norm2) / (2.0 * s);
+            double delta = hi;
+            for (int it = 0; it < 200; ++it) {
+                const double f = phi(delta);
+                if (std::abs(f) <= 1e-15 * s * s) break;
+                if (f > 0.0) lo = delta; else hi = delta;
+                if (hi - lo <= 1e-16 * hi) break;
+                double df = 0.0;
+                for (size_t k = 0; k < n; ++k) {
+                    const double d = d_of(k, delta);
+                    df -= c(k) * c(k) / (2.0 * d * d * d);
+                }
+                double next = (df < 0.0) ? delta - f / df : 0.0;
+                if (!(next > lo && next < hi))
+                    next = (lo > 0.0) ? std::sqrt(lo * hi) : 0.5 * hi;  // safeguarded bisection
+                delta = next;
+            }
+            for (size_t k = 0; k < n; ++k) y(k) = -c(k) / (2.0 * d_of(k, delta));
+        }
+        const double yn = y.norm();
+        if (yn > 0.0) y *= s / yn;  // remove residual root-finding error
+        Eigen::Map<Vec>(S_out, n) = Q * y;
+    }
+
     static void minimize_quadratic_on_sphere(const Eigen::MatrixXd& A, const double* g,
                                              double s, const double* S_cur, double* S_out,
                                              size_t n) {
-        const Eigen::MatrixXd A_sym = 0.5 * (A + A.transpose());
-        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(A_sym);
-        const Eigen::VectorXd& a = es.eigenvalues();          // ascending
-        const Eigen::MatrixXd& Q = es.eigenvectors();
-        const Eigen::VectorXd c = Q.transpose() * Eigen::Map<const Eigen::VectorXd>(g, n);
-        const double a_min = a(0);
-        const double spread = std::max(1e-300, a(n - 1) - a_min);
-        const double deg_tol = 1e-10 * std::max(spread, std::abs(a_min));
-
-        auto phi = [&](double lam) {
-            double sum = 0.0;
-            for (size_t k = 0; k < n; ++k) {
-                const double d = a(k) + lam;
-                sum += c(k) * c(k) / (4.0 * d * d);
-            }
-            return sum - s * s;
-        };
-
-        // Weight of g on the lowest eigenspace decides easy vs hard case.
-        double c_low2 = 0.0, c_norm2 = 0.0;
-        for (size_t k = 0; k < n; ++k) {
-            c_norm2 += c(k) * c(k);
-            if (a(k) - a_min <= deg_tol) c_low2 += c(k) * c(k);
+        if (n == 3) {
+            const Eigen::Matrix3d A3 = A.topLeftCorner<3, 3>();
+            minimize_quadratic_on_sphere_impl<3>(A3, g, s, S_cur, S_out, 3);
+        } else {
+            minimize_quadratic_on_sphere_impl<Eigen::Dynamic>(A, g, s, S_cur, S_out, n);
         }
-        const double c_norm = std::sqrt(c_norm2);
-
-        Eigen::VectorXd y(n);  // solution in the eigenbasis
-        bool hard = (c_low2 <= 1e-28 * std::max(1.0, c_norm2));
-        if (hard) {
-            double rest2 = 0.0;
-            for (size_t k = 0; k < n; ++k) {
-                if (a(k) - a_min <= deg_tol) { y(k) = 0.0; continue; }
-                y(k) = -c(k) / (2.0 * (a(k) - a_min));
-                rest2 += y(k) * y(k);
-            }
-            if (rest2 > s * s) hard = false;  // a genuine root exists above -a_min
-            else {
-                // Fill the a_min eigenspace along the current spin.
-                const Eigen::VectorXd cur = Q.transpose() * Eigen::Map<const Eigen::VectorXd>(S_cur, n);
-                double proj2 = 0.0;
-                for (size_t k = 0; k < n; ++k)
-                    if (a(k) - a_min <= deg_tol) proj2 += cur(k) * cur(k);
-                const double tau = std::sqrt(std::max(0.0, s * s - rest2));
-                if (proj2 > 1e-30) {
-                    const double scale = tau / std::sqrt(proj2);
-                    for (size_t k = 0; k < n; ++k)
-                        if (a(k) - a_min <= deg_tol) y(k) = scale * cur(k);
-                } else {
-                    y(0) = tau;
-                }
-            }
-        }
-        if (!hard) {
-            double lo = -a_min, hi = -a_min + c_norm / (2.0 * s) + 1e-300;
-            double lam = hi;
-            for (int it = 0; it < 200; ++it) {
-                const double f = phi(lam);
-                if (std::abs(f) <= 1e-15 * s * s) break;
-                if (f > 0.0) lo = lam; else hi = lam;
-                // Newton step on φ, kept inside the bracket.
-                double df = 0.0;
-                for (size_t k = 0; k < n; ++k) {
-                    const double d = a(k) + lam;
-                    df -= c(k) * c(k) / (2.0 * d * d * d);
-                }
-                double next = (df < 0.0) ? lam - f / df : 0.5 * (lo + hi);
-                if (!(next > lo && next < hi)) next = 0.5 * (lo + hi);
-                if (hi - lo <= 1e-16 * std::max(1.0, std::abs(lam))) { lam = next; break; }
-                lam = next;
-            }
-            for (size_t k = 0; k < n; ++k) y(k) = -c(k) / (2.0 * (a(k) + lam));
-            const double yn = y.norm();
-            if (yn > 0.0) y *= s / yn;  // remove residual root-finding error
-        }
-        Eigen::Map<Eigen::VectorXd>(S_out, n) = Q * y;
     }
 
     /**
@@ -2695,7 +2708,7 @@ public:
             for (int d = 0; d < 3; ++d) S_new[d] = s * (u * n[d] + r * (c * e1[d] + sn * e2[d]));
         }
         double* S = spins[site].data();
-        if (!onsite_is_scalar(site)) {
+        if (!onsite_scalar[site]) {
             const double dE = onsite_energy(site, S_new) - onsite_energy(site, S);
             if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE)) return false;
         }
@@ -2832,7 +2845,7 @@ public:
         }
         if (norm_sq <= 0.0) return false;
         const double k = 2.0 * S_dot_g / norm_sq;
-        if (onsite_is_scalar(site)) {
+        if (onsite_scalar[site]) {
             for (size_t d = 0; d < spin_dim; ++d) S[d] = k * g[d] - S[d];
             return true;
         }
@@ -2951,7 +2964,7 @@ public:
     bool compute_cluster_embedding_is_exact() const {
         if (twist_active) return false;
         for (size_t i = 0; i < lattice_size; ++i) {
-            if (!trilinear_partners[i].empty() || !onsite_is_scalar(i)) return false;
+            if (!trilinear_partners[i].empty() || !onsite_scalar[i]) return false;
         }
         const size_t D = spin_dim;
         for (size_t k = 0; k < bi_flat_partner.size(); ++k) {
@@ -3116,12 +3129,20 @@ public:
         }
         if (attached_to_ghost) return 0;
 
-        const bool exact = cluster_embedding_is_exact() && (use_ghost_field || !has_nonzero_field());
-        if (!exact) {
-            const double dE_res = cluster_residual_energy(cluster_members_buf, cluster_in_cluster.data(),
-                                                          r_data, cluster_proj_buf.data(), use_ghost_field);
-            if (dE_res > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE_res)) return 0;
+        double dE_res = 0.0;
+        if (!cluster_embedding_is_exact()) {
+            dE_res = cluster_residual_energy(cluster_members_buf, cluster_in_cluster.data(),
+                                             r_data, cluster_proj_buf.data(), use_ghost_field);
+        } else if (!use_ghost_field) {
+            // Exact embedding: only the Zeeman term is left, O(|C|).
+            for (size_t i : cluster_members_buf) {
+                const double* B = field[i].data();
+                double B_r = 0.0;
+                for (size_t d = 0; d < spin_dim; ++d) B_r += B[d] * r_data[d];
+                dE_res += 2.0 * cluster_proj_buf[i] * B_r;
+            }
         }
+        if (dE_res > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE_res)) return 0;
 
         for (size_t i : cluster_members_buf) {
             double* S = spins[i].data();
@@ -3309,7 +3330,7 @@ public:
             for (size_t i = 0; i < lattice_size; ++i) {
                 linear_field(i, spins_view(), g);
                 double* S = spins[i].data();
-                if (onsite_is_scalar(i)) {
+                if (onsite_scalar[i]) {
                     double norm = 0.0;
                     for (size_t d = 0; d < spin_dim; ++d) norm += g[d] * g[d];
                     norm = std::sqrt(norm);
@@ -4300,8 +4321,14 @@ public:
         double spin_length() const { return double(lat.spin_length); }
         void set_time(double t) const { lat.drive_envelopes(t, f1, f2); }
         void field_site(const double* x, double, size_t i, double* B) const {
+            // A scalar on-site matrix (A = cI, e.g. a folded isotropic self-
+            // bond) contributes 2c S_i to the gradient: parallel to S_i, no
+            // torque. It is dropped because the discrete schemes — colour
+            // splitting in particular, which freezes B_i over a sub-step —
+            // would otherwise rotate about a tilted axis.
             double H[MAX_SPIN_DIM];
-            lat.get_local_field_flat(x, i, H);
+            if (lat.onsite_scalar[i]) lat.linear_field(i, lat.flat_view(x), H);
+            else lat.get_local_field_flat(x, i, H);
             if (lat.field_drive_amp != 0.0) lat.apply_drive_field_flat(i, f1, f2, H);
             for (size_t d = 0; d < 3; ++d) B[d] = -H[d];
         }
@@ -4320,7 +4347,7 @@ public:
         }
         bool energy_linear_in_each_spin() const {
             for (size_t i = 0; i < lat.lattice_size; ++i)
-                if (!lat.onsite_is_scalar(i)) return false;
+                if (!lat.onsite_scalar[i]) return false;
             return true;
         }
     };
@@ -4328,9 +4355,9 @@ public:
     /**
      * Fixed-step integration with a norm-preserving geometric method
      * (spherical_midpoint, depondt, color_split, color_split4), stochastic
-     * when langevin_temperature > 0. The step is adjusted to divide
-     * [t0, t1] exactly; the observer is called at t0 and after every step,
-     * like odeint::integrate_const.
+     * when langevin_temperature > 0. Same contract as odeint::integrate_const:
+     * steps of exactly dt at t0 + k dt, the observer called at t0 and after
+     * every step, stopping at the last grid point not beyond t1.
      */
     template<typename Observer>
     void integrate_geometric(ODEState& state, double t0, double t1, double dt,
@@ -4344,12 +4371,11 @@ public:
         classical_spin::dynamics::SpinIntegrator<DynamicsModel> integrator(
             model, classical_spin::dynamics::parse_geometric_method(method),
             {alpha_gilbert, langevin_temperature});
-        const long n_steps = std::max(0L, std::lround((t1 - t0) / dt));
-        const double h = (n_steps > 0) ? (t1 - t0) / double(n_steps) : 0.0;
+        const long n_steps = std::max(0L, long(std::floor((t1 - t0) / dt + 1e-9)));
         observer(state, t0);
         for (long k = 0; k < n_steps; ++k) {
-            integrator.step(state.data(), t0 + double(k) * h, h);
-            observer(state, t0 + double(k + 1) * h);
+            integrator.step(state.data(), t0 + double(k) * dt, dt);
+            observer(state, t0 + double(k + 1) * dt);
         }
     }
 
@@ -4361,6 +4387,12 @@ public:
     void evolve_spins(double t0, double t1, double dt, const string& method, Observer observer) {
         ODEState state = spins_to_state(spins);
         integrate_geometric(state, t0, t1, dt, observer, method);
+        // Reach t1 exactly with a final partial step (no observer call).
+        const double t_reached = t0 + std::floor((t1 - t0) / dt + 1e-9) * dt;
+        if (t1 - t_reached > 1e-12 * std::max(1.0, std::abs(t1))) {
+            integrate_geometric(state, t_reached, t1, t1 - t_reached,
+                                [](const ODEState&, double) {}, method);
+        }
         for (size_t i = 0; i < lattice_size; ++i)
             for (size_t d = 0; d < spin_dim; ++d) spins[i](d) = state[i * spin_dim + d];
     }
