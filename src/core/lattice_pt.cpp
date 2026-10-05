@@ -52,6 +52,14 @@ public:
         if (accumulate_correlations_) lat_.accumulate_correlations_internal(corr_);
     }
 
+    /// Twist-boundary matrices enter the energy but are not exchanged, so they
+    /// must agree on every rank (checked by the engine).
+    std::vector<double> replica_invariants() const {
+        std::vector<double> v;
+        for (const auto& M : lat_.twist_matrices) v.insert(v.end(), M.data(), M.data() + M.size());
+        return v;
+    }
+
     void write_rank_outputs(const mc::PTRankContext& ctx) const {
         Base::write_rank_outputs(ctx);
         const double T = ctx.result->temperature;

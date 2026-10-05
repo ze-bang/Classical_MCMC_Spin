@@ -382,6 +382,16 @@ inline void validate_chain_setup(const M& model, const std::vector<double>& T, M
     }
 }
 
+/// Restores std::cout's format flags and precision on scope exit.
+struct CoutFormatGuard {
+    std::ios_base::fmtflags flags = std::cout.flags();
+    std::streamsize precision = std::cout.precision();
+    ~CoutFormatGuard() {
+        std::cout.flags(flags);
+        std::cout.precision(precision);
+    }
+};
+
 template <class F>
 inline std::string guarded_io(F&& f) {
     try {
@@ -1039,8 +1049,7 @@ void write_outputs(M& model, const PTResult& res, const PTOptions& o, MPI_Comm c
 }
 
 inline void print_summary(const PTResult& r) {
-    const std::ios_base::fmtflags flags = std::cout.flags();
-    const std::streamsize prec = std::cout.precision();
+    const CoutFormatGuard format_guard;
     std::cout << "\n=== Parallel tempering: " << r.temperatures.size() << " replicas, "
               << r.exchange_rounds << " exchange rounds ===\n";
     std::cout << "  k            T        <E>/N       err          c        err   tau_E  acc_loc   sigma   f_up  A(k,k+1)\n";
@@ -1067,8 +1076,6 @@ inline void print_summary(const PTResult& r) {
                       << r.temperatures[k + 1] << "; replicas cannot cross this edge (add temperatures "
                       << "or narrow the range)\n";
     std::cout << std::flush;
-    std::cout.flags(flags);
-    std::cout.precision(prec);
 }
 
 }  // namespace detail
@@ -1252,6 +1259,7 @@ LadderTuningResult tune_temperature_ladder(M& model, const LadderTuningOptions& 
     const uint64_t seed = detail::shared_exchange_seed(pt);
     ReplicaExchange<M> chain(model, pt, ladder, seed, o.initial_step_size, o.target_acceptance);
     const size_t ex = o.exchange_every;
+    const detail::CoutFormatGuard format_guard;
     if (rank == 0 && o.verbosity > 0)
         std::cout << "Tuning the temperature ladder: " << ladder_method_name(o.method) << ", R = " << R
                   << ", T in [" << o.T_min << ", " << o.T_max << "], " << o.warmup_steps

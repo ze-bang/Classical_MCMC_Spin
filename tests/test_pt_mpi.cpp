@@ -8,13 +8,17 @@
 //     alternate), measured round trips, f(T_min) = 1, f(T_max) = 0.
 //  2. Free spins in a field with adaptive Gaussian proposals: <E>/N and <m_z>
 //     against the Langevin function; sigma adapted toward the target.
-//  3. Bitwise reproducibility for a fixed seed.
-//  4. Ladder tuning (nrpt, katzgraber): valid ladders; nrpt equalises the
+//  3. MixedLattice adapter: free SU(2) spins and free 8-component SU(3)
+//     vectors in fields, <E>/N and both magnetisations vs the exact
+//     Langevin / Bessel-ratio results (both species travel on a swap).
+//  4. Bitwise reproducibility for a fixed seed.
+//  5. Ladder tuning (nrpt, katzgraber): valid ladders; nrpt equalises the
 //     measured edge acceptance.
-//  5. Collective failure: invalid input and rank-local output errors make every
+//  6. Collective failure: invalid input and rank-local output errors make every
 //     rank throw (no deadlock); successful output files exist.
 #include "physics_test_util.h"
 
+#include "classical_spin/lattice/mixed_lattice.h"
 #include "classical_spin/mc/parallel_tempering.h"
 
 #include <mpi.h>
@@ -108,6 +112,41 @@ void test_free_spins_adaptive() {
     MPI_Allgather(mine, 2, MPI_DOUBLE, all.data(), 2, MPI_DOUBLE, MPI_COMM_WORLD);
     for (size_t k = 0; k < T.size(); ++k)
         ck_stat(all[2 * k], all[2 * k + 1], langevin(h / T[k]), "<m_z> T=" + std::to_string(T[k]));
+}
+
+void test_mixed_free_species() {
+    if (g_rank == 0) std::printf("\n== PT on MixedLattice: free SU(2) and SU(3) spins in fields ==\n");
+    const double h2 = 1.0, h3 = 0.8;
+    const std::vector<double> T = {0.4, 0.7, 1.1, 1.8};
+    const auto axes = std::vector<Eigen::Vector3d>{Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(0, 1, 0),
+                                                   Eigen::Vector3d(0, 0, 1)};
+    UnitCell su2(3, 1, {Eigen::Vector3d::Zero()}, axes);
+    UnitCell su3(8, 1, {Eigen::Vector3d(0.5, 0.5, 0.0)}, axes);
+    su2.set_field(Eigen::Vector3d(0, 0, h2), 0);
+    SpinVector f3 = SpinVector::Zero(8);
+    f3(2) = h3;
+    su3.set_field(f3, 0);
+    seed_all(606);
+    MixedLattice lat(MixedUnitCell(su2, su3), 4, 4, 1, 1.0f, 1.0f);
+    lat.init_random();
+    const auto r = lat.parallel_tempering(T, 2000, 30000, 0, 10, 2, "", {-1}, false, true, MPI_COMM_WORLD);
+    auto u3 = [&](double t) {  // <n.h_hat> on S^7: I_4(K) / I_3(K)
+        const double K = h3 / t;
+        return std::cyl_bessel_i(4.0, K) / std::cyl_bessel_i(3.0, K);
+    };
+    for (size_t k = 0; k < T.size(); ++k) {
+        const double exact = 0.5 * (-h2 * langevin(h2 / T[k]) - h3 * u3(T[k]));  // equal site counts
+        ck_stat(r.energy[k], r.energy_error[k], exact, "mixed <E>/N T=" + std::to_string(T[k]));
+    }
+    double mine[4] = {r.thermo.order_parameters.at(0).mean.values[2], r.thermo.order_parameters.at(0).mean.errors[2],
+                      r.thermo.order_parameters.at(1).mean.values[2], r.thermo.order_parameters.at(1).mean.errors[2]};
+    std::vector<double> all(4 * size_t(g_size));
+    MPI_Allgather(mine, 4, MPI_DOUBLE, all.data(), 4, MPI_DOUBLE, MPI_COMM_WORLD);
+    for (size_t k = 0; k < T.size(); ++k) {
+        ck_stat(all[4 * k], all[4 * k + 1], langevin(h2 / T[k]), "<m_SU2,z> T=" + std::to_string(T[k]));
+        ck_stat(all[4 * k + 2], all[4 * k + 3], u3(T[k]), "<m_SU3,3> T=" + std::to_string(T[k]));
+    }
+    ck(r.bookkeeping_consistent && r.round_trips > 0, "mixed: consistent exchanges and round trips");
 }
 
 void test_reproducible() {
@@ -264,6 +303,7 @@ int main(int argc, char** argv) {
     }
     test_heisenberg_ring();
     test_free_spins_adaptive();
+    test_mixed_free_species();
     test_reproducible();
     test_ladder_tuning();
     test_no_exchange();
