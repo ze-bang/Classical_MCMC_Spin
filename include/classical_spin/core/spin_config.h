@@ -54,6 +54,9 @@ struct SpinConfig {
     
     // General simulation parameters
     int num_trials = 1;
+    // Master RNG seed. 0 = draw one from std::random_device on rank 0 (it is
+    // printed and written to the output directory so the run can be repeated).
+    uint64_t seed = 0;
     string output_dir = "output";
     double initial_step_size = 0.5;
     bool use_twist_boundary = false;

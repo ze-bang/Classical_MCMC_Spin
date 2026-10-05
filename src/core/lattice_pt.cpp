@@ -653,7 +653,7 @@
             double local_sigma = sigma;
             // Deterministic, replica-distinct seeding (replaces wall-clock).
             // Each replica gets a stream derived from (master_seed, k).
-            seed_lehman_from_rank(static_cast<unsigned long long>(k) + 1ULL);
+            seed_lehman_thread(static_cast<unsigned long long>(k) + 1ULL);
             run_on_replica(k, [&](Lattice& L) {
                 for (size_t i = 0; i < warmup_sweeps; ++i) {
                     L.metropolis(T_k, gaussian_move, local_sigma);

@@ -176,25 +176,40 @@ inline SpinMatrix transpose2D(const SpinMatrix& M) {
 // Transpose 3D tensor - defined in simple_linear_alg.cpp
 SpinTensor3 transpose3D(const SpinTensor3& T, size_t N1, size_t N2, size_t N3);
 
-// Random number generation using Lehman generator - defined in simple_linear_alg.cpp.
+// Random number generation: 128-bit multiplicative Lehmer generator (passes
+// BigCrush; period 2^126), defined in simple_linear_alg.cpp.
 //
-// Thread safety:
-//   `lehman_state` is declared `thread_local`, so each OpenMP / std::thread
-//   thread has its own independent state. Calling `seed_lehman(s)` from any
-//   thread updates a shared master seed and also reseeds the calling thread.
-//   The first time a thread (other than the one that called `seed_lehman`)
-//   invokes `lehman_next` / `random_*_lehman`, its state is lazily derived
-//   from (master_seed, thread_id) via a splitmix64 mix, producing a distinct
-//   stream per thread. This prevents the pre-existing data race where the
-//   OpenMP PT temperature optimizer in `lattice.h` (see ~5200-5286) was
-//   calling the generator from parallel regions against a single global
-//   state.
+// Streams and seeding:
+//   * Every thread owns an independent stream (`lehman_state` is
+//     thread_local). The process holds one master seed.
+//   * `seed_lehman(master)` sets the master and reseeds the calling thread.
+//     Every other thread reseeds itself from (master, OpenMP thread id) on
+//     its next draw — a generation counter makes this happen even for
+//     threads that already drew from an older seed, so a run is
+//     reproducible for a fixed (seed, MPI layout, thread count).
+//   * `seed_lehman_from_rank(key)` mixes `key` (MPI rank, trial index, ...)
+//     into the master: call it from the main thread only.
+//   * `seed_lehman_thread(key)` seeds only the calling thread from
+//     (master, key), for per-replica streams inside parallel regions.
+//   * Seeds are expanded to 128 bits through splitmix64 and the first draws
+//     discarded, so nearby seeds give unrelated streams (the previous
+//     `state = seed << 1 | 1` made the first output exactly zero).
 extern thread_local unsigned __int128 lehman_state;
 
 void seed_lehman(unsigned __int128 seed);
 uint64_t lehman_next();
+// Uniform in [min, max) with 53 random bits.
 double random_double_lehman(double min, double max);
+// Uniform integer in [0, size) (Lemire multiply-shift); size must be > 0.
 int random_int_lehman(int size);
+size_t random_index_lehman(size_t size);
+// Standard normal deviate (Marsaglia polar method).
+double random_normal_lehman();
+// Uniform point on the sphere S^{n-1} of radius `radius`: Marsaglia (1972)
+// for n = 3, a normalised Gaussian vector otherwise. (Normalising a uniform
+// hypercube point, as was done for n != 3, is NOT uniform on the sphere and
+// biased every SU(3) Metropolis move.)
+void random_point_on_sphere(double* out, size_t n, double radius);
 
 // splitmix64 finalizer — used everywhere we need to derive a deterministic
 // stream from (master_seed, key) with good avalanche properties.
@@ -205,19 +220,15 @@ inline unsigned long long splitmix64(unsigned long long x) {
     return x ^ (x >> 31);
 }
 
-// Deterministically reseed the calling thread from the current master seed +
-// `key` (typically MPI rank, replica index, or another stream identifier).
-//
-// This is the **reproducible** alternative to seeding from
-// `std::chrono::system_clock::now()` inside parallel-tempering / temperature-
-// grid optimizers. Set the master seed once via `seed_lehman(master)` (or
-// leave it at its default), then call `seed_lehman_from_rank(rank)` from each
-// rank/thread before performing MC work.
-//
-// The same call also publishes a derived seed as the new master so that any
-// lazily-spawned worker thread inheriting `lehman_state == 0` will pick up a
-// distinct stream consistent with this rank.
+// Mix `key` (typically the MPI rank, trial or replica index) into the
+// process master seed and reseed the calling thread. Main thread only.
 void seed_lehman_from_rank(unsigned long long key);
+
+// Seed only the calling thread from (master, key); leaves global state alone.
+void seed_lehman_thread(unsigned long long key);
+
+// Current process master seed (for provenance output).
+unsigned long long lehman_master_seed_value();
 
 // Derive a 64-bit seed from the current master seed + key without modifying
 // any thread-local or master state. Useful for seeding e.g. a separate

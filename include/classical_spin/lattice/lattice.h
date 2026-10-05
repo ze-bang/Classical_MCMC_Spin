@@ -662,8 +662,8 @@ public:
         field_drive_freq = 0.0;
         field_drive_width = 1.0;
 
-        // Initialize random seed
-        seed_lehman(chrono::system_clock::now().time_since_epoch().count() * 2 + 1);
+        // The RNG is seeded once per process (config key `seed`, see
+        // spin_solver.cpp); constructing a lattice must not reseed it.
 
         // Compute boundary thickness (max neighbor offset in each dimension)
         boundary_thickness = {0, 0, 0};
@@ -1134,45 +1134,7 @@ public:
      * per proposed move.
      */
     void gen_random_spin_into(double* out, float spin_l) const {
-        if (spin_dim == 3) {
-            // Marsaglia (1972) method for uniform sampling on the
-            // 2-sphere: rejection-sample u1, u2 uniformly in the
-            // unit disk, then map to the sphere algebraically.
-            //
-            //   x = 2*u1 * sqrt(1 - s)
-            //   y = 2*u2 * sqrt(1 - s)
-            //   z = 1 - 2*s,    where s = u1^2 + u2^2 < 1
-            //
-            // Acceptance probability is pi/4 ~ 0.785, so on average
-            // 1.27 rejection iterations per call. This replaces the
-            // cos+sin+sqrt formulation: same distribution, same
-            // 2-RNG-calls-per-accept budget, but no transcendental
-            // calls. On the Metropolis hot loop this is a few ns
-            // per proposed move (~ 5-10% of the per-site work).
-            double u1, u2, s;
-            do {
-                u1 = 2.0 * random_double_lehman(0.0, 1.0) - 1.0;
-                u2 = 2.0 * random_double_lehman(0.0, 1.0) - 1.0;
-                s  = u1 * u1 + u2 * u2;
-            } while (s >= 1.0);
-            const double factor = 2.0 * std::sqrt(1.0 - s);
-            out[0] = double(spin_l) * factor * u1;
-            out[1] = double(spin_l) * factor * u2;
-            out[2] = double(spin_l) * (1.0 - 2.0 * s);
-            return;
-        }
-        // General n-sphere via gaussian-on-sphere fallback (rejection of
-        // near-zero norms to avoid biasing). spin_dim should be small.
-        double sum_sq = 0.0;
-        do {
-            sum_sq = 0.0;
-            for (size_t i = 0; i < spin_dim; ++i) {
-                out[i] = random_double_lehman(-1.0, 1.0);
-                sum_sq += out[i] * out[i];
-            }
-        } while (sum_sq < 1e-20);
-        const double inv_norm = double(spin_l) / std::sqrt(sum_sq);
-        for (size_t i = 0; i < spin_dim; ++i) out[i] *= inv_norm;
+        random_point_on_sphere(out, spin_dim, double(spin_l));
     }
 
     /**

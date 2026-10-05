@@ -53,6 +53,28 @@ void test_free_spins() {
     }
 }
 
+// ------------------------------------------- free spins on S^7 (spin_dim 8)
+void test_free_spins_s7() {
+    std::printf("\n== Free 8-component spins in a field (uniform measure on S^7) ==\n");
+    // E = -h.S on S^{n-1}: <cos t> = I_{n/2}(K) / I_{n/2-1}(K), K = beta h S.
+    const size_t n = 8;
+    const double h = 1.0, T = 0.6;
+    UnitCell uc(n, 1, {Eigen::Vector3d::Zero()},
+                {Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(0, 1, 0), Eigen::Vector3d(0, 0, 1)});
+    SpinVector f = SpinVector::Zero(n);
+    f(7) = h;
+    uc.set_field(f, 0);
+    Lattice lat(uc, 8, 8, 1, 1.0f);
+    const double K = h / T;
+    const double exact = -h * std::cyl_bessel_i(n / 2.0, K) / std::cyl_bessel_i(n / 2.0 - 1.0, K);
+    seed_lehman(808);
+    auto r = sample_energy_density(lat, 500, 8000, [&] { lat.metropolis(T); });
+    check_stat(r.mean, r.err, exact, "S^7 metropolis(uniform)", kSigma);
+    double sig = 0.5;
+    r = sample_energy_density(lat, 500, 8000, [&] { lat.metropolis(T, true, sig); });
+    check_stat(r.mean, r.err, exact, "S^7 metropolis(gaussian)", kSigma);
+}
+
 // ------------------------------------------------------------ Heisenberg ring
 void test_heisenberg_ring() {
     std::printf("\n== 1D Heisenberg AFM ring (N = 64) ==\n");
@@ -381,6 +403,7 @@ int main(int argc, char** argv) {
     set_threads(1);
     test_colouring();
     test_free_spins();
+    test_free_spins_s7();
     test_heisenberg_ring();
     test_cluster_ferromagnet();
     test_two_site();

@@ -13,28 +13,45 @@
 #include <omp.h>
 #endif
 
-// Per-thread Lehman state. Initialised to 0 so that `lehman_next` can detect
-// a freshly-spawned thread and lazily seed it (see `lazy_seed_thread` below).
+// Per-thread Lehmer state. A thread whose generation lags the global one
+// (fresh OpenMP worker, or a reseed happened since its last draw) derives
+// its stream from (master seed, thread id) on its next draw.
 thread_local unsigned __int128 lehman_state = 0;
 
-// Shared master seed. `seed_lehman` updates it; each thread derives its own
-// state from this master + its thread id on first use.
 namespace {
-std::atomic<unsigned long long> lehman_master_seed{1ULL};
+std::atomic<unsigned long long> lehman_master_seed{0x853C49E6748FEA9BULL};
+std::atomic<unsigned long long> lehman_generation{1};
+thread_local unsigned long long lehman_thread_generation = 0;
+thread_local bool lehman_has_spare_normal = false;
+thread_local double lehman_spare_normal = 0.0;
+
+constexpr unsigned __int128 kLehmerMultiplier =
+    (unsigned __int128)0x12e15e35b500f16eULL << 64 | 0x2e714eb2b37916a5ULL;
+
+// Expand a 64-bit key into a well-mixed odd 128-bit state and step past the
+// first outputs (whose high bits are weak for small states).
+inline unsigned __int128 expand_seed(unsigned long long key) {
+    const unsigned long long hi = splitmix64(key);
+    const unsigned long long lo = splitmix64(key ^ 0xD1B54A32D192ED03ULL) | 1ULL;
+    unsigned __int128 state = ((unsigned __int128)hi << 64) | lo;
+    for (int i = 0; i < 4; ++i) state *= kLehmerMultiplier;
+    return state;
+}
+
+inline void set_thread_state(unsigned __int128 state) {
+    lehman_state = state;
+    lehman_thread_generation = lehman_generation.load(std::memory_order_acquire);
+    lehman_has_spare_normal = false;
+}
 
 inline void lazy_seed_thread() {
 #ifdef _OPENMP
-    const int tid = omp_get_thread_num();
+    const unsigned long long tid = static_cast<unsigned long long>(omp_get_thread_num());
 #else
-    const int tid = 0;
+    const unsigned long long tid = 0;
 #endif
-    const unsigned long long master =
-        lehman_master_seed.load(std::memory_order_relaxed);
-    const unsigned long long mixed =
-        splitmix64(master + static_cast<unsigned long long>(tid) + 1ULL);
-    // Ensure the low bit is set so the state is never zero (the multiplier
-    // used below preserves odd states).
-    lehman_state = (static_cast<unsigned __int128>(mixed) << 1) | 1;
+    const unsigned long long master = lehman_master_seed.load(std::memory_order_relaxed);
+    set_thread_state(expand_seed(master ^ splitmix64(tid + 0x632BE59BD9B4E019ULL)));
 }
 } // namespace
 
@@ -186,52 +203,94 @@ SpinTensor3 transpose3D(const SpinTensor3& T, size_t N1, size_t N2, size_t N3) {
     return result;
 }
 
-// Random number generation
-//
-// `seed_lehman` publishes the seed to the shared master so that other threads
-// can derive their own streams, and also reseeds the calling thread directly
-// so that single-threaded users keep the previous deterministic behaviour.
+// Random number generation (see the header for the stream/seeding model).
 void seed_lehman(unsigned __int128 seed) {
     const unsigned long long master =
-        static_cast<unsigned long long>(seed == 0 ? 1 : seed);
+        static_cast<unsigned long long>(seed) ^ static_cast<unsigned long long>(seed >> 64);
     lehman_master_seed.store(master, std::memory_order_relaxed);
-    lehman_state = (seed << 1) | 1;
+    lehman_generation.fetch_add(1, std::memory_order_acq_rel);
+    set_thread_state(expand_seed(master));
 }
 
 uint64_t lehman_next() {
-    // Lazy per-thread seeding: threads spawned by OpenMP inherit
-    // `lehman_state == 0` and must pick up a distinct stream before use.
-    if (lehman_state == 0) {
+    if (__builtin_expect(lehman_thread_generation !=
+                         lehman_generation.load(std::memory_order_relaxed), 0)) {
         lazy_seed_thread();
     }
-    uint64_t result = lehman_state >> 64;
-    const unsigned __int128 mult =
-        (unsigned __int128)0x12e15e35b500f16e << 64 |
-        0x2e714eb2b37916a5;
-    lehman_state *= mult;
+    const uint64_t result = static_cast<uint64_t>(lehman_state >> 64);
+    lehman_state *= kLehmerMultiplier;
     return result;
 }
 
 double random_double_lehman(double min, double max) {
-    return min + (max - min) * lehman_next() / ((uint64_t)-1);
+    const double u = static_cast<double>(lehman_next() >> 11) * 0x1.0p-53;  // [0, 1)
+    return min + (max - min) * u;
+}
+
+size_t random_index_lehman(size_t size) {
+    return static_cast<size_t>(
+        (static_cast<unsigned __int128>(lehman_next()) * static_cast<uint64_t>(size)) >> 64);
 }
 
 int random_int_lehman(int size) {
-    return lehman_next() % size;
+    return static_cast<int>(random_index_lehman(static_cast<size_t>(size)));
+}
+
+double random_normal_lehman() {
+    if (lehman_has_spare_normal) {
+        lehman_has_spare_normal = false;
+        return lehman_spare_normal;
+    }
+    double u, v, s;
+    do {
+        u = random_double_lehman(-1.0, 1.0);
+        v = random_double_lehman(-1.0, 1.0);
+        s = u * u + v * v;
+    } while (s >= 1.0 || s == 0.0);
+    const double f = std::sqrt(-2.0 * std::log(s) / s);
+    lehman_spare_normal = v * f;
+    lehman_has_spare_normal = true;
+    return u * f;
+}
+
+void random_point_on_sphere(double* out, size_t n, double radius) {
+    if (n == 3) {
+        double u1, u2, s;
+        do {
+            u1 = random_double_lehman(-1.0, 1.0);
+            u2 = random_double_lehman(-1.0, 1.0);
+            s = u1 * u1 + u2 * u2;
+        } while (s >= 1.0);
+        const double f = 2.0 * std::sqrt(1.0 - s);
+        out[0] = radius * f * u1;
+        out[1] = radius * f * u2;
+        out[2] = radius * (1.0 - 2.0 * s);
+        return;
+    }
+    double sum_sq;
+    do {
+        sum_sq = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            out[i] = random_normal_lehman();
+            sum_sq += out[i] * out[i];
+        }
+    } while (sum_sq < 1e-300);
+    const double scale = radius / std::sqrt(sum_sq);
+    for (size_t i = 0; i < n; ++i) out[i] *= scale;
 }
 
 void seed_lehman_from_rank(unsigned long long key) {
-    const unsigned long long master =
-        lehman_master_seed.load(std::memory_order_relaxed);
-    // Two independent mixes: one becomes the new published master so future
-    // lazily-seeded threads get a stream tied to this rank, the other is the
-    // local stream for the calling thread. Both are odd to keep the
-    // multiplicative state nonzero and well-conditioned.
-    const unsigned long long new_master = splitmix64(master ^ (key * 0x9E3779B97F4A7C15ULL));
-    const unsigned long long thread_seed = splitmix64(new_master + 1ULL);
-    lehman_master_seed.store(new_master | 1ULL, std::memory_order_relaxed);
-    lehman_state =
-        (static_cast<unsigned __int128>(thread_seed) << 1) | 1;
+    const unsigned long long master = lehman_master_seed.load(std::memory_order_relaxed);
+    seed_lehman(splitmix64(master ^ splitmix64(key ^ 0x9E3779B97F4A7C15ULL)));
+}
+
+void seed_lehman_thread(unsigned long long key) {
+    const unsigned long long master = lehman_master_seed.load(std::memory_order_relaxed);
+    set_thread_state(expand_seed(master ^ splitmix64(key + 0xA0761D6478BD642FULL)));
+}
+
+unsigned long long lehman_master_seed_value() {
+    return lehman_master_seed.load(std::memory_order_relaxed);
 }
 
 unsigned long long derive_seed_from_master(unsigned long long key) {

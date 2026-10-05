@@ -218,8 +218,8 @@
             std::filesystem::create_directories(out_dir);
         }
         
-        // Initialize random seed
-        seed_lehman(chrono::system_clock::now().time_since_epoch().count() * 2 + 1);
+        // No reseeding here: the stream continues from the process seed so
+        // that a run is reproducible from its `seed`.
         
         double T = T_start;
         double sigma = 1000.0;

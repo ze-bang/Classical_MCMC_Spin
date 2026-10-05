@@ -595,6 +595,7 @@ add_optimized_executable(test_mixed_gpu_cpu_equivalence src/apps/test_mixed_gpu_
 # Boltzmann quadrature for tiny clusters, analytic precession / magnon
 # frequencies and known classical ground states.
 set(CLASSICAL_SPIN_PHYSICS_TESTS
+    test_rng
     test_mc_statistics
     test_mc_exact
     test_md_exact

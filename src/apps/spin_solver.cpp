@@ -25,6 +25,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <random>
 
 #ifdef CUDA_ENABLED
 #include <cuda_runtime.h>
@@ -73,6 +74,30 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    // Seed the process RNG once: a user seed, or a random one drawn on rank 0
+    // and broadcast. Every rank then derives its own stream from (seed, rank);
+    // nothing reseeds from the wall clock afterwards.
+    {
+        unsigned long long seed = config.seed;
+        if (seed == 0 && rank == 0) {
+            std::random_device rd;
+            seed = (static_cast<unsigned long long>(rd()) << 32) ^ rd();
+            if (seed == 0) seed = 1;
+        }
+        MPI_Bcast(&seed, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+        config.seed = seed;
+        seed_lehman(seed);
+        seed_lehman_from_rank(static_cast<unsigned long long>(rank));
+        if (rank == 0) {
+            cout << "RNG seed: " << seed << " (set `seed = " << seed
+                 << "` to reproduce this run)" << endl;
+            if (!config.output_dir.empty()) {
+                std::filesystem::create_directories(config.output_dir);
+                std::ofstream(config.output_dir + "/seed.txt") << seed << "\n";
+            }
+        }
+    }
+
     // Print configuration on rank 0
     if (rank == 0) {
         config.print();

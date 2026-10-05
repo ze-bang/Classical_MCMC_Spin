@@ -454,7 +454,8 @@ public:
         // equilibrium_SU3 will be sized after lattice is built (see below)
 
         // Initialize random seed
-        seed_lehman(chrono::system_clock::now().time_since_epoch().count() * 2 + 1);
+        // The RNG is seeded once per process (config key `seed`); constructing
+        // a lattice must not reseed it.
 
         // Build SU(2) sublattice
         build_sublattice(mixed_uc.SU2_cell, spins_SU2, site_positions_SU2, field_SU2,
@@ -537,52 +538,13 @@ public:
     }
 
     /**
-     * Generate random spin on n-sphere
+     * Uniformly random spin on the sphere of radius spin_l in R^spin_dim
+     * (see random_point_on_sphere).
      */
     SpinVector gen_random_spin(float spin_l, size_t spin_dim) {
         SpinVector spin(spin_dim);
-
-        if (spin_dim == 3) {
-            // Marsaglia (1972) method for uniform sampling on the 2-sphere:
-            // rejection-sample u1, u2 uniformly in the unit disk, then map
-            // to the sphere algebraically.
-            //
-            //   x = 2*u1 * sqrt(1 - s)
-            //   y = 2*u2 * sqrt(1 - s)
-            //   z = 1 - 2*s,    where s = u1^2 + u2^2 < 1
-            //
-            // Acceptance probability is pi/4 ~ 0.785, so on average ~2.55
-            // RNG draws per accepted spin. Replaces the cos+sin+sqrt
-            // formulation: same distribution, no transcendental calls.
-            // For SU(2) Metropolis this is a few ns per proposed move and
-            // is shared between both species (called every accept/reject).
-            double u1, u2, s;
-            do {
-                u1 = 2.0 * random_double_lehman(0.0, 1.0) - 1.0;
-                u2 = 2.0 * random_double_lehman(0.0, 1.0) - 1.0;
-                s  = u1 * u1 + u2 * u2;
-            } while (s >= 1.0);
-            const double factor = 2.0 * std::sqrt(1.0 - s);
-            spin(0) = factor * u1;
-            spin(1) = factor * u2;
-            spin(2) = 1.0 - 2.0 * s;
-        } else {
-            // General n-sphere sampling. For spin_dim==8 (SU(3)) the
-            // hypercube + reject-near-zero approach is fine; transcendental
-            // savings here would be negligible since the inner loop is d
-            // multiplies + 1 sqrt regardless.
-            double norm_sq = 0.0;
-            do {
-                norm_sq = 0.0;
-                for (size_t i = 0; i < spin_dim; ++i) {
-                    spin(i) = random_double_lehman(-1, 1);
-                    norm_sq += spin(i) * spin(i);
-                }
-            } while (norm_sq < 1e-10);
-            spin /= std::sqrt(norm_sq);
-        }
-
-        return spin * spin_l;
+        random_point_on_sphere(spin.data(), spin_dim, double(spin_l));
+        return spin;
     }
 
     /**

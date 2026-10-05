@@ -111,10 +111,9 @@ PhononLattice::PhononLattice(const UnitCell& uc, size_t d1, size_t d2, size_t d3
     }
     afm_sublattice_signs = uc.afm_sublattice_signs;
     
-    // Initialize RNG
-    auto seed_val = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    rng.seed(static_cast<unsigned int>(seed_val));
-    seed_lehman(seed_val * 2 + 1);
+    // Private engine for the Langevin noise, derived from the process seed
+    // (config key `seed`); the shared Lehmer stream is not reseeded here.
+    rng.seed(static_cast<std::mt19937::result_type>(derive_seed_from_master(0x50484F4EULL)));
     
     cout << "Initializing PhononLattice with dimensions: "
          << dim1 << " x " << dim2 << " x " << dim3 << endl;
