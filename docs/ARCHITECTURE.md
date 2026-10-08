@@ -66,9 +66,15 @@ integrators, the `mc::ReplicaModel` concept (`SpinLatticeReplica<L>`,
   is uniform on S^{n−1}. No algorithm reseeds from the wall clock: the only
   entropy source is the `seed` config key (0 = `random_device` on rank 0,
   broadcast and written to `output_dir/seed.txt`).
-* **Configuration** (`core/spin_config.{h,cpp}`). `key = value` files parsed
-  into typed fields plus a map of Hamiltonian parameters read by the unit-cell
-  builders; `validate()` rejects inconsistent input before any work starts.
+* **Configuration** (`core/spin_config.{h,cpp}`). One table of typed keys
+  (with aliases and deprecations) is the single entry point `SpinConfig::set`
+  for config files, parameter sweeps and `to_file`, so every key round-trips.
+  Hamiltonian parameters read by the builders are registered too: an unknown
+  key is an error with a nearest-key suggestion, numbers and booleans are
+  parsed strictly, and `validation_errors()` rejects inconsistent input (for
+  every point of a sweep) before any work starts.
+* **Spin files** (`io/spin_table.h`). One strict reader and full-precision
+  writer for spin configurations, shared by the three lattice classes.
 * **Unit cells** (`core/unitcell.h`, `src/core/unitcell_builders.cpp`).
   `UnitCell` holds positions, lattice vectors, frames, fields, on-site terms,
   bilinear and trilinear couplings and the SU(3) bracket coefficient;
@@ -94,8 +100,13 @@ integrators, the `mc::ReplicaModel` concept (`SpinLatticeReplica<L>`,
   after any change to `twist_matrices`, via `sync_twist_state`).
 * **Monte Carlo.** `local_update ∈ {Metropolis, Gaussian, HeatBath}` selects
   the single-site kernel used by `local_sweep(T)`: uniform or adaptive
-  small-angle Metropolis, or the exact heat bath for spin_dim 3
-  (Miyatake et al. 1986; `u = 1 + log1p(ξ expm1(−2b))/b`). Overrelaxation
+  small-angle Metropolis (one `propose_spin` kernel for the serial and
+  coloured sweeps), or the exact heat bath (Miyatake et al. 1986;
+  `u = 1 + log1p(ξ expm1(−2b))/b` for O(3) spins). 8-component spins of a
+  Gell-Mann-bracket cell are qutrit pure states and are sampled on CP² with
+  the Fubini–Study measure through the shared kernels of `core/su3_mc.h`
+  (Haar draws, small moves, exact heat bath, phase-randomising
+  overrelaxation, exact local ground state). Overrelaxation
   reflects about the field that does not depend on the spin itself and is
   Metropolis-corrected on sites with anisotropic on-site terms (exact at
   T > 0). Lattices with ≥ `parallel_sweep_min_sites` sites use the coloured
@@ -117,7 +128,9 @@ integrators, the `mc::ReplicaModel` concept (`SpinLatticeReplica<L>`,
 `MixedLattice` (`lattice/mixed_lattice.h`, `src/core/mixed_lattice_*.cpp`)
 holds an SU(2) and an SU(3) sublattice with mixed bilinear, trilinear and
 pulse-modulated couplings; its dynamics use the generic
-`dynamics/grid_integrate.h`. `PhononLattice` (`lattice/phonon_lattice.h`,
+`dynamics/grid_integrate.h`, and its Monte Carlo follows the same policies as
+Lattice (local-update kernels, exact overrelaxation, CP² sampling of the SU(3)
+sites via `core/su3_mc.h`, allocation-free sweeps). `PhononLattice` (`lattice/phonon_lattice.h`,
 `src/core/phonon_lattice.cpp`) couples honeycomb spins to zone-centre phonon
 coordinates (magnetoelastic tensors in `ncto_me_tensors.h`, parameters in
 `phonon_config.h`); with `mc_sample_lattice = 1` Monte Carlo samples the
@@ -173,20 +186,39 @@ geometric (norm-preserving; the only family that supports Langevin noise).
 
 ## Applications and I/O
 
-`spin_solver <config>` seeds the RNG once, builds the unit cell and lattice
-from the config, and dispatches to a runner (`runners_lattice.cpp`,
-`runners_mixed.cpp`, `runners_phonon.cpp`, `runners_parameter_sweep.cpp`).
-HDF5 writers (`io/hdf5_io.h`) produce one structured file per trajectory /
-delay scan / PT rank; PT additionally writes `pt_summary.txt` and
-`parallel_tempering_aggregated.h5`.
+`spin_solver <config>` parses and validates the config on rank 0 and
+broadcasts it, seeds the RNG once, writes `run_info.txt` (seed, MPI size,
+threads, git revision, build flags and the full resolved config, which reruns
+the job), and calls `run_simulation(config, comm)` (`src/apps/system_factory.cpp`):
+the one construction path (`make_unit_cell`, `make_lattice`,
+`make_mixed_lattice`, `make_ncto_lattice`) and mode dispatch, used by both
+`main` and the parameter sweep. Runners (`runners_lattice.cpp`,
+`runners_mixed.cpp`, `runners_phonon.cpp`, `runners_population_annealing.cpp`,
+`runners_parameter_sweep.cpp`) take a communicator and never touch
+`MPI_COMM_WORLD` (sweep points run on `MPI_COMM_SELF` or on equal rank
+groups); every rank writes the trials it ran and rank 0 gathers
+`trial_summary.txt`; an exception on any rank prints `[rank r] error: …` and
+aborts the job. HDF5 writers (`io/hdf5_io.h`) produce one structured file per
+trajectory / delay scan / PT rank; PT additionally writes `pt_summary.txt` and
+`parallel_tempering_aggregated.h5`, population annealing `pa_summary.txt`.
+
+Observables: the real-space correlation accumulator
+(`lattice/correlation_accumulator.h`) computes S(q) and dimer correlations on
+the commensurate grid by FFT (`core/fft.h`, any length) in O(N log N) per
+sample, from global-frame spins with all components kept, with jackknife
+error bars and an MPI reduction.
 
 Parallelism: MPI distributes replicas (PT), trials (SA, MD) and delay points
 (pump-probe / 2DCS, dynamic scheduling); OpenMP parallelises coloured sweeps
 and the RHS site loop (thresholds avoid fork/join overhead on small systems).
-The CUDA path implements the plain Landau–Lifshitz RHS; models it does not
-implement (damping, Langevin noise, trilinear terms, twisted boundaries, the
-legacy SU(3) bracket) fall back to the CPU with a warning
-(`Lattice::gpu_supports_model`).
+The CUDA path implements the plain Landau–Lifshitz RHS with fixed-step RK4
+or error-controlled embedded pairs (Dormand–Prince 5(4), Cash–Karp 5(4),
+Fehlberg 7(8); tableaux in `gpu/ode/rk_tableaux.h`, shared with a CPU order
+test); models it does not implement (damping, Langevin noise, trilinear
+terms, twisted boundaries, the legacy SU(3) bracket) fall back to the CPU with
+a warning (`Lattice::gpu_supports_model`). `gpu/device_select.h` binds each
+process to a device by node-local rank, or reports once that it runs on the
+CPU.
 
 ## Testing
 
@@ -204,11 +236,18 @@ independently of the code (label `physics`):
 | `test_pt_mpi`, `test_pt_ladder` | PT on 4 ranks vs Fisher / Langevin / Bessel results, DEO bookkeeping, round trips, reproducibility, ladder updates |
 | `test_mixed_md`, `test_mixed_pump_probe` | SU(3) convention, exact grids, pump-probe on 1 and 4 ranks |
 | `test_phonon_dynamics`, `test_phonon_mpi` | spin–phonon dynamics, Langevin bath, MPI 2DCS, replica exchange of the lattice sector |
+| `test_mixed_mc_exact`, `test_mixed_mc_kernels` | MixedLattice samplers vs simplex / Beta(1,2) / quadrature references on CP² and S²×CP², exact local ΔE, overrelaxation energy conservation, Casimirs, SA ground states |
 | `test_unitcell_geometry` | every builder's bonds vs geometric neighbour shells, validation |
+| `test_observables`, `test_observables_mpi` | FFT vs direct sums, Bragg peaks, Néel and spiral states, sum rules, dimer coverings, jackknife, MPI reduction |
+| `test_gpu_tableaux` | convergence orders of the GPU Runge–Kutta tables (run on the CPU) |
+| `test_config`, `test_config_spin_io` | strict parsing, unknown keys, round trip of every key, every example config, sweep grids, spin-file failure modes and round trips |
 
-`tests/smoke/run_smoke.sh <spin_solver>` runs the end-to-end configurations
-(SA, population annealing, PT, tuned PT, MD with four integrators, pump-probe, 2DCS, sweeps,
-TmFeO3, NCTO).
+`tests/smoke/run_smoke.sh <spin_solver>` (CTest `smoke_spin_solver`) runs
+end-to-end configurations of every mode (SA, population annealing, PT, tuned
+PT, MD with four integrators, pump-probe, 2DCS, sweeps, TmFeO3, NCTO), MPI
+driver cases and expected failures. CI (`.github/workflows/ci.yml`) runs the
+whole suite on a portable Release build and the physics tests under
+AddressSanitizer + UndefinedBehaviorSanitizer.
 
 ## Extending
 

@@ -1,105 +1,56 @@
-# Refactor backlog
+# Backlog
 
-This file tracks structural work that has been scoped but deliberately
-deferred out of a single refactor pass, usually because landing it safely
-needs its own PR / day-long effort. Items listed here came out of the
-Tier 1 and Tier 2 audit passes.
+Structural work that is scoped but not done. Each item says why it matters
+and what blocks it. Behaviour changes that did land are in
+[`MIGRATION.md`](MIGRATION.md); the architecture is described in
+[`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-## Deferred (Tier 2)
+## Code structure
 
-### Split `lattice.h` (~8.6 kLOC) and `mixed_lattice.h` (~7.8 kLOC)
+- **Split the lattice headers.** `lattice.h` (≈4.6 kLOC) and
+  `mixed_lattice.h` (≈4.2 kLOC) still declare the class and inline most
+  method bodies, so any change rebuilds every translation unit that includes
+  them. The kernel layer, the dynamics engine and the PT / PA engines are
+  already separate; what remains is moving the Monte Carlo sweeps, I/O and
+  observables into their own headers or `.cpp` files behind the class
+  declaration. Blocked only by effort: it touches every method and must land
+  in one change.
+- **Flat spin storage.** Spins are `std::vector<Eigen::VectorXd>` (one heap
+  allocation per site). The hot kernels already work on raw pointers
+  (`FlatView`, packed bond tables); a contiguous `n_sites × spin_dim` array
+  would remove the last indirection and simplify packing for MPI and HDF5.
+- **Header hygiene.** `simple_linear_alg.h`, `spin_config.h` and `unitcell.h`
+  contain `using namespace std;` at namespace scope, which leaks into every
+  includer. Mechanical to remove (clang-tidy
+  `google-global-names-in-headers`), but it touches thousands of lines.
+- **One FFT.** `core/fft.h` handles any length; `dynamics/structure_factor.h`,
+  `mc/statistics.h` and `phonon_lattice.cpp` still carry their own
+  power-of-two transforms.
 
-Both headers are god-objects: they declare the `Lattice` / `MixedLattice`
-class *and* inline every method body — Monte Carlo moves, MD integration,
-observables, HDF5 I/O, GPU plumbing, EwaldHamiltonian helpers, etc.
-Any change that touches one method causes the whole compilation unit to
-rebuild.
+## Algorithms
 
-Recommended split (per file):
+- **Geometric SU(3) integrators.** SU(3) spins (8-component `Lattice` and the
+  MixedLattice Tm sector) integrate with explicit Runge–Kutta methods, so the
+  norm and Casimirs drift at the integrator tolerance and Langevin noise is
+  unavailable for them. `core/su3_coherent_state.h` already contains the
+  coherent-state implicit-midpoint step (Dahlbom et al., PRB 106, 054423
+  (2022)); it needs to be wired into the integration engines as a method.
+- **Population annealing for MixedLattice and PhononLattice.** The engine
+  (`mc/population_annealing.h`) is generic; these classes need a
+  `PopulationWorker` adapter (random state, scalar observables) and a runner.
+- **Checkpoint / restart.** Long SA / PT / PA / MD runs cannot resume after a
+  walltime limit; the PT and PA engines already hold their whole state in
+  packed buffers, which would make a checkpoint format straightforward.
 
-1. `lattice_core.h` — class declaration, data members, constructors,
-   geometry helpers.
-2. `lattice_energy.h` — `total_energy`, per-site energy, gradient.
-3. `lattice_mc.h` — metropolis, overrelaxation, deterministic sweep,
-   `molecular_dynamics_*`.
-4. `lattice_observables.h` — magnetisation, structure factor, binning.
-5. `lattice_io.h` — `save_spin_config`, `save_positions`, HDF5 glue.
-6. `lattice_gpu.h` — `ensure_gpu_data_initialized` and friends (already
-   guards trilinear interactions as of Tier 1).
+## GPU
 
-Each split becomes a translation unit compiled once per executable
-instead of inlined at every include site. Expected compile-time win is
-large (a full build currently spends most of its time re-instantiating
-the two lattice headers from `spin_solver.cpp`).
+The CUDA path cannot be built in the CI container (no toolchain); its changes
+were compile-checked with clang against the CUDA headers only.
 
-The reason this is deferred: there are ~150 member functions, many with
-subtle cross-references (e.g. `molecular_dynamics_*` → `total_energy` →
-`get_Jx` on magnetoelastic params), and several template helpers in
-`mc_common.h` call methods across multiple groups. The split must be
-done in one coordinated change to keep CTest green, which is a PR of
-its own.
-
-### Decompose `spin_solver.cpp::main()` — **partially landed**
-
-The 4.9 kLOC `spin_solver.cpp` has been split into one TU per lattice
-family plus a dedicated TU for the parameter-sweep driver. `main()` is
-now a thin (~370-line) dispatcher on top of forward declarations in
-`src/apps/spin_solver_runners.h`:
-
-* `src/apps/runners_lattice.cpp`           — SU(2) `Lattice` runners
-* `src/apps/runners_phonon.cpp`            — `PhononLattice` runners
-* `src/apps/runners_strain.cpp`            — `StrainPhononLattice` runners
-  (incl. GNEB kinetic-barrier analysis and its file-local helpers)
-* `src/apps/runners_mixed.cpp`             — `MixedLattice` (SU(2)+SU(3))
-* `src/apps/runners_parameter_sweep.cpp`   — multi-lattice sweep driver
-* `src/apps/spin_solver.cpp`               — MPI lifetime + dispatch only
-
-Still deferred, but separately from the TU split:
-
-* Extracting CLI parsing into `spin_solver_cli.{h,cpp}` and replacing
-  the hand-rolled option loop with `CLI11`. Needs a smoke-test suite
-  for the CLI first (currently no test coverage).
-* Introducing a `run_<method>()` factory keyed by `SimulationType` so the
-  per-lattice 4-way `switch` blocks in `main` collapse to a single
-  dispatch. Low priority — the switches are small and easy to read.
-
-### Drop `using std::X` from public headers
-
-`lattice.h`, `mixed_lattice.h`, `phonon_lattice.h`,
-`strain_phonon_lattice.h`, and `mc_common.h` each contain a cluster of
-`using std::vector;` / `using std::string;` / `using std::cout;` /
-`using std::endl;` declarations at namespace scope. These leak names
-into the global namespace of every translation unit that includes them —
-standard header-hygiene violation, and a latent source of name-clash
-bugs the day someone adds their own `vector` symbol.
-
-Removing them is mechanical but invasive: every unqualified `vector<…>`,
-`string`, `cout << …` inside those headers (many thousands of sites)
-must be qualified. Easier to do with a clang-tidy pass
-(`readability-avoid-unused-using-decls`, `google-global-names-in-headers`)
-and a single build than in a hand edit. Deferred for now.
-
-## Not deferred — landed in Tier 2
-
-* Library no longer calls `MPI_Init` on behalf of the caller
-  (`include/classical_spin/mc/mc_common.h`): the routine now throws if
-  MPI is not initialised.
-* Kitaev rotation + local-frame bond matrices live in a single header
-  (`include/classical_spin/lattice/kitaev_bonds.h`) and both
-  `phonon_lattice.h` and `strain_phonon_lattice.h` delegate to it.
-* SLERP / geodesic-angle logic for the GNEB optimizers lives in
-  `include/classical_spin/core/gneb_math.h`. Both `gneb.cpp` and
-  `gneb_strain.cpp` now share the same implementation instead of three
-  copy-pasted copies.
-* Dead `include/classical_spin/core/simulation_config.h` has been
-  deleted (it was only listed in CMake, never included), which also
-  removes the duplicate `trim()` definition that would have become an
-  ODR violation if anyone ever included both config headers.
-* `spin_solver.cpp` was split from 4945 lines into a 408-line `main` TU
-  plus five per-lattice runner TUs. The shared private header
-  `src/apps/spin_solver_runners.h` carries the forward declarations so
-  the `run_*()` functions can live in separate compilation units and
-  build in parallel.
-* `util/readers/` is marked deprecated (see `util/readers/DEPRECATED.md`)
-  and `workflow/LSWT_fit/job_search.py` emits a `DeprecationWarning`
-  pointing callers at `job_search_refactored.py`.
+- Gilbert damping, Langevin noise, trilinear couplings and twisted boundaries
+  are not implemented on the device (those models run on the CPU, with a
+  warning); neither are the geometric integrators or Monte Carlo.
+- Drivers copy the full state to the host at every sample and reduce
+  magnetisations with atomics (non-deterministic sums).
+- The TmFeO3 delay-parallel 2DCS routine is hard-wired to `MPI_COMM_WORLD`;
+  on a sub-communicator (parameter sweeps) its trials run serially.
