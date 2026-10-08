@@ -1109,6 +1109,7 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         // Damping / ablation setup from the synchronized ground state,
         // identically on every rank.
         configure_dynamics(lattice, config, rank);
+        const double e0 = lattice.energy_density();
         if (rank == 0) {
             lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
         }
@@ -1186,8 +1187,8 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
             reuse_m0_for_m01
         );
         vector<TrialResult> mine;
-        if (rank == 0) mine.push_back({0, lattice.energy_density(), trial_dir + "/pump_probe_spectroscopy.h5"});
-        write_trial_summary(config, "mixed-lattice 2DCS, delay-parallel", mine, comm);
+        if (rank == 0) mine.push_back({0, e0, trial_dir + "/pump_probe_spectroscopy.h5"});
+        write_trial_summary(config, "mixed-lattice 2DCS, delay-parallel (energy = ground state)", mine, comm);
         
     } else {
         // Distribute trials across MPI ranks (same physics as the tau-parallel

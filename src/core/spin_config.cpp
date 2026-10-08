@@ -970,16 +970,15 @@ vector<string> SpinConfig::validation_errors() const {
                s == SimulationType::TWOD_COHERENT_SPECTROSCOPY;
     };
 
-    // Annealing: SA itself, and the ground-state preparation of the dynamics
-    // modes (skipped when a configuration is loaded, except the TmFeO3 2DCS
-    // runner, which always anneals). A schedule that never reaches T_end
+    // Annealing: SA itself (annealing_steps = 0 only evaluates the start), and
+    // the ground-state preparation of the dynamics modes, which runs the
+    // cooling schedule whenever no configuration is loaded (the TmFeO3 2DCS
+    // runner anneals a loaded one too). A schedule that never reaches T_end
     // would run forever.
-    const bool anneals =
-        run == SimulationType::SIMULATED_ANNEALING ||
-        (is_dynamics(run) && annealing_steps > 0 &&
-         (initial_spin_config.empty() ||
-          (system == SystemType::TMFEO3 && run == SimulationType::TWOD_COHERENT_SPECTROSCOPY)));
-    if (anneals && annealing_steps > 0) {
+    const bool mixed_2dcs = (system == SystemType::TMFEO3 && run == SimulationType::TWOD_COHERENT_SPECTROSCOPY);
+    const bool anneals = (run == SimulationType::SIMULATED_ANNEALING && annealing_steps > 0) ||
+                         (is_dynamics(run) && (initial_spin_config.empty() || mixed_2dcs));
+    if (anneals) {
         if (!(T_end > 0.0)) fail("T_end must be > 0 for annealing (use T_zero = true for a T = 0 quench)");
         if (T_start < T_end) fail("T_start must be >= T_end for annealing");
         if (!(cooling_rate > 0.0 && cooling_rate < 1.0)) fail("cooling_rate must lie in (0, 1)");
