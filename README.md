@@ -1,341 +1,123 @@
-# ClassicalSpin_Cpp
+# Classical MCMC Spin
 
-A high-performance C++/CUDA framework for simulating classical spin systems on various lattice geometries. This software package provides efficient implementations of Monte Carlo methods (simulated annealing, parallel tempering) and molecular dynamics simulations for studying magnetic materials.
+A C++20 / MPI / OpenMP (optional CUDA) engine for classical spin models:
+Monte Carlo sampling (simulated annealing, population annealing, parallel
+tempering), spin dynamics (Landau–Lifshitz–Gilbert, Langevin), and nonlinear
+pump-probe / 2D coherent spectroscopy, for O(3) spins and SU(3) coherent
+states on arbitrary lattices.
 
-## Features
+Every sampler and integrator is checked against results known independently
+of the code (closed-form statistical mechanics, quadrature, analytic
+precession and spin waves); see [Testing](#testing).
 
-- **Multiple Lattice Types**
-  - Honeycomb lattice (BCAO, Kitaev models)
-  - Pyrochlore lattice
-  - TmFeO3 mixed lattice (SU(2) + SU(3) spins)
-  - Extensible architecture for custom lattices
+## Methods
 
-- **Simulation Methods**
-  - Simulated Annealing (SA)
-  - Parallel Tempering (PT) with MPI
-  - Molecular Dynamics (MD)
-  - Pump-Probe spectroscopy
-  - 2D Coherent Spectroscopy (2DCS)
-  - N-dimensional parameter sweeps
+**Monte Carlo**
 
-- **High Performance**
-  - CUDA GPU acceleration for MD and spectroscopy
-  - MPI parallelization for PT and parameter sweeps
-  - OpenMP for shared-memory parallelism
-  - Optimized numerical routines with Eigen3
+| | |
+|---|---|
+| Local updates | uniform or adaptive-width Metropolis, exact heat bath (Miyatake et al. 1986), overrelaxation about the spin-independent field (Metropolis-corrected for anisotropic sites), Wolff / Swendsen–Wang embedded-Ising clusters with an exact filter; coloured OpenMP sweeps on large lattices |
+| Simulated annealing | validated geometric schedule ending exactly at `T_end`, Robbins–Monro proposal-width control, converged T = 0 descent (exact single-site minimisation) |
+| Population annealing | annealing of R replicas with Boltzmann resampling (Hukushima & Iba 2003; Machta 2010; Wang, Machta & Katzgraber 2015): equilibrium averages and the free energy at every temperature, family-jackknife errors, linear / geometric / ESS-adaptive schedules, MPI × OpenMP with layout-independent results |
+| Parallel tempering | deterministic even/odd (non-reversible) exchanges (Okabe et al. 2001; Syed et al. 2022), measured round trips and f(T), ladder tuning by equal rejection (`nrpt`) or flow feedback (`katzgraber`) |
+| Statistics | Wolff's Γ-method with automatic windowing, blocked jackknife for c, χ, Binder U4 |
 
-- **Flexible Configuration**
-  - Simple parameter file format
-  - Support for arbitrary Hamiltonian parameters
-  - Field scans and parameter sweeps
-  - HDF5 output for large datasets
+**Spin dynamics**
 
-## Requirements
+| | |
+|---|---|
+| Integrators | geometric: spherical midpoint (McLachlan, Modin & Verdier 2014), Depondt–Mertens, Suzuki–Trotter colour splitting (2nd / 4th order); adaptive dopri5 with dense output, Cash–Karp, Fehlberg 7(8), Bulirsch–Stoer; fixed-step RK |
+| Damping and noise | Gilbert damping in Landau–Lifshitz or Gilbert form; stochastic LLG with the fluctuation–dissipation noise strength (García-Palacios & Lázaro 1998) |
+| Drives | Gaussian × carrier pulses with per-sublattice polarisation, passed explicitly to the equations of motion |
+| Spectroscopy | pump-probe and 2DCS delay scans on exact time grids (OpenMP / MPI dynamic scheduling), dynamical structure factor S(q, ω) from thermal samples |
+| SU(3) | Gell-Mann coherent states, E = ⟨ψ|H|ψ⟩, Lie–Poisson dynamics (Zhang & Batista 2021); Monte Carlo on CP² with the Fubini–Study measure (uniform, small-move, exact heat-bath and phase-randomising overrelaxation moves) |
 
-- CMake 3.18+
-- C++20 compatible compiler (GCC 10+, Clang 12+)
-- CUDA Toolkit 11.0+ (for GPU support)
-- MPI implementation (OpenMPI, MPICH, etc.)
-- Eigen3 3.3+
-- Boost 1.65+
-- HDF5 with C++ bindings
-
-### Ubuntu/Debian Installation
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-    build-essential cmake \
-    libopenmpi-dev openmpi-bin \
-    libeigen3-dev \
-    libboost-all-dev \
-    libhdf5-dev libhdf5-cpp-103
-```
-
-For CUDA support, install the [NVIDIA CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit).
+**Models**: honeycomb (Kitaev–Γ–Γ′, BCAO), pyrochlore (XXZ, non-Kramers with
+J2/J3), triangular (anisotropic), TmFeO3 (Fe SU(2) + Tm SU(3) with mixed
+couplings), NCTO (honeycomb spins + zone-centre phonons), and any unit cell
+built with `UnitCell`.
 
 ## Building
 
-```bash
-# Clone the repository
-git clone https://github.com/ze-bang/ClassicalSpin_Cpp.git
-cd ClassicalSpin_Cpp
-
-# Create build directory
-mkdir build && cd build
-
-# Configure (Release build recommended)
-cmake .. -DCMAKE_BUILD_TYPE=Release
-
-# Build (use all available cores)
-cmake --build . -j$(nproc)
-```
-
-The main executable `spin_solver` will be created in the `build/` directory.
-
-### Build Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `CMAKE_BUILD_TYPE` | Release | Build type (Debug/Release) |
-| `CMAKE_CUDA_ARCHITECTURES` | 60;75;80;86;89 | Target GPU architectures |
-
-## Quick Start
-
-### Basic Usage
+Requirements: CMake ≥ 3.18, a C++20 compiler (GCC ≥ 10, Clang ≥ 12), MPI,
+Eigen ≥ 3.3, Boost (odeint), HDF5 with C++ bindings; optionally CUDA ≥ 11.
 
 ```bash
-# Run a simulation with a parameter file
-./build/spin_solver config.param
-
-# Run with MPI for parallel tempering
-mpirun -np 16 ./build/spin_solver example_configs/BCAO/pt_emily.param
-
-# Run parameter sweep
-mpirun -np 8 ./build/spin_solver example_configs/param_sweeps/parameter_sweep_example.param
+sudo apt-get install -y build-essential cmake ninja-build libopenmpi-dev openmpi-bin \
+    libeigen3-dev libboost-all-dev libhdf5-dev
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build -j4          # physics validation + MPI + end-to-end smoke tests
 ```
 
-### Example: BCAO Honeycomb Simulated Annealing
+| CMake option | Default | Meaning |
+|---|---|---|
+| `CMAKE_BUILD_TYPE` | `Release` | `Release` for production; `RelWithDebInfo` / `Debug` for development |
+| `ENABLE_CUDA` | `OFF` | CUDA spin-dynamics kernels (models the GPU path does not implement fall back to the CPU with a warning) |
+| `CMAKE_CUDA_ARCHITECTURES` | detected | GPU architectures to compile for |
+| `CLASSICAL_SPIN_ENABLE_WARNINGS` | `ON` | recommended warning flags |
+| `CLASSICAL_SPIN_WARNINGS_AS_ERRORS` | `OFF` | treat warnings as errors |
+| `BUILD_TESTING` | `ON` | build the test suite (`ctest`) |
+
+## Running
 
 ```bash
-./build/spin_solver example_configs/BCAO/sa_emily.param
+./build/spin_solver example_configs/Kitaev/sa_kitaev.param            # simulated annealing
+mpirun -np 8 ./build/spin_solver example_configs/Kitaev/pt_kitaev.param  # one PT replica per rank
+mpirun -np 4 ./build/spin_solver my_population_annealing.param        # population over all ranks
 ```
 
-### Example: Kitaev Model Molecular Dynamics
-
-```bash
-./build/spin_solver example_configs/Kitaev/md_kitaev.param
-```
-
-### Example: Pyrochlore Field Scan
-
-```bash
-mpirun -np 20 ./build/spin_solver example_configs/Pyrochlore/field_scan.param
-```
-
-## Configuration Files
-
-Configuration files use a simple `key = value` format:
+A configuration is a `key = value` file. A minimal population-annealing run:
 
 ```ini
-# System selection
-system = honeycomb_bcao
-simulation_mode = simulated_annealing
-
-# Lattice size (Lx, Ly, Lz)
-lattice_size = 24, 24, 1
-
-# Temperature range
-T_start = 10.0
-T_end = 0.001
-annealing_steps = 100000
-
-# Hamiltonian parameters
-J1xy = -7.6
-J1z = -1.2
-D = 0.1
-
-# Magnetic field
-field_strength = 0.0
-field_direction = 0, 1, 0
-g_factor = 4.8, 4.85, 2.5
-
-# Output
-output_dir = output
-save_observables = true
+system = honeycomb_kitaev
+lattice_size = 12, 12, 1
+K = -1.0
+Gamma = 0.25
+simulation_mode = population_annealing
+T_start = 2.0
+T_end = 0.02
+pa_population = 4096
+pa_sweeps = 10
+pa_schedule = adaptive      # or linear_beta (pa_temperatures points), geometric
+pa_target_ess = 0.9
+seed = 12345                # 0: random, written to output_dir/seed.txt
+output_dir = out_pa
 ```
 
-### Supported Systems
+| Mode (`simulation_mode`) | Main keys | Main outputs |
+|---|---|---|
+| `simulated_annealing` | `T_start`, `T_end`, `cooling_rate`, `annealing_steps`, `local_update`, `overrelaxation_rate`, `num_trials`, `T_zero` | `sample_k/` spins, energies |
+| `population_annealing` | `T_start`, `T_end`, `pa_population`, `pa_sweeps`, `pa_schedule`, `pa_temperatures`, `pa_target_ess` | `pa_summary.txt` (E, C, ln Z, errors, diagnostics per T), `pa_best_spins.txt` |
+| `parallel_tempering` | `T_start`, `T_end`, `pt_optimize_temperatures`, `pt_temperature_optimizer`, `pt_exchange_frequency`, `pt_equilibration_steps`, `pt_measurement_steps` | `pt_summary.txt`, `parallel_tempering_aggregated.h5`, `rank_k/` |
+| `molecular_dynamics` | `md_integrator`, `md_timestep`, `md_time_end`, `alpha_gilbert`, `damping_form`, `langevin_temperature`, `dssf_*` | trajectory / `dssf.h5` per sample |
+| `pump_probe`, `2dcs` | `pump_*`, `probe_*`, `tau_start`, `tau_end`, `tau_step` | `pump_probe_spectroscopy.h5` |
+| `parameter_sweep` | `sweep_parameters`, `sweep_starts`, `sweep_ends`, `sweep_steps`, `sweep_base_simulation` | one directory per point |
 
-| System | Key | Description |
-|--------|-----|-------------|
-| BCAO Honeycomb | `honeycomb_bcao` | Ba₃CoSb₂O₉ with anisotropic exchange |
-| Kitaev Honeycomb | `honeycomb_kitaev` | Kitaev model with K, Γ, Γ' interactions |
-| Pyrochlore | `pyrochlore` | Pyrochlore lattice with exchange anisotropy |
-| TmFeO3 | `tmfeo3` | Mixed Fe (SU2) + Tm (SU3) spins |
+More examples: [`example_configs/`](example_configs/README.md).
 
-### Simulation Modes
+**Reproducibility.** One `seed` determines every random number of a run (it
+is written to `output_dir/seed.txt` when drawn at random); there is no
+wall-clock seeding anywhere. Population annealing gives bitwise-identical
+results for any number of ranks and threads; the other modes are
+reproducible for a fixed seed, MPI layout and thread count.
 
-| Mode | Key | Description |
-|------|-----|-------------|
-| Simulated Annealing | `simulated_annealing` | Single replica cooling |
-| Parallel Tempering | `parallel_tempering` | Multi-replica with exchanges |
-| Molecular Dynamics | `molecular_dynamics` | Spin dynamics integration |
-| Pump-Probe | `pump_probe` | Magnetic pulse response |
-| 2D Spectroscopy | `2dcs` | Two-pulse coherent spectroscopy |
-| Parameter Sweep | `parameter_sweep` | Systematic parameter exploration |
+## Testing
 
-### Parallel Tempering
+`ctest` runs physics tests that compare kernels with exact results:
+free spins (Langevin function), the 1D Heisenberg ring (Fisher's u(T), c(T)
+and free energy), 2- and 3-site clusters against quadrature, free SU(3)
+vectors (Bessel ratios), triangular and pyrochlore ground states, spin
+precession, conservation laws, magnon dispersion, integrator orders,
+fluctuation–dissipation, parallel tempering and population annealing on
+several MPI ranks, neighbour shells of every unit-cell builder, and
+end-to-end runs of every simulation mode.
 
-One engine (`include/classical_spin/mc/parallel_tempering.h`) drives Lattice,
-MixedLattice and PhononLattice, one replica per MPI rank:
+## Documentation
 
-- **Deterministic even/odd (non-reversible) exchanges** [Okabe et al., CPL 335, 435 (2001);
-  Syed et al., JRSS-B 84, 321 (2022)]; both partners take the identical decision from a shared
-  counter-based random number. Replica labels travel with the configurations, so round trips,
-  the up-fraction f(T) and the acceptance of every edge are *measured* and reported.
-- Local moves follow `local_update` (heat bath, adaptive Gaussian or uniform Metropolis) with the
-  coloured OpenMP kernels on large lattices; the Gaussian width is adapted per temperature during
-  equilibration only and frozen while measuring.
-- Statistics: Wolff's Gamma method with automatic windowing for means, errors and τ_int; blocked
-  jackknife (blocks ≈ 8 τ_int) for c = Var(E)/(N T²), χ = βN(⟨m²⟩ − ⟨|m|⟩²) and the Binder cumulant.
-
-Temperature ladders are tuned with the replica chain itself:
-
-- **Default: `nrpt`** — equal-rejection schedule of Syed et al. (2022): the cumulative
-  communication barrier Λ(β) is interpolated monotonically and inverted at equal spacing over
-  rounds of doubling length. The run reports Λ and the replica count ≈ 2Λ+1 that would be optimal.
-- **`katzgraber`** — flow feedback of Katzgraber, Trebst, Huse, Troyer, J. Stat. Mech. P03018
-  (2006): density of temperatures ∝ sqrt(|df/dT| / ΔT) with f(T) measured from the replica labels.
-- `gradient` was removed (it maps to `nrpt` with a warning; see `docs/MIGRATION.md`).
-
-```ini
-pt_optimize_temperatures = true   # false: geometric ladder in [T_end, T_start]
-pt_temperature_optimizer = nrpt   # nrpt | katzgraber
-pt_optimization_warmup = 500      # warm-up MC steps
-pt_optimization_sweeps = 500      # steps of the first round (doubles per round, up to 16x)
-pt_optimization_iterations = 20   # maximum number of rounds
-pt_optimization_tolerance = 0.05  # stop when no temperature moves more than 5% of its spacing
-pt_exchange_frequency = 10        # MC steps between exchange rounds (1-10 recommended)
-pt_equilibration_steps = 0        # 0 = annealing_steps
-pt_measurement_steps = 0          # 0 = annealing_steps
-probe_rate = 10                   # MC steps between measurements
-```
-
-Outputs: `optimized_temperatures.txt` (tuned ladder), and per trial `pt_summary.txt` and
-`parallel_tempering_aggregated.h5` (per-temperature energy, specific heat, τ_int, order
-parameters with errors, edge acceptance, f(T), round trips, predicted round-trip rate) plus
-`rank_k/` files per temperature.
-
-## Example Configurations
-
-The `example_configs/` directory contains ready-to-use configurations:
-
-```
-example_configs/
-├── BCAO/           # Ba₃CoSb₂O₉ honeycomb configurations
-├── Kitaev/         # Kitaev honeycomb model
-├── Pyrochlore/     # Pyrochlore lattice
-├── TmFeO3/         # TmFeO3 mixed lattice
-└── param_sweeps/   # N-dimensional parameter sweeps
-```
-
-See [example_configs/README.md](example_configs/README.md) for detailed documentation.
-
-## Project Structure
-
-```
-ClassicalSpin_Cpp/
-├── CMakeLists.txt           # Build configuration
-├── README.md                 # This file
-├── LICENSE                   # MIT License
-├── include/
-│   └── classical_spin/
-│       ├── core/             # Core classes (SpinConfig, UnitCell, etc.)
-│       ├── lattice/          # Lattice implementations
-│       ├── gpu/              # CUDA kernels and GPU helpers
-│       └── io/               # HDF5 I/O utilities
-├── src/
-│   ├── apps/                 # Main executables
-│   │   └── spin_solver.cpp   # Main simulation driver
-│   ├── core/                 # Core implementations
-│   └── gpu/                  # CUDA implementations
-├── example_configs/          # Example parameter files
-├── util/                     # Utility scripts (Python readers, etc.)
-└── legacy/                   # Legacy run scripts (deprecated)
-```
-
-## Key Classes
-
-### SpinConfig
-Configuration structure that holds all simulation parameters. Parse from file with:
-```cpp
-SpinConfig config = SpinConfig::from_file("config.param");
-```
-
-### UnitCell / MixedUnitCell
-Defines the magnetic unit cell including:
-- Lattice vectors
-- Atom positions
-- Exchange interactions
-- Single-ion anisotropies
-- Magnetic fields
-
-### Lattice / MixedLattice
-Full simulation lattice built from unit cells. Provides:
-- Spin initialization
-- Energy calculations
-- Monte Carlo updates
-- Molecular dynamics integration
-- Observable measurements
-
-## Output Files
-
-Simulations produce output in the specified `output_dir`:
-
-```
-output/
-├── sample_0/
-│   ├── positions.txt       # Spin positions
-│   ├── spins.txt          # Final spin configuration
-│   ├── final_energy.txt   # Ground state energy
-│   ├── observables.txt    # Temperature-dependent observables
-│   └── trajectory.h5      # MD trajectory (HDF5)
-├── rank_0/
-│   └── parallel_tempering_data.h5  # PT replica data (HDF5)
-├── parallel_tempering_aggregated.h5  # PT temperature scan (HDF5)
-└── simulation_parameters.txt  # Copy of input parameters
-```
-
-**HDF5 Output:**  
-Parallel tempering simulations use structured HDF5 format to minimize file count on cluster filesystems. See [PARALLEL_TEMPERING_HDF5.md](PARALLEL_TEMPERING_HDF5.md) for detailed documentation.
-
-## GPU Acceleration
-
-Enable GPU acceleration for molecular dynamics:
-
-```ini
-use_gpu = true
-```
-
-Supported operations:
-- Spin dynamics integration (RK4, Dopri5)
-- Energy calculations
-- Pump-probe simulations
-- 2DCS spectroscopy
-
-## Python Utilities
-
-Analysis scripts are provided in `util/`:
-
-```python
-# Read honeycomb lattice results
-python util/readers_new/reader_honeycomb.py output_dir/ plot
-
-# Read pyrochlore results
-python util/readers_new/reader_pyrochlore.py output_dir/ analyze
-
-# Read and visualize parallel tempering HDF5 output
-python util/read_pt_hdf5.py output_parallel_tempering/
-```
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
-
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — layers, physical conventions, engines, extension points.
+- [`docs/MIGRATION.md`](docs/MIGRATION.md) — every behaviour change, with the switch that restores the old behaviour where one exists.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- [Eigen3](https://eigen.tuxfamily.org/) for linear algebra
-- [Thrust](https://thrust.github.io/) for GPU primitives
-- [HDF5](https://www.hdfgroup.org/solutions/hdf5/) for data storage
-- [Boost](https://www.boost.org/) for utilities
+MIT — see [LICENSE](LICENSE).
