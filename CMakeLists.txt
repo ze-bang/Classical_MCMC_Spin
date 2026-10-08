@@ -492,11 +492,33 @@ endfunction()
 # (split out of spin_solver.cpp for parallel compilation and readability).
 add_optimized_executable(spin_solver
     src/apps/spin_solver.cpp
+    src/apps/system_factory.cpp
     src/apps/runners_lattice.cpp
     src/apps/runners_phonon.cpp
     src/apps/runners_mixed.cpp
     src/apps/runners_parameter_sweep.cpp
 )
+
+# Provenance for spin_solver's run_info.txt: git describe ("unknown" outside a
+# git checkout), compiler, build type and flags. Regenerated at every build;
+# the header only changes (and spin_solver only recompiles) when they do.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _classical_spin_bt)
+string(JOIN " " _classical_spin_flags ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_classical_spin_bt}}
+       ${CXX_OPTIMIZATION_FLAGS})
+add_custom_target(classical_spin_build_info
+    COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DTEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/src/apps/build_info.h.in
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generated/classical_spin_build_info.h
+            "-DCLASSICAL_SPIN_CXX_COMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+            "-DCLASSICAL_SPIN_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+            "-DCLASSICAL_SPIN_CXX_FLAGS=${_classical_spin_flags}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/src/apps/build_info.cmake
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/classical_spin_build_info.h
+    COMMENT "Recording git describe / build flags for run_info.txt"
+    VERBATIM)
+add_dependencies(spin_solver classical_spin_build_info)
+target_include_directories(spin_solver PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # Symmetry + finite-difference regression tests for the NCTO E1
 # magnetoelastic Hamiltonian (PhononLattice). Verifies the form-factor

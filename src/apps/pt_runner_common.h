@@ -19,22 +19,6 @@
 
 namespace pt_runner {
 
-/**
- * Communicator of a PT run on `size` replicas. Callers that run independent
- * single-replica jobs pass size = 1 with the default MPI_COMM_WORLD (e.g. the
- * parameter sweep); they get MPI_COMM_SELF so the collective engine never
- * waits for ranks working on other jobs. Any other mismatch is an error.
- */
-inline MPI_Comm replica_comm(MPI_Comm comm, int size) {
-    int comm_size = 0;
-    MPI_Comm_size(comm, &comm_size);
-    if (comm_size == size) return comm;
-    if (size == 1) return MPI_COMM_SELF;
-    throw std::invalid_argument("parallel tempering: " + std::to_string(size) +
-                                " replicas requested on a communicator of " + std::to_string(comm_size) +
-                                " ranks");
-}
-
 /// Equilibration / measurement MC steps (0 in the config = annealing_steps).
 inline size_t equilibration_steps(const SpinConfig& c) {
     return c.pt_equilibration_steps ? c.pt_equilibration_steps : c.annealing_steps;

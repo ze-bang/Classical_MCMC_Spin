@@ -192,7 +192,14 @@ struct KeySpec {
     Getter get;
     string deprecated;        // non-empty: warning shown when an alias in `deprecated_aliases` is used
     vector<string> deprecated_aliases;
+    string no_effect;         // non-empty: the key is accepted but not used (warning shown)
 };
+
+/// Mark a key as accepted for compatibility but not read by any simulation.
+KeySpec unused(KeySpec k, const string& why) {
+    k.no_effect = why;
+    return k;
+}
 
 /// Spec for a plain field: parser and formatter chosen from the field type.
 template <class T>
@@ -302,7 +309,8 @@ vector<KeySpec> build_typed_key_table() {
     add(field("seed", &C::seed));
     add(field("local_update", &C::local_update));
     add(field("output_dir", &C::output_dir));
-    add(field("initial_step_size", &C::initial_step_size));
+    add(unused(field("initial_step_size", &C::initial_step_size),
+               "the Gaussian proposal width is adapted during equilibration"));
     add(field("use_twist_boundary", &C::use_twist_boundary, {"tbc"}));
     add(field("twist_sweep_count", &C::twist_sweep_count, {"tbc_sweeps"}));
     add(field("allow_unknown_keys", &C::allow_unknown_keys));
@@ -311,11 +319,12 @@ vector<KeySpec> build_typed_key_table() {
     add(field("T_start", &C::T_start, {"temperature_start"}));
     add(field("T_end", &C::T_end, {"temperature_end"}));
     add(field("annealing_steps", &C::annealing_steps));
-    add(field("equilibration_steps", &C::equilibration_steps));
+    add(unused(field("equilibration_steps", &C::equilibration_steps),
+               "use pt_equilibration_steps for parallel tempering"));
     add(field("cooling_rate", &C::cooling_rate));
     add(field("gaussian_move", &C::gaussian_move));
     add(field("save_observables", &C::save_observables));
-    add(field("deterministic", &C::deterministic));
+    add(unused(field("deterministic", &C::deterministic), "use T_zero / n_deterministics"));
     add(field("T_zero", &C::T_zero));
     add(field("n_deterministics", &C::n_deterministics));
     add(field("adiabatic_phonons", &C::adiabatic_phonons));
@@ -349,7 +358,8 @@ vector<KeySpec> build_typed_key_table() {
     add(field("use_gpu", &C::use_gpu, {"gpu"}));
 
     // --- Parallel tempering -----------------------------------------------
-    add(field("num_replicas", &C::num_replicas));
+    add(unused(field("num_replicas", &C::num_replicas),
+               "parallel tempering runs one replica per MPI rank (pt_ranks_per_point in sweeps)"));
     {
         KeySpec k = field("pt_exchange_frequency", &C::pt_exchange_frequency, {"pt_sweeps_per_exchange"});
         // pt_sweeps_per_exchange was parsed but never read; it is now an alias.
@@ -393,7 +403,8 @@ vector<KeySpec> build_typed_key_table() {
     add(field("pt_n_bond_types", &C::pt_n_bond_types));
     add(field("pt_optimize_temperatures", &C::pt_optimize_temperatures));
     add(field("pt_temperature_optimizer", &C::pt_temperature_optimizer));
-    add(field("pt_target_acceptance", &C::pt_target_acceptance));
+    add(unused(field("pt_target_acceptance", &C::pt_target_acceptance),
+               "the ladder tuners equalise the swap rejection instead"));
     add(field("pt_optimization_warmup", &C::pt_optimization_warmup));
     add(field("pt_optimization_sweeps", &C::pt_optimization_sweeps));
     add(field("pt_optimization_iterations", &C::pt_optimization_iterations));
@@ -484,7 +495,7 @@ vector<KeySpec> build_typed_key_table() {
     add(field("plaquette_j7_disorder_config", &C::plaquette_j7_disorder_config));
     add(field("use_ferromagnetic_init", &C::use_ferromagnetic_init));
     add(field("ferromagnetic_direction", &C::ferromagnetic_direction));
-    add(field("use_mpi", &C::use_mpi));
+    add(unused(field("use_mpi", &C::use_mpi), "spin_solver always runs under MPI"));
 
     // --- GNEB / strain -------------------------------------------------------
     add(field("gneb_n_images", &C::gneb_n_images));
@@ -772,6 +783,9 @@ SpinConfig SpinConfig::from_string(const string& text, const string& source, boo
                     if (deprecated && verbose)
                         cerr << "Warning: " << source << ":" << line_num << ": '" << key << "' is deprecated; "
                              << spec.deprecated << endl;
+                    if (!spec.no_effect.empty() && verbose)
+                        cerr << "Warning: " << source << ":" << line_num << ": '" << key << "' has no effect ("
+                             << spec.no_effect << ")" << endl;
                 }
                 const auto [pos, fresh] = first_line.emplace(canonical, line_num);
                 if (!fresh && verbose)

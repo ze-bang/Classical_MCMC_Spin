@@ -658,3 +658,113 @@ reloaded with |S| errors of ~1e-6 (non-stationary "ground states").
 file uses the round-off tolerant delay count of `dynamics::delay_grid` (shared
 helper `hdf5_delay_count`); it truncated `|tau_end - tau_start| / tau_step`,
 so 0 → 0.3 in steps of 0.1 recorded 3 delays while 4 were written.
+
+## Parameter sweeps: typed keys, validated points, one construction path
+
+**What changed.** Each sweep point is the base configuration with the swept
+values applied through `SpinConfig::set` (printed with `%.17g`), so typed keys
+(`pump_amplitude`, `probe_time`, `T_start`, `md_*`, `tau_*`, `annealing_steps`,
+...) are swept like Hamiltonian keys. Every point is validated before anything
+runs (e.g. a sweep that reaches `T_end = 0` is rejected up front), writes its
+own `run_info.txt`, and is built and run by `run_simulation()` — the same
+factory (`make_unit_cell`, `make_lattice`, `make_mixed_lattice`,
+`make_ncto_lattice`) and mode dispatch as a direct run, so a one-point sweep
+reproduces the direct run bitwise (smoke-tested). Point directories keep their
+names (`<key>_<value in %e>`).
+
+**Why.** Sweeps only wrote the Hamiltonian map (5 of the 11 shipped sweep
+examples ran N identical simulations) and carried their own copies of the
+unit-cell switch and initial-state logic, which had drifted from `main`.
+
+## Parameter sweeps: grids built by index
+
+**What changed.** A sweep axis has `n = llround((end - start) / step) + 1`
+points `start + k * step`, so the endpoint is kept and no round-off
+accumulates. `step = 0`, a step pointing away from `end`, and a range that is
+not a whole number of steps (to 1e-6 steps) are errors. `start == end` is one
+point.
+
+**Why.** Repeated addition dropped the endpoint (0 → 2 step 0.1 gave 20
+points ending at 1.9000000000000006), `step = 0` looped until memory ran out,
+and a wrong-sign step silently gave no points.
+
+**Recover the old behaviour.** For a range that is not a whole number of
+steps, set `sweep_end` to the last point you want.
+
+## MPI: runners take a communicator; sweeps never deadlock
+
+**What changed.** Every runner takes the `MPI_Comm` it runs on (instead of
+rank/size integers) and uses no other communicator. Non-PT sweep points run
+on `MPI_COMM_SELF`, one rank per point; the only collective on the job
+communicator is the final barrier, reached once by every rank. PT sweep points
+run on equal-sized groups of `pt_ranks_per_point` ranks (auto: ranks / points,
+at least 2); ranks left over idle with a warning instead of joining the last
+group (unequal ladders), and fewer than 3 replicas per point prints a warning.
+The TmFeO3 delay-parallel 2DCS (whose library routine runs on
+`MPI_COMM_WORLD`) is used only when the communicator spans the job; on a
+sub-communicator the trials run serially. Mixed-runner input errors throw
+(reported with the rank) instead of calling `MPI_Abort` from rank 0's checks.
+`spin_solver` initialises MPI with `MPI_THREAD_FUNNELED`.
+
+**Why.** Single-rank sweep points still ended in `MPI_Barrier(MPI_COMM_WORLD)`
+(MD, pump-probe, 2DCS, NCTO and TmFeO3 runners), so whenever the point count
+was not a multiple of the rank count some ranks waited forever.
+
+## spin_solver: error reporting and exit status
+
+**What changed.** Rank 0 reads the configuration and broadcasts its text, so
+every rank parses identical input; parse and validation errors are reported
+once and exit with status 1. During the run, an exception on any rank prints
+`[rank r] error: ...` and calls `MPI_Abort(MPI_COMM_WORLD, 1)` (it used to call
+`MPI_Finalize` on that rank while others waited in a collective, and only
+rank 0's message was printed). `H5::Exception` (not derived from
+`std::exception`) is caught and its function and detail message printed;
+HDF5's own error-stack dump is switched off. Unsupported system/mode
+combinations (NCTO + parallel tempering, `kinetic_barrier`, `custom`) are
+configuration errors (they printed to stderr and exited 0).
+"Simulation completed successfully" is printed only when everything ran.
+
+## Every trial starts from the configured initial state
+
+**What changed.** With `initial_spin_config` (or `use_ferromagnetic_init`)
+every trial of simulated annealing (Lattice, MixedLattice) and every parallel-
+tempering trial after the first start from that state; without one every trial
+starts from fresh random spins. MixedLattice MD/pump-probe/2DCS trials restore
+a ferromagnetic start too. `annealing_steps = 0` evaluates the starting state
+for every family (MixedLattice and PhononLattice used to run the cooling loop
+with zero sweeps).
+
+**Why.** Trials after the first (and, under MPI, the first trial of every rank
+but 0) silently started from random spins, MixedLattice SA never used the
+loaded configuration after trial 0, and PT trials > 0 discarded it.
+
+## Outputs: every rank writes its trials; trial_summary.txt; run_info.txt
+
+**What changed.**
+- Every rank writes the results of the trials it ran: `final_energy.txt`
+  (17 digits) and `spins_final*.txt` for simulated annealing (Lattice,
+  MixedLattice, PhononLattice); pump-probe trajectories (MixedLattice now at
+  17 digits). Rank 0 gathers one line per trial into
+  `output_dir/trial_summary.txt` (trial, owning rank, energy per site — final
+  for SA, of the initial state for the dynamics modes — and the result file,
+  plus mean/std/min).
+- Rank 0 writes `output_dir/run_info.txt`: comment lines with date, host,
+  seed, MPI size, OpenMP threads, `git describe` (generated at build time;
+  "unknown" outside a git checkout), compiler, build type and flags, followed
+  by the full resolved configuration — the file itself reruns the job
+  (`spin_solver output_dir/run_info.txt` reproduces the trial energies
+  bitwise; smoke-tested). Each sweep point writes its own. `seed.txt` is still
+  written.
+- MixedLattice MD writes `initial_spins_SU2.txt`/`_SU3.txt` (it wrote
+  `initial_spins.txt_SU2.txt`).
+
+**Why.** SA final energies and pump-probe trajectories of trials on ranks ≠ 0
+were computed and discarded (rank-0-only writes at 6 digits), and no run
+recorded the configuration, seed or code version that produced it.
+
+## Config keys that have no effect warn
+
+**What changed.** `equilibration_steps` (use `pt_equilibration_steps`),
+`num_replicas` (PT uses one replica per rank), `initial_step_size`,
+`deterministic`, `pt_target_acceptance` and `use_mpi` are accepted as before
+but print a warning: no simulation reads them.
