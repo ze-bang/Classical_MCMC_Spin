@@ -5,7 +5,12 @@
  * The model has every coupling class of the production Hamiltonian: Fe-Fe
  * exchange with DM, single-ion anisotropy (Ka, Kc), the Tm crystal field,
  * the Fe-Tm exchange K^- (mixed bilinear) and the Fe-Fe-Tm vertex W (mixed
- * trilinear, on-site in the Fe index). Reported per kernel: wall time per
+ * trilinear, on-site in the Fe index). Kernels: Metropolis with uniform /
+ * Gaussian proposals (natural and cell-interleaved order), heat bath,
+ * overrelaxation at T = 0 (sites with a non-constant self energy skipped) and
+ * at T (Metropolis-corrected), the T = 0 descent and the total energy (the
+ * heat bath and overrelaxation(T) are absent from the pre-overhaul code).
+ * Reported per kernel: wall time per
  * sweep and nanoseconds per site update (N = N_Fe + N_Tm sites per sweep),
  * best of `--repeats` timings after a warm-up of the same length.
  *
@@ -96,7 +101,9 @@ int main(int argc, char** argv) {
         {"metropolis_uniform",   [&] { lat.metropolis(T, false, 0.0); }},
         {"metropolis_gaussian",  [&] { lat.metropolis(T, true, 0.5); }},
         {"interleaved_gaussian", [&] { lat.metropolis_interleaved(T, true, 0.5); }},
+        {"heat_bath",            [&] { lat.heat_bath(T); }},
         {"overrelaxation",       [&] { lat.overrelaxation(); }},
+        {"overrelaxation_T",     [&] { lat.overrelaxation(T); }},
         {"deterministic_sweep",  [&] { lat.deterministic_sweep(); }},
         {"total_energy",         [&] { volatile double e = lat.total_energy(); (void)e; }},
     };

@@ -13,9 +13,9 @@
  *     - pyrochlore           : isotropic NN Heisenberg, 6 NN, frustrated 3D
  *
  *   MixedLattice (two species, SU(2) + SU(3), with mixed couplings):
- *     - tmfeo3-bilinear      : TmFeO3, only bilinear + mixed-bilinear (chi*=0)
- *     - tmfeo3-trilinear     : TmFeO3 with the SU(2)-SU(2)-SU(3) mixed
- *                              trilinear couplings on (chi2, chi5, chi7 != 0).
+ *     - tmfeo3-bilinear      : TmFeO3, Fe-Fe and Tm crystal field only
+ *     - tmfeo3-trilinear     : TmFeO3 with the Fe-Tm exchange K^- and the
+ *                              SU(2)-SU(2)-SU(3) mixed trilinear W on.
  *                              This is the kernel where O(d^3) trilinear
  *                              contraction dominates and is the primary target
  *                              of the trilinear-pre-contraction optimization.
@@ -401,18 +401,19 @@ unique_ptr<MixedLattice> build_tmfeo3_lat(int L, double /*T*/, bool with_triline
     cfg.set_param("e2",  3.97);
 
     if (with_trilinear) {
-        // Realistic chi values produce the SU(2)-SU(2)-SU(3) mixed trilinear
-        // couplings inside build_tmfeo3. Magnitudes are deliberately small so
-        // the model stays physical but the trilinear loops are exercised.
-        cfg.set_param("chi2x", 0.10);
-        cfg.set_param("chi2y", 0.05);
-        cfg.set_param("chi2z", 0.02);
-        cfg.set_param("chi5x", 0.07);
-        cfg.set_param("chi5y", 0.04);
-        cfg.set_param("chi5z", 0.03);
-        cfg.set_param("chi7x", 0.06);
-        cfg.set_param("chi7y", 0.05);
-        cfg.set_param("chi7z", 0.02);
+        // Fe-Tm exchange K^- (mixed bilinear) and the Fe-Fe-Tm vertex W
+        // (mixed trilinear, W(S_i, S_i, n_k)) read by build_tmfeo3. (The
+        // former chi* keys are not read by the builder, so this model used to
+        // be identical to tmfeo3-bilinear.) Small magnitudes keep the model
+        // physical while exercising the trilinear loops.
+        cfg.set_param("Kminus_2x", 0.12);
+        cfg.set_param("Kminus_5y", -0.08);
+        cfg.set_param("Kminus_7z", 0.05);
+        cfg.set_param("W3_xx", 0.05);
+        cfg.set_param("W8_zz", -0.04);
+        cfg.set_param("W1_xy", 0.03);
+        cfg.set_param("W4_xz", 0.02);
+        cfg.set_param("W6_yz", -0.025);
     }
 
     MixedUnitCell mixed_uc = build_tmfeo3(cfg);
