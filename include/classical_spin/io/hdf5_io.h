@@ -8,6 +8,8 @@
 #include <ctime>
 #include <sstream>
 #include <iomanip>
+#include <cmath>
+#include <limits>
 #include "classical_spin/core/simple_linear_alg.h"
 
 /**
@@ -46,9 +48,13 @@ inline H5::H5File create_hdf5_file_serial(const std::string& filename) {
         throw H5::FileIException("create_hdf5_file_serial", "Failed to create HDF5 file: " + filename);
     }
     
-    // Wrap the C file handle in C++ H5File object
-    // The H5File constructor takes ownership of the file_id
-    return H5::H5File(file_id);
+    // Wrap the C file handle in a C++ H5File object. H5File(hid_t) takes an
+    // ADDITIONAL reference to the id, so drop ours: otherwise close() leaves
+    // the file open (and flock-ed) until the process exits, and another
+    // process (e.g. the next MPI rank, or a reader) cannot open it.
+    H5::H5File file(file_id);
+    H5Idec_ref(file_id);
+    return file;
 }
 
 /**
@@ -766,8 +772,9 @@ public:
                       Temp_start, Temp_end, n_anneal, T_zero_quench, quench_sweeps,
                       pulse_field_direction, site_positions);
         
-        // Compute and store tau values
-        int n_tau = static_cast<int>(std::abs((tau_end - tau_start) / tau_step)) + 1;
+        // Compute and store tau values (round-off tolerant count: 0 -> 0.3 in
+        // steps of 0.1 is four delays; matches dynamics::delay_grid).
+        int n_tau = n_delays(tau_start, tau_end, tau_step);
         std::vector<double> tau_vals(n_tau);
         for (int i = 0; i < n_tau; ++i) {
             tau_vals[i] = tau_start + i * tau_step;
@@ -853,6 +860,11 @@ public:
     }
     
 private:
+    static int n_delays(double tau_start, double tau_end, double tau_step) {
+        const double r = std::abs((tau_end - tau_start) / tau_step);
+        return static_cast<int>(std::floor(r + 1e-9 + 8.0 * std::numeric_limits<double>::epsilon() * r)) + 1;
+    }
+
     void write_metadata(size_t lattice_size, size_t spin_dim, size_t n_atoms,
                        size_t dim1, size_t dim2, size_t dim3, float spin_length,
                        double pulse_amp, double pulse_width, double pulse_freq,
@@ -899,8 +911,7 @@ private:
         write_double_attr(metadata_group_, "tau_start", tau_start);
         write_double_attr(metadata_group_, "tau_end", tau_end);
         write_double_attr(metadata_group_, "tau_step", tau_step);
-        int n_tau = static_cast<int>(std::abs((tau_end - tau_start) / tau_step)) + 1;
-        write_int_attr(metadata_group_, "tau_steps", n_tau);
+        write_int_attr(metadata_group_, "tau_steps", n_delays(tau_start, tau_end, tau_step));
         
         // Ground state
         write_double_attr(metadata_group_, "ground_state_energy", ground_state_energy);

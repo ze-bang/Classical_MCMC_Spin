@@ -2,9 +2,20 @@
  * @file  pulse_chunking.h
  * @brief Pulse-window chunking helper for the 2DCS / pump-probe drivers.
  *
- * Shared between Lattice, MixedLattice, PhononLattice, and (future)
- * StrainPhononLattice. See docs/optimization_notes.tex Ingredient XV
- * (W3) for the full rationale; the executive summary is:
+ * WARNING (audit chunk-seam-drops-last-interval). Integrating the segments
+ * returned here one after the other with odeint::integrate_const is WRONG:
+ * integrate_const decides whether another interval fits with an ABSOLUTE
+ * time epsilon (2.2e-16), while segment endpoints T_start + k T_step and
+ * odeint's t0 + j T_step differ by ~1e-14, so the last interval of a segment
+ * is silently skipped. The next segment then restarts from a state one step
+ * old, with a delay-dependent lag that leaks into M_NL = M01 - M0 - M1.
+ * Drive a segment by its step COUNT (segment_steps() with integrate_n_steps
+ * or a fixed-step loop), or integrate the whole window once on the exact
+ * grid of dynamics/time_grid.h (dense output) as Lattice does now. Lattice
+ * no longer uses this helper; it is kept for MixedLattice / PhononLattice.
+ *
+ * See docs/optimization_notes.tex Ingredient XV (W3) for the original
+ * rationale; the executive summary is:
  *
  *   - The pulse envelope used by every *_pulse_drive() RHS is
  *     exp(−(Δt/(2σ))²) × cos(ω·Δt) (note the factor of 2 in the
@@ -51,8 +62,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstddef>
 #include <utility>
 #include <vector>
+
+#include "classical_spin/dynamics/drive.h"
 
 namespace classical_spin_pulse_chunking {
 
@@ -160,6 +174,12 @@ inline std::vector<Segment> build_pulse_segments(
     return segments;
 }
 
+/// Number of T_step steps in a segment, by count rather than by comparing
+/// times (see the warning at the top of this file).
+inline std::size_t segment_steps(const Segment& seg, double T_step) {
+    return static_cast<std::size_t>(std::llround((seg.t1 - seg.t0) / T_step));
+}
+
 /// Half-width of each pulse-active region as a multiple of the
 /// `field_drive_width_*` parameter σ.
 ///
@@ -170,7 +190,7 @@ inline std::vector<Segment> build_pulse_segments(
 /// kPulseWindowSigmas = 9 that is ≈ 1.6 × 10⁻⁹.  Audit B2: the old
 /// value of 6 only got us `exp(−9) ≈ 10⁻⁴`, which is far above what
 /// the comment claimed.
-constexpr double kPulseWindowSigmas = 9.0;
+constexpr double kPulseWindowSigmas = classical_spin::dynamics::kPulseSupportWidths;
 
 /// Multiplicative factor for the dt-hint in free segments. 20× is
 /// conservative — the controlled stepper still enforces the

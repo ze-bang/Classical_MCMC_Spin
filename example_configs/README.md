@@ -173,19 +173,53 @@ use_gpu = true
 - `cooling_rate`: Exponential cooling factor (0-1)
 - `overrelaxation_rate`: Frequency of overrelaxation moves
 
-**Molecular Dynamics:**
+**Molecular Dynamics (Lattice systems):**
 - `md_time_start`, `md_time_end`, `md_timestep`
-- `md_integrator`: `rk4` or `verlet`
-- `md_save_interval`: Frames between saves
+- `md_save_interval`: output every `md_save_interval * md_timestep` time units; samples
+  lie exactly on `md_time_start + k * dt_save` (also for adaptive integrators)
+- `md_integrator` (an unknown name is a configuration error):
+  - geometric, fixed step `md_timestep`, `|S_i|` exact — recommended for long runs:
+    `spherical_midpoint` (symplectic implicit midpoint, any Hamiltonian, Langevin),
+    `depondt` (explicit rotation Heun, Langevin),
+    `color_split` / `color_split4` (sublattice Suzuki-Trotter, 2nd/4th order, exact energy
+    conservation; no single-ion anisotropy, no damping or bath)
+  - fixed-step Runge-Kutta: `euler`, `rk2`, `rk4`, `adams_bashforth`, `adams_moulton`
+  - error-controlled (`md_timestep` is the initial step, tolerances `md_abs_tol`,
+    `md_rel_tol`): `dopri5` (default), `bulirsch_stoer`, `rk5` (Cash-Karp), `rk78`
+- `alpha_gilbert`: damping constant, default 0
+- `damping_form`: `landau_lifshitz` (default; λ = α) or `gilbert` (precession and
+  damping divided by 1 + α²)
+- `langevin_temperature`: stochastic LLG bath temperature (k_B = 1), default 0; needs
+  `alpha_gilbert > 0` and `spherical_midpoint` or `depondt`; samples the Gibbs state
+- Output `sample_<trial>/trajectory.h5`: `/trajectory/{times, magnetization_*, spins,
+  energy_density, max_norm_error}`, `/metadata/dt_save`; `final_spins.txt`
+- `initial_spin_config`: used as-is in every trial (no annealing)
+- Dynamical structure factor: `dssf_samples` (> 0 enables it), `dssf_q_points`
+  (`h,k,l` triples in reciprocal-lattice units), `dssf_temperature` (default `T_end`),
+  `dssf_t_equilibrate`, `dssf_t_decorrelate`, `dssf_alpha` (sampling thermostat),
+  `dssf_hann_window`. Each sample is a Langevin-equilibrated state evolved without
+  damping by `md_integrator` over `md_time_end - md_time_start`; output
+  `sample_<trial>/dssf.h5`: `/dssf/{q, omega, S_re, S_im, S_err, S_static_re,
+  S_static_im, classical_to_quantum}` (S^{ab}(q, ω) in the global frame, the
+  frequency sum rule ∫ S dω = S(q) holds exactly)
 - `use_gpu`: Enable CUDA acceleration
 
 **Pump-Probe/2DCS:**
 - `pump_direction`: Field direction vector(s). Can be:
   - Single 3-vector for all sublattices: `0,1,0`
   - Per-sublattice directions: `1,1,1,1,-1,-1,-1,1,-1,-1,-1,1` (4 sublattices × 3 components)
+  - Directions are global-frame vectors; the drive acting on the spin variables of
+    sublattice a is `F_a^T B` (F_a the sublattice frame, S_global = F_a S)
 - `pump_amplitude`, `pump_width`, `pump_frequency`
 - `pump_time`: Pump pulse center time
-- `tau_start`, `tau_end`, `tau_step`: Delay time scan
+- `probe_amplitude`, `probe_width`, `probe_frequency`, `probe_time`, `probe_direction`:
+  the probe of `pump_probe` runs (set `probe_amplitude = 0` for a pump-only run)
+- `tau_start`, `tau_end`, `tau_step`: Delay time scan (2DCS); every trajectory is sampled
+  on `md_time_start + k * md_timestep`, so `M_NL = M01 - M0 - M1` is defined sample by sample
+- `reuse_m0_for_m1`, `stationarity_tol`: synthesise M1 by time translation when the
+  ground state is stationary (relative torque below the tolerance), the delay is a
+  multiple of `md_timestep` and the probe window starts after `md_time_start`
+- `pump_probe_abs_tol`, `pump_probe_rel_tol`: tolerances of the error-controlled integrators
 
 ## Mapping Legacy to Unified
 

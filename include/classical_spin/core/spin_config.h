@@ -85,19 +85,44 @@ struct SpinConfig {
     double md_time_start = 0.0;
     double md_time_end = 100.0;
     double md_timestep = 0.01;
-    size_t md_save_interval = 1;  // Save every N steps
-    // Available integrators:
-    //   euler       - Explicit Euler (1st order, simple, inaccurate)
-    //   rk2/midpoint- Runge-Kutta 2nd order / modified midpoint
-    //   rk4         - Classic Runge-Kutta 4th order (good balance, fixed step)
-    //   rk5/rkck54  - Cash-Karp 5(4) adaptive (good for smooth problems)
-    //   rk54/rkf54  - alias for Cash-Karp 5(4) (Boost has no fehlberg54 stepper)
-    //   dopri5      - Dormand-Prince 5(4) adaptive (default, recommended)
-    //   rk78/rkf78  - Runge-Kutta-Fehlberg 7(8) (high accuracy, expensive)
-    //   bulirsch_stoer/bs - Bulirsch-Stoer (very high accuracy, expensive)
-    //   adams_bashforth/ab - Adams-Bashforth 5-step multistep (efficient for smooth problems)
-    //   adams_moulton/am   - Adams-Bashforth-Moulton predictor-corrector (more accurate multistep)
+    size_t md_save_interval = 1;  // MD output spacing dt_save = md_save_interval * md_timestep
+    // Integrators (Lattice family; parsed once, an unknown name is an error —
+    // see dynamics/ode_method.h). MD output is always on the uniform grid
+    // md_time_start + k dt_save; pump-probe/2DCS output on md_time_start + k md_timestep.
+    //   geometric, fixed step md_timestep, |S_i| exact (recommended for long runs):
+    //   spherical_midpoint - implicit midpoint on the sphere: symplectic, no energy
+    //                        drift, any Hamiltonian, Langevin-capable
+    //   depondt            - explicit rotation Heun, 2nd order, Langevin-capable
+    //   color_split(4)     - sublattice Suzuki-Trotter splitting (2nd/4th order), exact
+    //                        energy conservation; no single-ion anisotropy, alpha = T = 0
+    //   fixed-step Runge-Kutta / multistep (step md_timestep):
+    //   euler, rk2/midpoint, rk4, adams_bashforth/ab, adams_moulton/am
+    //   error-controlled (md_timestep = initial step; md_*_tol / pump_probe_*_tol):
+    //   dopri5 (default) and bulirsch_stoer/bs use dense output;
+    //   rk5/rkck54 (= rk54/rkf54, Cash-Karp 5(4)) and rk78/rkf78 step onto each sample.
+    //   rosenbrock4 / implicit_euler were removed (dense N x N Jacobian): use spherical_midpoint.
+    // Related Hamiltonian-style keys read by the dynamics runners:
+    //   alpha_gilbert        - damping (Landau-Lifshitz form, lambda = alpha), default 0
+    //   langevin_temperature - stochastic LLG bath temperature (k_B = 1), default 0;
+    //                          needs alpha_gilbert > 0 and spherical_midpoint/depondt
     string md_integrator = "dopri5";
+    // Normalisation of the damped equation of motion (Lattice): "landau_lifshitz"
+    // (dS/dt = S x B - (alpha/s) S x (S x B), default) or "gilbert" (the same
+    // divided by 1 + alpha^2).
+    string damping_form = "landau_lifshitz";
+    // Dynamical structure factor (Lattice, simulation_mode = molecular_dynamics):
+    // dssf_samples > 0 replaces the single trajectory per trial by S^{ab}(q, w)
+    // from dssf_samples thermal states at dssf_temperature (Langevin sampling with
+    // damping dssf_alpha), each evolved by md_integrator for md_time_end -
+    // md_time_start, sampled every md_save_interval * md_timestep; output
+    // sample_<trial>/dssf.h5 (see Lattice::dynamical_structure_factor).
+    size_t dssf_samples = 0;
+    vector<vector<double>> dssf_q_points;  // (h, k, l) in units of the reciprocal lattice vectors
+    double dssf_temperature = -1.0;        // < 0: use T_end
+    double dssf_t_equilibrate = 50.0;
+    double dssf_t_decorrelate = 10.0;
+    double dssf_alpha = 0.1;
+    bool dssf_hann_window = true;
     bool use_gpu = false;
 
     // ----------------------------------------------------------------
@@ -191,12 +216,14 @@ struct SpinConfig {
                                         //     Disabled automatically if the ground
                                         //     state is not stationary (max ‖dS/dt‖_∞
                                         //     > stationarity_tol).
-    double stationarity_tol = 1e-6;     // W1 guard: treat the loaded configuration
-                                        //     as a true equilibrium if every site
-                                        //     has |dS/dt| below this threshold.
+    double stationarity_tol = 1e-6;     // W1 guard: treat the configuration as an
+                                        //     equilibrium below this residual (Lattice:
+                                        //     relative torque max|S x H| / max(|S||H|);
+                                        //     MixedLattice/PhononLattice: max |dS/dt|).
     bool pulse_window_chunking = true;  // W3: split each integration around the
-                                        //     pulse window so the controlled stepper
-                                        //     can grow its dt in free regions.
+                                        //     pulse window (MixedLattice/PhononLattice;
+                                        //     ignored by Lattice, which integrates each
+                                        //     trajectory once on the exact time grid).
     int pump_probe_omp_threads = 0;     // W2: outer OpenMP threads for the τ loop
                                         //     in the non-MPI / single-rank entry
                                         //     point. 0 = use all available threads.

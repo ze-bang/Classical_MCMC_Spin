@@ -7,6 +7,8 @@
  */
 
 #include "classical_spin/core/spin_config.h"
+#include "classical_spin/dynamics/ode_method.h"
+#include "classical_spin/dynamics/time_grid.h"
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -139,6 +141,30 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             }
             else if (key == "md_integrator" || key == "integrator") {
                 config.md_integrator = value;
+            }
+            else if (key == "damping_form") {
+                config.damping_form = value;
+            }
+            else if (key == "dssf_samples") {
+                config.dssf_samples = stoull(value);
+            }
+            else if (key == "dssf_q_points") {
+                config.dssf_q_points = parse_vectorN_list(value, 3);
+            }
+            else if (key == "dssf_temperature") {
+                config.dssf_temperature = stod(value);
+            }
+            else if (key == "dssf_t_equilibrate") {
+                config.dssf_t_equilibrate = stod(value);
+            }
+            else if (key == "dssf_t_decorrelate") {
+                config.dssf_t_decorrelate = stod(value);
+            }
+            else if (key == "dssf_alpha") {
+                config.dssf_alpha = stod(value);
+            }
+            else if (key == "dssf_hann_window") {
+                config.dssf_hann_window = parse_bool(value);
             }
             else if (key == "md_abs_tol") {
                 config.md_abs_tol = stod(value);
@@ -549,6 +575,7 @@ void SpinConfig::to_file(const string& filename) const {
     file << "md_time_end = " << md_time_end << "\n";
     file << "md_timestep = " << md_timestep << "\n";
     file << "md_integrator = " << md_integrator << "\n";
+    file << "damping_form = " << damping_form << "\n";
     file << "use_gpu = " << (use_gpu ? "true" : "false") << "\n\n";
     
     file << "# Parallel Tempering Parameters\n";
@@ -625,7 +652,86 @@ bool SpinConfig::validate() const {
         cerr << "Error: lattice_size dimensions must be > 0\n";
         valid = false;
     }
-    
+
+    // Spin dynamics of the Lattice family (every system except the mixed
+    // TmFeO3 and the NCTO spin-phonon models, which have their own integrator
+    // tables): parse the integrator name once, so a typo fails here instead
+    // of silently running another method, and reject parameters the drivers
+    // would otherwise reject mid-run.
+    auto is_dynamics = [](SimulationType s) {
+        return s == SimulationType::MOLECULAR_DYNAMICS || s == SimulationType::PUMP_PROBE ||
+               s == SimulationType::TWOD_COHERENT_SPECTROSCOPY;
+    };
+    const bool lattice_family = (system != SystemType::TMFEO3 && system != SystemType::NCTO);
+    const SimulationType run = (simulation == SimulationType::PARAMETER_SWEEP) ? sweep_base_simulation : simulation;
+    if (lattice_family && is_dynamics(run)) {
+        try {
+            classical_spin::dynamics::parse_ode_method(md_integrator);
+        } catch (const std::invalid_argument& e) {
+            cerr << "Error: md_integrator: " << e.what() << "\n";
+            valid = false;
+        }
+        try {
+            classical_spin::dynamics::parse_damping_form(damping_form);
+        } catch (const std::invalid_argument& e) {
+            cerr << "Error: " << e.what() << "\n";
+            valid = false;
+        }
+        if (!(md_timestep > 0.0)) {
+            cerr << "Error: md_timestep must be > 0\n";
+            valid = false;
+        }
+        if (md_save_interval == 0) {
+            cerr << "Error: md_save_interval must be >= 1\n";
+            valid = false;
+        }
+        if (md_time_end < md_time_start) {
+            cerr << "Error: md_time_end must be >= md_time_start\n";
+            valid = false;
+        }
+        const double alpha = get_param("alpha_gilbert", 0.0);
+        const double T_bath = get_param("langevin_temperature", 0.0);
+        if (alpha < 0.0 || T_bath < 0.0) {
+            cerr << "Error: alpha_gilbert and langevin_temperature must be >= 0\n";
+            valid = false;
+        }
+        if (T_bath > 0.0 && alpha == 0.0) {
+            cerr << "Error: langevin_temperature > 0 needs alpha_gilbert > 0 (the bath acts through the damping)\n";
+            valid = false;
+        }
+        const bool stochastic_ok = classical_spin::dynamics::is_geometric_method(md_integrator) &&
+            classical_spin::dynamics::parse_geometric_method(md_integrator) !=
+                classical_spin::dynamics::Method::ColorSplit &&
+            classical_spin::dynamics::parse_geometric_method(md_integrator) !=
+                classical_spin::dynamics::Method::ColorSplit4;
+        if (T_bath > 0.0 && !stochastic_ok) {
+            cerr << "Error: langevin_temperature > 0 needs md_integrator = spherical_midpoint or depondt\n";
+            valid = false;
+        }
+        if (run == SimulationType::MOLECULAR_DYNAMICS && dssf_samples > 0) {
+            if (dssf_q_points.empty()) {
+                cerr << "Error: dssf_samples > 0 needs dssf_q_points\n";
+                valid = false;
+            }
+            if (!(dssf_alpha > 0.0) || dssf_t_equilibrate < 0.0 || dssf_t_decorrelate < 0.0) {
+                cerr << "Error: dssf_alpha must be > 0 and the dssf times >= 0\n";
+                valid = false;
+            }
+        }
+        if (run == SimulationType::TWOD_COHERENT_SPECTROSCOPY) {
+            try {
+                classical_spin::dynamics::delay_grid(tau_start, tau_end, tau_step, "tau scan");
+            } catch (const std::invalid_argument& e) {
+                cerr << "Error: " << e.what() << "\n";
+                valid = false;
+            }
+            if (T_bath > 0.0) {
+                cerr << "Error: 2DCS needs deterministic dynamics (langevin_temperature = 0)\n";
+                valid = false;
+            }
+        }
+    }
+
     return valid;
 }
 
