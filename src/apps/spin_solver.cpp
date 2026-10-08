@@ -151,6 +151,11 @@ int main(int argc, char** argv) {
                                        config.lattice_size[2],
                                        config.spin_length,
                                        config.spin_length_su3);
+            // Monte Carlo policy: local update kernel and SU(3) state space
+            // (CP^2 by default, legacy S^7 with su3_legacy_convention or
+            // su3_mc_manifold = sphere); set before the spins are initialised.
+            mixed_lattice.local_update = MixedLattice::parse_local_update(config.local_update);
+            mixed_lattice.set_su3_mc_manifold(config.su3_mc_manifold);
             
             // Initialize spins
             if (config.use_ferromagnetic_init) {

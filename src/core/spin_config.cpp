@@ -76,6 +76,9 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "local_update") {
                 config.local_update = value;
             }
+            else if (key == "su3_mc_manifold") {
+                config.su3_mc_manifold = value;
+            }
             else if (key == "output_dir") {
                 config.output_dir = value;
             }
@@ -575,6 +578,7 @@ void SpinConfig::to_file(const string& filename) const {
     file << "num_trials = " << num_trials << "\n";
     file << "seed = " << seed << "\n";
     file << "local_update = " << local_update << "\n";
+    if (!su3_mc_manifold.empty()) file << "su3_mc_manifold = " << su3_mc_manifold << "\n";
     file << "output_dir = " << output_dir << "\n\n";
     
     file << "# Temperature Parameters\n";
@@ -666,6 +670,12 @@ bool SpinConfig::validate() const {
     
     if (lattice_size[0] == 0 || lattice_size[1] == 0 || lattice_size[2] == 0) {
         cerr << "Error: lattice_size dimensions must be > 0\n";
+        valid = false;
+    }
+
+    if (!su3_mc_manifold.empty() && su3_mc_manifold != "auto" && su3_mc_manifold != "cp2" &&
+        su3_mc_manifold != "sphere") {
+        cerr << "Error: su3_mc_manifold must be cp2 or sphere (got '" << su3_mc_manifold << "')\n";
         valid = false;
     }
 

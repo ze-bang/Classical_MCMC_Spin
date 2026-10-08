@@ -253,6 +253,8 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                                           sweep_config.lattice_size[2],
                                           sweep_config.spin_length,
                                           sweep_config.spin_length_su3);
+                mixed_lattice.local_update = MixedLattice::parse_local_update(sweep_config.local_update);
+                mixed_lattice.set_su3_mc_manifold(sweep_config.su3_mc_manifold);
                 
                 // Initialize spins
                 if (sweep_config.use_ferromagnetic_init) {
@@ -427,6 +429,8 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                                       sweep_config.lattice_size[2],
                                       sweep_config.spin_length,
                                       sweep_config.spin_length_su3);
+            mixed_lattice.local_update = MixedLattice::parse_local_update(sweep_config.local_update);
+            mixed_lattice.set_su3_mc_manifold(sweep_config.su3_mc_manifold);
             
             // Initialize spins
             if (sweep_config.use_ferromagnetic_init) {
