@@ -2,7 +2,13 @@
 #define UNITCELL_REFACTORED_H
 
 #include "simple_linear_alg.h"
+#include <algorithm>
+#include <cmath>
 #include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <tuple>
 #include <vector>
 #include <map>
 #include <Eigen/Dense>
@@ -160,23 +166,29 @@ public:
     void set_field(const SpinVector& f, size_t index) {
         if (index >= N_atoms) throw out_of_range("Atom index out of range");
         if (f.size() != N) throw invalid_argument("Field dimension mismatch");
+        require_finite(f, "field of atom " + std::to_string(index));
         field[index] = f;
     }
     
     void set_bilinear_interaction(const SpinMatrix& J, size_t source, 
                                   size_t partner, const Vector3i& offset) {
-        if (J.rows() != N || J.cols() != N) {
-            throw invalid_argument("Bilinear matrix dimension mismatch");
-        }
-        bilinear_interaction.insert(make_pair(source, Bilinear(J, partner, offset)));
+        set_bilinear_interaction(J, source, partner, offset, -1);
     }
     
+    /**
+     * Declare the bond E = S_source(R)^T J S_partner(R + offset). Each bond is
+     * declared ONCE: the lattice adds the reverse bond with J^T itself, so
+     * declaring both directions double counts (validate() rejects that).
+     */
     void set_bilinear_interaction(const SpinMatrix& J, size_t source, 
                                   size_t partner, const Vector3i& offset,
                                   int bond_type) {
         if (J.rows() != N || J.cols() != N) {
             throw invalid_argument("Bilinear matrix dimension mismatch");
         }
+        check_atom(source, "bilinear source");
+        check_atom(partner, "bilinear partner");
+        require_finite(J, "bilinear coupling " + bond_label(source, partner, offset));
         bilinear_interaction.insert(make_pair(source, Bilinear(J, partner, offset, bond_type)));
     }
     
@@ -186,16 +198,30 @@ public:
         if (K.size() != N) {
             throw invalid_argument("Trilinear tensor dimension mismatch");
         }
+        for (const auto& slice : K) {
+            if (slice.rows() != N || slice.cols() != N)
+                throw invalid_argument("Trilinear tensor slice dimension mismatch (each slice must be N x N)");
+            require_finite(slice, "trilinear coupling on atom " + std::to_string(source));
+        }
+        check_atom(source, "trilinear source");
+        check_atom(partner1, "trilinear partner1");
+        check_atom(partner2, "trilinear partner2");
         trilinear_interaction.insert(make_pair(source, 
             Trilinear(K, partner1, partner2, offset1, offset2)));
     }
     
+    /**
+     * On-site term S^T A S. Only the symmetric part of A contributes to the
+     * energy (S^T A S = S^T A_s S with A_s = (A + A^T)/2), so A_s is stored:
+     * the local-field and ΔE kernels may then use 2 A S = dE/dS.
+     */
     void set_onsite_interaction(const SpinMatrix& A, size_t index) {
         if (index >= N_atoms) throw out_of_range("Atom index out of range");
         if (A.rows() != N || A.cols() != N) {
             throw invalid_argument("Onsite matrix dimension mismatch");
         }
-        onsite_interaction[index] = A;
+        require_finite(A, "on-site matrix of atom " + std::to_string(index));
+        onsite_interaction[index] = 0.5 * (A + A.transpose());
     }
     
     void set_sublattice_frame(const SpinMatrix& frame, size_t index) {
@@ -210,7 +236,163 @@ public:
         if (signs.size() != N_atoms) throw invalid_argument("AFM signs size must match N_atoms");
         afm_sublattice_signs = signs;
     }
-    
+
+    // ------------------------------------------------------------------
+    // Geometry
+    // ------------------------------------------------------------------
+
+    /// Real-space vector from atom `source` in the home cell to atom
+    /// `partner` in the cell displaced by `offset` (lattice coordinates).
+    Vector3d bond_vector(size_t source, size_t partner, const Vector3i& offset) const {
+        return double(offset[0]) * lattice_vectors[0] + double(offset[1]) * lattice_vectors[1] +
+               double(offset[2]) * lattice_vectors[2] + lattice_pos[partner] - lattice_pos[source];
+    }
+
+    /// One bond of a neighbour shell (see bonds_at_distance).
+    struct BondGeometry {
+        size_t source;
+        size_t partner;
+        Vector3i offset;
+        Vector3d vector;
+    };
+
+    /**
+     * Every bond (source, partner, offset) of length `distance` (to `tol`),
+     * each unordered bond listed exactly once — source < partner, or
+     * source == partner with the first nonzero offset component positive.
+     * That is precisely the list a builder declares, since the lattice adds
+     * the reverse of every declared bond itself. Generating shells this way
+     * (instead of hand-written offset tables) keeps builders from wiring a
+     * bond to the wrong neighbour.
+     */
+    vector<BondGeometry> bonds_at_distance(double distance, double tol = 1e-8) const {
+        if (!(distance > 0.0)) throw invalid_argument("bonds_at_distance: distance must be > 0");
+        // |n_d| <= (|d| + max |r_p - r_s|) |b_d|, b_d = rows of A^{-1} (A = [a1 a2 a3]).
+        double r_max = 0.0;
+        for (size_t a = 0; a < N_atoms; ++a)
+            for (size_t b = 0; b < N_atoms; ++b) r_max = std::max(r_max, (lattice_pos[b] - lattice_pos[a]).norm());
+        const Eigen::Matrix3d B = lattice_matrix().inverse();
+        int n_max[3];
+        for (int d = 0; d < 3; ++d)
+            n_max[d] = int(std::ceil((distance + tol + r_max) * B.row(d).norm())) + 1;
+        vector<BondGeometry> out;
+        for (size_t s = 0; s < N_atoms; ++s)
+            for (size_t p = s; p < N_atoms; ++p)
+                for (int i = -n_max[0]; i <= n_max[0]; ++i)
+                    for (int j = -n_max[1]; j <= n_max[1]; ++j)
+                        for (int k = -n_max[2]; k <= n_max[2]; ++k) {
+                            const Vector3i n(i, j, k);
+                            if (s == p && !lexicographically_positive(n)) continue;
+                            const Vector3d d = bond_vector(s, p, n);
+                            if (std::abs(d.norm() - distance) <= tol) out.push_back({s, p, n, d});
+                        }
+        return out;
+    }
+
+    /// Sorted distinct bond lengths of the first `n_shells` neighbour shells.
+    vector<double> neighbour_shells(size_t n_shells, double tol = 1e-8) const {
+        const Eigen::Matrix3d B = lattice_matrix().inverse();
+        vector<double> shells;
+        for (int reach = 1; reach <= 64; ++reach) {
+            vector<double> lengths;
+            for (size_t s = 0; s < N_atoms; ++s)
+                for (size_t p = 0; p < N_atoms; ++p)
+                    for (int i = -reach; i <= reach; ++i)
+                        for (int j = -reach; j <= reach; ++j)
+                            for (int k = -reach; k <= reach; ++k) {
+                                const double r = bond_vector(s, p, Vector3i(i, j, k)).norm();
+                                if (r > tol) lengths.push_back(r);
+                            }
+            std::sort(lengths.begin(), lengths.end());
+            shells.clear();
+            for (double r : lengths)
+                if (shells.empty() || r - shells.back() > tol) shells.push_back(r);
+            // Complete once the search box holds a sphere beyond the last wanted shell
+            // (minus the largest intra-cell separation).
+            double r_max = 0.0;
+            for (size_t a = 0; a < N_atoms; ++a)
+                for (size_t b = 0; b < N_atoms; ++b) r_max = std::max(r_max, (lattice_pos[b] - lattice_pos[a]).norm());
+            double box = 1e300;
+            for (int d = 0; d < 3; ++d) box = std::min(box, double(reach) / B.row(d).norm());
+            if (shells.size() >= n_shells && shells[n_shells - 1] < box - r_max - 1e-12) break;
+        }
+        if (shells.size() > n_shells) shells.resize(n_shells);
+        return shells;
+    }
+
+    /// True if a lattice site (any atom, any cell) sits at real-space position r.
+    bool has_site_at(const Vector3d& r, double tol = 1e-8) const {
+        const Eigen::Matrix3d A = lattice_matrix();
+        const Eigen::Matrix3d B = A.inverse();
+        for (size_t a = 0; a < N_atoms; ++a) {
+            const Vector3d f = B * (r - lattice_pos[a]);
+            const Vector3d n = f.array().round().matrix();
+            if ((A * (f - n)).norm() <= tol) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Consistency check, called by the lattice constructor. Throws
+     * std::invalid_argument (std::out_of_range for indices) naming the
+     * offending entry: atom indices out of range, wrong matrix/vector sizes,
+     * non-finite entries, degenerate lattice vectors, and a bilinear bond
+     * declared again as its own reverse (the lattice adds every reverse bond
+     * with J^T, so declaring both directions silently doubles the coupling).
+     * Several terms on one bond in the SAME orientation are fine: they add.
+     */
+    void validate() const {
+        if (N == 0 || N_atoms == 0) throw invalid_argument("UnitCell: spin dimension and N_atoms must be >= 1");
+        if (lattice_pos.size() != N_atoms || lattice_vectors.size() != 3)
+            throw invalid_argument("UnitCell: need N_atoms positions and 3 lattice vectors");
+        if (!(std::abs(lattice_matrix().determinant()) > 1e-12))
+            throw invalid_argument("UnitCell: lattice vectors are linearly dependent");
+        if (field.size() != N_atoms || onsite_interaction.size() != N_atoms || sublattice_frames.size() != N_atoms)
+            throw invalid_argument("UnitCell: per-atom tables must have N_atoms entries");
+        for (size_t a = 0; a < N_atoms; ++a) {
+            const std::string atom = " of atom " + std::to_string(a);
+            require_finite(lattice_pos[a], "position" + atom);
+            if (size_t(field[a].size()) != N) throw invalid_argument("UnitCell: field" + atom + " has wrong size");
+            if (size_t(onsite_interaction[a].rows()) != N || size_t(onsite_interaction[a].cols()) != N)
+                throw invalid_argument("UnitCell: on-site matrix" + atom + " has wrong size");
+            require_finite(field[a], "field" + atom);
+            require_finite(onsite_interaction[a], "on-site matrix" + atom);
+        }
+        // Canonical unordered bond -> orientation it was first declared in.
+        std::map<std::tuple<size_t, size_t, int, int, int>, bool> seen;
+        for (const auto& [src, bi] : bilinear_interaction) {
+            if (src < 0) throw out_of_range("UnitCell: negative bilinear source index");
+            const size_t s = size_t(src);
+            check_atom(s, "bilinear source");
+            check_atom(bi.partner, "bilinear partner");
+            const std::string label = bond_label(s, bi.partner, bi.offset);
+            if (size_t(bi.interaction.rows()) != N || size_t(bi.interaction.cols()) != N)
+                throw invalid_argument("UnitCell: bilinear matrix " + label + " has wrong size");
+            require_finite(bi.interaction, "bilinear coupling " + label);
+            // Canonical orientation of the unordered bond.
+            size_t a = s, b = bi.partner;
+            Vector3i n = bi.offset;
+            const bool reversed = (a > b || (a == b && !lexicographically_positive(n)));
+            if (reversed) {
+                std::swap(a, b);
+                n = -n;
+            }
+            const auto [it, inserted] = seen.insert({{a, b, n[0], n[1], n[2]}, reversed});
+            if (!inserted && it->second != reversed)
+                throw invalid_argument("UnitCell: bilinear bond " + label +
+                                       " is also declared in the reverse direction; the lattice adds the "
+                                       "reverse bond (with J^T) itself, so declare each bond in one direction");
+        }
+        for (const auto& [src, tri] : trilinear_interaction) {
+            if (src < 0) throw out_of_range("UnitCell: negative trilinear source index");
+            check_atom(size_t(src), "trilinear source");
+            check_atom(tri.partner1, "trilinear partner1");
+            check_atom(tri.partner2, "trilinear partner2");
+            if (tri.interaction.size() != N)
+                throw invalid_argument("UnitCell: trilinear tensor on atom " + std::to_string(src) + " has wrong size");
+        }
+    }
+
     // Print method for debugging
     void print() const {
         cout << "--- UnitCell Information ---" << endl;
@@ -236,6 +418,36 @@ public:
         cout << "Trilinear Interactions: " << trilinear_interaction.size() << " total" << endl;
         cout << "--- End of UnitCell Information ---" << endl;
     }
+
+private:
+    Eigen::Matrix3d lattice_matrix() const {
+        Eigen::Matrix3d A;
+        for (int d = 0; d < 3; ++d) A.col(d) = lattice_vectors[d];
+        return A;
+    }
+
+    static bool lexicographically_positive(const Vector3i& n) {
+        for (int d = 0; d < 3; ++d)
+            if (n[d] != 0) return n[d] > 0;
+        return false;
+    }
+
+    void check_atom(size_t index, const char* what) const {
+        if (index >= N_atoms)
+            throw out_of_range(std::string("UnitCell: ") + what + " index " + std::to_string(index) +
+                               " out of range (N_atoms = " + std::to_string(N_atoms) + ")");
+    }
+
+    template<class M>
+    static void require_finite(const M& m, const std::string& what) {
+        if (!m.allFinite()) throw invalid_argument("UnitCell: " + what + " has non-finite entries");
+    }
+
+    static std::string bond_label(size_t s, size_t p, const Vector3i& n) {
+        std::ostringstream os;
+        os << s << " -> " << p << " offset (" << n[0] << "," << n[1] << "," << n[2] << ")";
+        return os.str();
+    }
 };
 
 // Mixed unit cell for systems with multiple spin types (e.g., TmFeO3 with Fe and Tm)
@@ -254,6 +466,9 @@ public:
     void set_mixed_trilinear(const SpinTensor3& K, size_t source,
                             size_t partner1, size_t partner2,
                             const Vector3i& offset1, const Vector3i& offset2) {
+        check_index(source, SU2_cell.N_atoms, "mixed trilinear source (SU2)");
+        check_index(partner1, SU2_cell.N_atoms, "mixed trilinear partner1 (SU2)");
+        check_index(partner2, SU3_cell.N_atoms, "mixed trilinear partner2 (SU3)");
         trilinear_SU2_SU3.insert(make_pair(source,
             MixedTrilinear(K, partner1, partner2, offset1, offset2)));
     }
@@ -262,6 +477,7 @@ public:
     // J is N_SU2 × N_SU3 matrix, offset = cell displacement from source to partner
     void set_mixed_bilinear(const SpinMatrix& J, size_t source,
                            size_t partner, const Vector3i& offset) {
+        check_mixed_bond(J, source, partner, "mixed bilinear");
         bilinear_SU2_SU3.insert(make_pair(source,
             MixedBilinear(J, partner, offset)));
     }
@@ -272,8 +488,27 @@ public:
     void set_mixed_bilinear_drive(const SpinMatrix& J, size_t source,
                                   size_t partner, const Vector3i& offset,
                                   int envelope) {
+        check_mixed_bond(J, source, partner, "mixed bilinear drive");
+        if (envelope != 0 && envelope != 1)
+            throw invalid_argument("mixed bilinear drive: envelope must be 0 (SU(3)/E) or 1 (SU(2)/B)");
         bilinear_drive_SU2_SU3.insert(make_pair(source,
             MixedBilinearDrive(J, partner, offset, envelope)));
+    }
+
+private:
+    static void check_index(size_t index, size_t n, const char* what) {
+        if (index >= n)
+            throw out_of_range(std::string("MixedUnitCell: ") + what + " index " + std::to_string(index) +
+                               " out of range (" + std::to_string(n) + " atoms)");
+    }
+
+    void check_mixed_bond(const SpinMatrix& J, size_t source, size_t partner, const char* what) const {
+        check_index(source, SU2_cell.N_atoms, what);
+        check_index(partner, SU3_cell.N_atoms, what);
+        if (size_t(J.rows()) != SU2_cell.N || size_t(J.cols()) != SU3_cell.N)
+            throw invalid_argument(std::string("MixedUnitCell: ") + what + " matrix must be N_SU2 x N_SU3 (" +
+                                   std::to_string(SU2_cell.N) + " x " + std::to_string(SU3_cell.N) + ")");
+        if (!J.allFinite()) throw invalid_argument(std::string("MixedUnitCell: ") + what + " has non-finite entries");
     }
 };
 

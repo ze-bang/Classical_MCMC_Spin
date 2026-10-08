@@ -600,6 +600,7 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_mc_exact
     test_md_exact
     test_sa_ground_state
+    test_unitcell_geometry
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)

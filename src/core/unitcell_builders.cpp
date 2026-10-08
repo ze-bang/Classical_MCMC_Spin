@@ -325,13 +325,16 @@ UnitCell build_pyrochlore(const SpinConfig& config) {
     atoms.set_bilinear_interaction(J, 1, 3, Eigen::Vector3i(0, 0, 0));
     atoms.set_bilinear_interaction(J, 2, 3, Eigen::Vector3i(0, 0, 0));
     
-    // Inter-tetrahedron interactions
+    // Inter-tetrahedron ("down") bonds: offset n with |n.a + r_j - r_i| = sqrt(2)/4,
+    // e.g. (2,3): a3 - a2 + r3 - r2 = (0, 1/4, -1/4). The (2,3) offset used to be
+    // (0,+1,-1), a bond of length 3 sqrt(2)/4 (third shell) instead of a nearest
+    // neighbour; tests/test_unitcell_geometry.cpp checks every bond length.
     atoms.set_bilinear_interaction(J, 0, 1, Eigen::Vector3i(1, 0, 0));
     atoms.set_bilinear_interaction(J, 0, 2, Eigen::Vector3i(0, 1, 0));
     atoms.set_bilinear_interaction(J, 0, 3, Eigen::Vector3i(0, 0, 1));
     atoms.set_bilinear_interaction(J, 1, 2, Eigen::Vector3i(-1, 1, 0));
     atoms.set_bilinear_interaction(J, 1, 3, Eigen::Vector3i(-1, 0, 1));
-    atoms.set_bilinear_interaction(J, 2, 3, Eigen::Vector3i(0, 1, -1));
+    atoms.set_bilinear_interaction(J, 2, 3, Eigen::Vector3i(0, -1, 1));
     
     // Build field vector
     Eigen::Vector3d field_global;
@@ -373,7 +376,9 @@ UnitCell build_pyrochlore_non_kramer(const SpinConfig& config) {
     const double Jpm = config.get_param("Jpm", 0.0);
     const double Jzz = config.get_param("Jzz", 1.0);
     const double Jpmpm = config.get_param("Jpmpm", 0.0);
-    const double J2 = config.get_param("J2", 0.0);  // Second nearest neighbor Heisenberg
+    const double J2 = config.get_param("J2", 0.0);    // second-neighbour Heisenberg
+    const double J3a = config.get_param("J3a", 0.0);  // third neighbour along a bond chain
+    const double J3b = config.get_param("J3b", 0.0);  // third neighbour across a hexagon
     const double h = config.field_strength;
     
     // Non-Kramers field response parameters (delta1 and delta2)
@@ -424,21 +429,45 @@ UnitCell build_pyrochlore_non_kramer(const SpinConfig& config) {
     atoms.set_bilinear_interaction(Jx, 1, 3, Eigen::Vector3i(0, 0, 0));
     atoms.set_bilinear_interaction(Jz, 2, 3, Eigen::Vector3i(0, 0, 0));
     
-    // Inter-tetrahedron interactions
+    // Inter-tetrahedron interactions (same offsets as build_pyrochlore; the
+    // (2,3) bond is a3 - a2, see there)
     atoms.set_bilinear_interaction(Jz, 0, 1, Eigen::Vector3i(1, 0, 0));
     atoms.set_bilinear_interaction(Jx, 0, 2, Eigen::Vector3i(0, 1, 0));
     atoms.set_bilinear_interaction(Jy, 0, 3, Eigen::Vector3i(0, 0, 1));
     atoms.set_bilinear_interaction(Jy, 1, 2, Eigen::Vector3i(-1, 1, 0));
     atoms.set_bilinear_interaction(Jx, 1, 3, Eigen::Vector3i(-1, 0, 1));
-    atoms.set_bilinear_interaction(Jz, 2, 3, Eigen::Vector3i(0, 1, -1));
+    atoms.set_bilinear_interaction(Jz, 2, 3, Eigen::Vector3i(0, -1, 1));
     
-    // Second nearest neighbor J2 Heisenberg interaction (same sublattice)
-    Eigen::Matrix3d J2_mat = Eigen::Matrix3d::Identity() * J2;
-    
-    for (int s = 0; s < 4; ++s) {
-        atoms.set_bilinear_interaction(J2_mat, s, s, Eigen::Vector3i(1, 0, 0));
-        atoms.set_bilinear_interaction(J2_mat, s, s, Eigen::Vector3i(0, 1, 0));
-        atoms.set_bilinear_interaction(J2_mat, s, s, Eigen::Vector3i(0, 0, 1));
+    // Further-neighbour Heisenberg couplings, generated from the geometry
+    // (r_NN = sqrt(2)/4 for these lattice vectors):
+    //   J2  : second shell, |d| = sqrt(3) r_NN, 12 neighbours on the OTHER
+    //         sublattices;
+    //   J3a : third shell along a bond chain (a site sits at the midpoint),
+    //         |d| = 2 r_NN, 6 neighbours;
+    //   J3b : third shell across a hexagon (no site at the midpoint), 6.
+    // `J2` used to couple each sublattice to itself at offsets a1, a2, a3 —
+    // third-shell bonds, J3a for sublattice 0 but J3b for the others, which
+    // breaks the cubic symmetry. pyrochlore_legacy_J2 = 1 restores it
+    // (docs/MIGRATION.md).
+    const double r_nn = std::sqrt(2.0) / 4.0;
+    if (config.get_param("pyrochlore_legacy_J2", 0.0) != 0.0) {
+        Eigen::Matrix3d J2_mat = Eigen::Matrix3d::Identity() * J2;
+        for (int s = 0; s < 4; ++s) {
+            atoms.set_bilinear_interaction(J2_mat, s, s, Eigen::Vector3i(1, 0, 0));
+            atoms.set_bilinear_interaction(J2_mat, s, s, Eigen::Vector3i(0, 1, 0));
+            atoms.set_bilinear_interaction(J2_mat, s, s, Eigen::Vector3i(0, 0, 1));
+        }
+    } else if (J2 != 0.0) {
+        for (const auto& b : atoms.bonds_at_distance(std::sqrt(3.0) * r_nn))
+            atoms.set_bilinear_interaction(J2 * Eigen::Matrix3d::Identity(), b.source, b.partner, b.offset);
+    }
+    if (J3a != 0.0 || J3b != 0.0) {
+        for (const auto& b : atoms.bonds_at_distance(2.0 * r_nn)) {
+            const bool chain = atoms.has_site_at(atoms.lattice_pos[b.source] + 0.5 * b.vector);
+            const double J3 = chain ? J3a : J3b;
+            if (J3 != 0.0)
+                atoms.set_bilinear_interaction(J3 * Eigen::Matrix3d::Identity(), b.source, b.partner, b.offset);
+        }
     }
     
     // Build field vector

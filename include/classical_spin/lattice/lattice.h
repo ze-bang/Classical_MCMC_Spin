@@ -629,13 +629,15 @@ public:
     }
 
     /// M(w) = R_2^{w_2} R_1^{w_1} R_0^{w_0} (R^{-1} = R^T): the rotation a
-    /// partner spin picks up when the bond crosses the boundaries w.
+    /// partner spin picks up when the bond crosses the boundaries w (|w_d| > 1
+    /// for bonds longer than the lattice extent along d).
     Eigen::Matrix3d twist_product(const array<int8_t, 3>& wrap) const {
         Eigen::Matrix3d M = Eigen::Matrix3d::Identity();
         for (size_t d = 0; d < 3; ++d) {
             if (wrap[d] == 0) continue;
             const Eigen::Matrix3d R = twist_matrices[d].topLeftCorner<3, 3>();
-            M = ((wrap[d] > 0) ? R : Eigen::Matrix3d(R.transpose())) * M;
+            const Eigen::Matrix3d Rw = (wrap[d] > 0) ? R : Eigen::Matrix3d(R.transpose());
+            for (int n = 0; n < std::abs(int(wrap[d])); ++n) M = Rw * M;
         }
         return M;
     }
@@ -684,6 +686,11 @@ public:
           dim3(dim3),
           spin_length(spin_l)
     {
+        if (dim1 == 0 || dim2 == 0 || dim3 == 0)
+            throw std::invalid_argument("Lattice: every lattice dimension must be >= 1");
+        if (!(spin_l > 0.0f) || !std::isfinite(spin_l))
+            throw std::invalid_argument("Lattice: spin_length must be positive and finite");
+        uc.validate();
         lattice_size = N_atoms * dim1 * dim2 * dim3;
         
         // Initialize arrays
@@ -737,6 +744,17 @@ public:
                 boundary_thickness[2] = std::max(boundary_thickness[2], size_t(std::abs(bi.offset[2])));
             }
         }
+        {
+            // A lattice no wider than 2|offset| along a bonded direction maps
+            // distinct bonds onto the same pair of sites (their couplings add).
+            // That is a valid periodic Hamiltonian, but rarely the intended one.
+            const array<size_t, 3> dims = {dim1, dim2, dim3};
+            for (size_t d = 0; d < 3; ++d)
+                if (boundary_thickness[d] > 0 && dims[d] < 2 * boundary_thickness[d] + 1)
+                    cout << "Warning: lattice extent " << dims[d] << " along a" << d + 1
+                         << " is below 2*" << boundary_thickness[d] << "+1; periodic images of distinct bonds "
+                         << "coincide (their couplings add)" << endl;
+        }
 
         // Build the lattice
         cout << "Initializing lattice with dimensions: " << dim1 << " x " << dim2 << " x " << dim3 << endl;
@@ -776,18 +794,9 @@ public:
                         auto bi_range = unit_cell.bilinear_interaction.equal_range(atom);
                         for (auto it = bi_range.first; it != bi_range.second; ++it) {
                             const auto& bi = it->second;
-                            int pi = i + bi.offset[0];
-                            int pj = j + bi.offset[1];
-                            int pk = k + bi.offset[2];
-                            
-                            if (pi < 0) pi += dim1;
-                            else if (pi >= (int)dim1) pi -= dim1;
-                            if (pj < 0) pj += dim2;
-                            else if (pj >= (int)dim2) pj -= dim2;
-                            if (pk < 0) pk += dim3;
-                            else if (pk >= (int)dim3) pk -= dim3;
-                            
-                            size_t partner_idx = flatten_index(pi, pj, pk, bi.partner);
+                            size_t partner_idx = flatten_index_periodic(int(i) + bi.offset[0],
+                                                                        int(j) + bi.offset[1],
+                                                                        int(k) + bi.offset[2], bi.partner);
                             bi_count[partner_idx]++;
                         }
                         
@@ -849,19 +858,18 @@ public:
                         for (auto it = bi_range.first; it != bi_range.second; ++it) {
                             const auto& bi = it->second;
                             
-                            // Compute partner site with periodic boundaries
-                            int pi = i + bi.offset[0];
-                            int pj = j + bi.offset[1];
-                            int pk = k + bi.offset[2];
-                            
-                            // Track wrapping for twist boundaries
+                            // Partner site with periodic boundaries; wrap[d] counts the
+                            // periods crossed (the twist the bond picks up).
                             array<int8_t, 3> wrap = {0, 0, 0};
-                            if (pi < 0) { pi += dim1; wrap[0] = -1; }
-                            else if (pi >= (int)dim1) { pi -= dim1; wrap[0] = +1; }
-                            if (pj < 0) { pj += dim2; wrap[1] = -1; }
-                            else if (pj >= (int)dim2) { pj -= dim2; wrap[1] = +1; }
-                            if (pk < 0) { pk += dim3; wrap[2] = -1; }
-                            else if (pk >= (int)dim3) { pk -= dim3; wrap[2] = +1; }
+                            int n_wraps[3];
+                            const size_t pi = wrap_coordinate(long(i) + bi.offset[0], dim1, n_wraps[0]);
+                            const size_t pj = wrap_coordinate(long(j) + bi.offset[1], dim2, n_wraps[1]);
+                            const size_t pk = wrap_coordinate(long(k) + bi.offset[2], dim3, n_wraps[2]);
+                            for (size_t d = 0; d < 3; ++d) {
+                                if (std::abs(n_wraps[d]) > 127)
+                                    throw std::invalid_argument("Lattice: bond offset exceeds 127 lattice periods");
+                                wrap[d] = static_cast<int8_t>(n_wraps[d]);
+                            }
                             
                             size_t partner_idx = flatten_index(pi, pj, pk, bi.partner);
 
@@ -870,7 +878,7 @@ public:
                             // term S^T J S: fold it into the on-site matrix so the
                             // energy, ΔE, local field and dynamics all count it once.
                             if (partner_idx == site_idx) {
-                                onsite_interaction[site_idx] += bi.interaction;
+                                onsite_interaction[site_idx] += 0.5 * (bi.interaction + bi.interaction.transpose());
                                 continue;
                             }
 
@@ -1171,15 +1179,26 @@ public:
     }
 
     /**
+     * Euclidean (floor) reduction of a cell coordinate onto [0, L); `n_wraps`
+     * receives the number of periods crossed (negative below 0). Correct for
+     * any |coord|: the previous single-step `coord ± L` returned an
+     * out-of-range index (a heap overflow in the constructor) for bonds longer
+     * than the lattice, e.g. the honeycomb J3 offset (1,-2,0) with L2 = 1.
+     */
+    static size_t wrap_coordinate(long coord, size_t L, int& n_wraps) {
+        const long l = long(L);
+        long q = coord / l, r = coord % l;
+        if (r < 0) { r += l; --q; }
+        n_wraps = int(q);
+        return size_t(r);
+    }
+
+    /**
      * Apply periodic boundary condition
      */
     size_t periodic_boundary(int coord, size_t dim_size) const {
-        if (coord < 0) {
-            return coord + dim_size;
-        } else if (coord >= (int)dim_size) {
-            return coord - dim_size;
-        }
-        return coord;
+        int n_wraps;
+        return wrap_coordinate(coord, dim_size, n_wraps);
     }
 
     /**
