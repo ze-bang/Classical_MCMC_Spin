@@ -768,3 +768,14 @@ recorded the configuration, seed or code version that produced it.
 `num_replicas` (PT uses one replica per rank), `initial_step_size`,
 `deterministic`, `pt_target_acceptance` and `use_mpi` are accepted as before
 but print a warning: no simulation reads them.
+
+## Smoke tests in CTest
+
+**What changed.** `tests/smoke/run_smoke.sh` is registered as
+`smoke_spin_solver` (label `smoke`, timeout 900 s) and covers, besides every
+simulation mode: uneven MPI sweeps of a typed key, PT sweep groups, a TmFeO3
+MD sweep, sweep point == direct run (Lattice and NCTO), loaded configurations
+in every trial (Lattice and TmFeO3), the `run_info.txt` rerun, and clean
+non-zero exits for a misspelt key, an unsupported mode, a missing seed file
+(under MPI) and a non-terminating schedule. Two MPI CTests run `spin_solver`
+directly (`mpi_sweep_uneven`, `mpi_runtime_error_aborts`).

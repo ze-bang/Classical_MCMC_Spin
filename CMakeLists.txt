@@ -706,7 +706,32 @@ if(BUILD_TESTING)
                              PASS_REGULAR_EXPRESSION "PhononLattice 2DCS completed"
                              ENVIRONMENT "OMP_NUM_THREADS=1"
                              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        # Parameter sweep with 3 points on 2 ranks (deadlocked on COMM_WORLD
+        # barriers inside the runners) over a typed key.
+        add_test(NAME mpi_sweep_uneven
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 --oversubscribe --allow-run-as-root
+                         $<TARGET_FILE:spin_solver> ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/sweep_uneven_mpi.param)
+        set_tests_properties(mpi_sweep_uneven PROPERTIES TIMEOUT 180 LABELS mpi
+                             PASS_REGULAR_EXPRESSION "Parameter sweep completed \\(3 points\\)"
+                             ENVIRONMENT "OMP_NUM_THREADS=1"
+                             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        # A failing run reports "[rank r] error: ..." and aborts every rank
+        # (instead of hanging, or continuing from random spins).
+        add_test(NAME mpi_runtime_error_aborts
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 --oversubscribe --allow-run-as-root
+                         $<TARGET_FILE:spin_solver> ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/missing_seed_mpi.param)
+        set_tests_properties(mpi_runtime_error_aborts PROPERTIES TIMEOUT 120 LABELS mpi
+                             PASS_REGULAR_EXPRESSION "\\[rank [0-9]+\\] error: .*no_such_seed_file"
+                             FAIL_REGULAR_EXPRESSION "completed successfully"
+                             ENVIRONMENT "OMP_NUM_THREADS=1"
+                             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endif()
+    # End-to-end smoke tests of every simulation mode, sweeps (uneven MPI
+    # splits, typed keys, PT groups), provenance and error exits.
+    add_test(NAME smoke_spin_solver
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/smoke/run_smoke.sh $<TARGET_FILE:spin_solver>)
+    set_tests_properties(smoke_spin_solver PROPERTIES TIMEOUT 900 LABELS smoke
+                         ENVIRONMENT "OMP_NUM_THREADS=1")
     add_test(NAME hdf5_pt_writer_smoke COMMAND test_hdf5_pt)
     set_tests_properties(hdf5_pt_writer_smoke PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
