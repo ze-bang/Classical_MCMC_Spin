@@ -8,8 +8,23 @@ else()
     project(ClassicalSpin_Cpp LANGUAGES CXX)
 endif()
 
-option(CLASSICAL_SPIN_ENABLE_WARNINGS "Enable recommended warning flags" ON)
+# Build options
+#   CLASSICAL_SPIN_NATIVE    Release flags tuned for the build host (-march=native
+#                            -mtune=native, LTO, fast FP contraction). OFF: portable
+#                            -O3 only (binaries run on any x86-64; CI uses OFF).
+#   CLASSICAL_SPIN_SANITIZE  AddressSanitizer + UndefinedBehaviorSanitizer on every
+#                            C++ target (use with CMAKE_BUILD_TYPE=Debug).
+#   CLASSICAL_SPIN_WARNINGS  -Wall -Wextra on the project's own code (dependencies
+#                            are SYSTEM includes), no blanket -Wno-* suppression.
+option(CLASSICAL_SPIN_NATIVE "Tune Release builds for the build host (-march=native)" ON)
+option(CLASSICAL_SPIN_SANITIZE "Build with -fsanitize=address,undefined" OFF)
+option(CLASSICAL_SPIN_WARNINGS "Compile project code with -Wall -Wextra" ON)
 option(CLASSICAL_SPIN_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+# Deprecated alias: -DCLASSICAL_SPIN_ENABLE_WARNINGS=OFF still turns warnings off.
+if(DEFINED CLASSICAL_SPIN_ENABLE_WARNINGS AND NOT CLASSICAL_SPIN_ENABLE_WARNINGS)
+    message(DEPRECATION "CLASSICAL_SPIN_ENABLE_WARNINGS is deprecated; use CLASSICAL_SPIN_WARNINGS")
+    set(CLASSICAL_SPIN_WARNINGS OFF)
+endif()
 
 # ============================================================================
 # PROJECT CONFIGURATION
@@ -171,58 +186,50 @@ if(NOT HDF5_FOUND)
     )
 endif()
 
+# HDF5 through imported targets (they carry include directories as SYSTEM and
+# the definitions); the variables of the manual fallback are wrapped in an
+# INTERFACE target of the same shape.
+if(TARGET hdf5::hdf5_cpp AND TARGET hdf5::hdf5)
+    set(CLASSICAL_SPIN_HDF5_TARGETS hdf5::hdf5_cpp hdf5::hdf5)
+else()
+    add_library(classical_spin_hdf5 INTERFACE)
+    target_include_directories(classical_spin_hdf5 SYSTEM INTERFACE ${HDF5_INCLUDE_DIRS})
+    target_link_libraries(classical_spin_hdf5 INTERFACE ${HDF5_CXX_LIBRARIES})
+    if(HDF5_DEFINITIONS)
+        target_compile_definitions(classical_spin_hdf5 INTERFACE ${HDF5_DEFINITIONS})
+    endif()
+    set(CLASSICAL_SPIN_HDF5_TARGETS classical_spin_hdf5)
+endif()
+
+# Boost is header-only here (odeint, uBLAS): link the imported headers target
+# so a Boost outside the default include path (-DBoost_ROOT=...) works.
+if(TARGET Boost::headers)
+    set(CLASSICAL_SPIN_BOOST_TARGETS Boost::headers)
+elseif(TARGET Boost::boost)
+    set(CLASSICAL_SPIN_BOOST_TARGETS Boost::boost)
+else()
+    set(CLASSICAL_SPIN_BOOST_TARGETS "")
+endif()
+
 # ============================================================================
 # COMPILER FLAGS
 # ============================================================================
 
-# Compiler warnings configuration
+# Compiler warnings configuration. Dependencies (Eigen, Boost, HDF5, MPI) come
+# in through imported targets, i.e. as SYSTEM include directories, so these
+# flags only report on the project's own code.
 set(CLASSICAL_SPIN_CXX_WARNING_FLAGS "")
 set(CLASSICAL_SPIN_CUDA_WARNING_FLAGS "")
 
-if(CLASSICAL_SPIN_ENABLE_WARNINGS)
+if(CLASSICAL_SPIN_WARNINGS)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-        list(APPEND CLASSICAL_SPIN_CXX_WARNING_FLAGS
-            -Wall
-            -Wextra
-            -Wformat=2
-            -Wnon-virtual-dtor
-            # Suppress noisy warnings common in scientific computing code:
-            -Wno-sign-compare          # size_t vs int comparisons (very common with Eigen)
-            -Wno-sign-conversion       # signed/unsigned conversions
-            -Wno-conversion            # narrowing conversions (common with Eigen Index types)
-            -Wno-shadow                # constructor parameters shadowing members (common pattern)
-            -Wno-old-style-cast        # C-style casts (from external headers like HDF5)
-            -Wno-deprecated-copy       # deprecated implicit copy operators (HDF5 library issue)
-            -Wno-float-conversion      # float/double conversions
-            -Wno-unused-parameter      # unused parameters in callbacks/interfaces
-            -Wno-pedantic              # strict ISO compliance (e.g., __int128)
-            -Wno-reorder               # member initialization order
-            -Wno-unused-variable       # unused variables (reserved for future use)
-            -Wno-stringop-overread     # false positive in AVX intrinsics (GCC bug)
-            -Wno-stringop-overflow     # false positive in AVX intrinsics (GCC bug)
-        )
+        list(APPEND CLASSICAL_SPIN_CXX_WARNING_FLAGS -Wall -Wextra -Wformat=2 -Wnon-virtual-dtor)
     elseif(MSVC)
         list(APPEND CLASSICAL_SPIN_CXX_WARNING_FLAGS /W3 /permissive-)
     endif()
 
     if(ENABLE_CUDA AND CMAKE_CUDA_COMPILER)
-        list(APPEND CLASSICAL_SPIN_CUDA_WARNING_FLAGS 
-            -Xcompiler=-Wall 
-            -Xcompiler=-Wextra
-            -Xcompiler=-Wno-sign-compare
-            -Xcompiler=-Wno-sign-conversion
-            -Xcompiler=-Wno-conversion
-            -Xcompiler=-Wno-shadow
-            -Xcompiler=-Wno-old-style-cast
-            -Xcompiler=-Wno-deprecated-copy
-            -Xcompiler=-Wno-float-conversion
-            -Xcompiler=-Wno-unused-parameter
-            -Xcompiler=-Wno-pedantic
-            -Xcompiler=-Wno-reorder
-            -Xcompiler=-Wno-unused-variable
-            -Xcompiler=-Wno-stringop-overread
-            -Xcompiler=-Wno-stringop-overflow
-        )
+        list(APPEND CLASSICAL_SPIN_CUDA_WARNING_FLAGS -Xcompiler=-Wall -Xcompiler=-Wextra)
     endif()
 
     if(CLASSICAL_SPIN_WARNINGS_AS_ERRORS)
@@ -239,7 +246,7 @@ if(CLASSICAL_SPIN_ENABLE_WARNINGS)
 endif()
 
 function(classical_spin_apply_warnings target)
-    if(CLASSICAL_SPIN_ENABLE_WARNINGS)
+    if(CLASSICAL_SPIN_WARNINGS)
         target_compile_options(${target} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:${CLASSICAL_SPIN_CXX_WARNING_FLAGS}>
             $<$<COMPILE_LANGUAGE:CUDA>:${CLASSICAL_SPIN_CUDA_WARNING_FLAGS}>
@@ -247,44 +254,69 @@ function(classical_spin_apply_warnings target)
     endif()
 endfunction()
 
+# Sanitizers: every C++ target created below (library, executables, tests).
+# UBSan aborts on the first error so a test fails instead of printing.
+if(CLASSICAL_SPIN_SANITIZE)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "CLASSICAL_SPIN_SANITIZE needs GCC or Clang")
+    endif()
+    # -O1 in Debug keeps the Eigen-heavy physics tests within their time limits
+    # (at -O0 under ASan several take > 300 s); stack traces stay usable.
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=address,undefined>
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-sanitize-recover=undefined>
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Debug>>:-O1>
+    )
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
 # CUDA compiler flags
 if(ENABLE_CUDA)
-    # --extended-lambda allows __device__ annotation on lambdas (required for Thrust)
-    set(CMAKE_CUDA_FLAGS "-D__CUDA_NO_HOST_COMPILER_CHECK --extended-lambda --expt-relaxed-constexpr -Wno-deprecated-gpu-targets")
-    set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG --use_fast_math -lineinfo")
+    # --extended-lambda allows __device__ annotation on lambdas (required for Thrust).
+    # Appended, so flags given by the user or a toolchain file are kept.
+    string(APPEND CMAKE_CUDA_FLAGS " -D__CUDA_NO_HOST_COMPILER_CHECK --extended-lambda --expt-relaxed-constexpr -Wno-deprecated-gpu-targets")
+    set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG -lineinfo")
     
     # Suppress nvlink warnings about incompatible libraries (32-bit libs on 64-bit system)
     set(CMAKE_CUDA_LINK_FLAGS "${CMAKE_CUDA_LINK_FLAGS} -Xnvlink=-w")
 endif()
 
-# Optimization flags for Release builds
+# Optimization flags for Release builds. CLASSICAL_SPIN_NATIVE=ON (default)
+# keeps the host-tuned set; OFF gives portable binaries (-O3 only).
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CXX_OPTIMIZATION_FLAGS
-        -O3 -DNDEBUG -march=native -mtune=native -flto
-        -funroll-loops -fomit-frame-pointer -fno-stack-protector
-        -ffp-contract=fast -fno-math-errno -fno-trapping-math -fno-rounding-math
-        -Wno-stringop-overread -Wno-stringop-overflow  # suppress false positives in AVX intrinsics during LTO
-    )
-    
+    if(CLASSICAL_SPIN_NATIVE)
+        set(CXX_OPTIMIZATION_FLAGS
+            -O3 -DNDEBUG -march=native -mtune=native -flto
+            -funroll-loops -fomit-frame-pointer -fno-stack-protector
+            -ffp-contract=fast -fno-math-errno -fno-trapping-math -fno-rounding-math
+            -Wno-stringop-overread -Wno-stringop-overflow  # GCC false positives in AVX intrinsics under LTO
+        )
+        if(OpenMP_CXX_FOUND)
+            list(APPEND CXX_OPTIMIZATION_FLAGS -fopenmp-simd)
+        endif()
+    else()
+        set(CXX_OPTIMIZATION_FLAGS -O3 -DNDEBUG)
+    endif()
+
+    # Double-precision kernels: no register cap (--maxrregcount=32 forced
+    # local-memory spills) and no host -ffast-math (it makes std::isfinite /
+    # isnan unreliable in the host code of the .cu files).
     set(CUDA_OPTIMIZATION_FLAGS
         -O3 -DNDEBUG --use_fast_math --ptxas-options=-v,-O3
-        -lineinfo --maxrregcount=32 --extra-device-vectorization
+        -lineinfo --extra-device-vectorization
     )
-    
+
     set(CUDA_HOST_OPTIMIZATION_FLAGS
-        -Xcompiler=-O3 -Xcompiler=-ffast-math -Xcompiler=-funroll-loops
+        -Xcompiler=-O3 -Xcompiler=-funroll-loops
     )
-    
+
     # AMX intrinsics workaround for nvcc/GCC 12
     set(CUDA_AMX_WORKAROUND
         --compiler-options=-D_AMXTILEINTRIN_H_INCLUDED
         --compiler-options=-D_AMX_INT8INTRIN_H_INCLUDED
         --compiler-options=-D_AMX_BF16INTRIN_H_INCLUDED
     )
-    
-    if(OpenMP_CXX_FOUND)
-        list(APPEND CXX_OPTIMIZATION_FLAGS -fopenmp-simd)
-    endif()
 endif()
 
 # ============================================================================
@@ -368,16 +400,16 @@ target_include_directories(classical_spin_headers INTERFACE
     $<INSTALL_INTERFACE:include/classical_spin/io>
 )
 target_compile_features(classical_spin_headers INTERFACE cxx_std_20)
-target_link_libraries(classical_spin_headers INTERFACE 
-    OpenMP::OpenMP_CXX 
-    MPI::MPI_CXX 
+target_link_libraries(classical_spin_headers INTERFACE
+    OpenMP::OpenMP_CXX
+    MPI::MPI_CXX
     Eigen3::Eigen
-    ${HDF5_CXX_LIBRARIES}
+    ${CLASSICAL_SPIN_BOOST_TARGETS}
+    ${CLASSICAL_SPIN_HDF5_TARGETS}
 )
 if(ENABLE_CUDA)
     target_link_libraries(classical_spin_headers INTERFACE CUDA::cudart)
 endif()
-target_include_directories(classical_spin_headers INTERFACE ${HDF5_INCLUDE_DIRS})
 target_compile_definitions(classical_spin_headers INTERFACE 
     OPENMP_ENABLED MPI_ENABLED EIGEN3_ENABLED HDF5_ENABLED
 )
@@ -387,12 +419,9 @@ endif()
 
 add_library(classical_spin_core STATIC ${CORE_SOURCES})
 target_compile_features(classical_spin_core PUBLIC cxx_std_20)
-target_link_libraries(classical_spin_core PUBLIC 
+target_link_libraries(classical_spin_core PUBLIC
     classical_spin_headers
-    Eigen3::Eigen
-    ${HDF5_CXX_LIBRARIES}
 )
-target_include_directories(classical_spin_core PUBLIC ${HDF5_INCLUDE_DIRS})
 target_include_directories(classical_spin_core PUBLIC 
     $<BUILD_INTERFACE:${CLASSICAL_SPIN_INCLUDE_DIR}>
     $<INSTALL_INTERFACE:include>
@@ -415,19 +444,17 @@ if(ENABLE_CUDA AND GPU_SOURCES)
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
     )
     
-    target_include_directories(classical_spin_gpu PUBLIC 
+    target_include_directories(classical_spin_gpu PUBLIC
         $<BUILD_INTERFACE:${CLASSICAL_SPIN_INCLUDE_DIR}>
         $<INSTALL_INTERFACE:include>
-        ${Boost_INCLUDE_DIRS}
-        ${HDF5_INCLUDE_DIRS}
     )
-    
-    target_link_libraries(classical_spin_gpu PUBLIC 
+
+    # One CUDA runtime for the whole program (classical_spin_headers links the
+    # shared CUDA::cudart; mixing it with cudart_static is unsupported).
+    # cuBLAS / cuRAND are not used.
+    target_link_libraries(classical_spin_gpu PUBLIC
         classical_spin_headers
-        Eigen3::Eigen
-        CUDA::cudart_static CUDA::cuda_driver CUDA::cublas CUDA::curand
-        MPI::MPI_CXX
-        ${HDF5_CXX_LIBRARIES}
+        CUDA::cudart
     )
     
     target_compile_definitions(classical_spin_gpu PUBLIC 
@@ -468,15 +495,17 @@ function(add_optimized_executable exec_name source_file)
     
     target_compile_options(${exec_name} PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:${CXX_OPTIMIZATION_FLAGS}>
-        $<$<COMPILE_LANGUAGE:CXX>:-g1>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CONFIG:Release>>:-g1>
         $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_OPTIMIZATION_FLAGS}>
         $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_HOST_OPTIMIZATION_FLAGS}>
         $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     )
-    # Suppress LTO warnings from AVX intrinsics (GCC bug with -flto and avx512)
-    target_link_options(${exec_name} PRIVATE
-        -Wno-stringop-overread -Wno-stringop-overflow
-    )
+    # GCC false positives in AVX intrinsics during the LTO link (native builds)
+    if(CLASSICAL_SPIN_NATIVE AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_link_options(${exec_name} PRIVATE
+            -Wno-stringop-overread -Wno-stringop-overflow
+        )
+    endif()
     classical_spin_apply_warnings(${exec_name})
     
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -747,11 +776,33 @@ if(TARGET classical_spin_gpu)
     message(STATUS "  CUDA sources: ${GPU_SOURCES}")
 endif()
 
+message(STATUS "Options: NATIVE=${CLASSICAL_SPIN_NATIVE} SANITIZE=${CLASSICAL_SPIN_SANITIZE} WARNINGS=${CLASSICAL_SPIN_WARNINGS}")
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     message(STATUS "")
     message(STATUS "Optimization Flags:")
-    message(STATUS "  C++: -O3 -march=native -flto ...")
-    message(STATUS "  CUDA: -O3 --use_fast_math ...")
+    message(STATUS "  C++: ${CXX_OPTIMIZATION_FLAGS}")
+    if(ENABLE_CUDA)
+        message(STATUS "  CUDA: ${CUDA_OPTIMIZATION_FLAGS}")
+    endif()
 endif()
 
 message(STATUS "===========================================================")
+
+# Sanitizer runs of every test registered above: LeakSanitizer ignores the
+# allocations Open MPI keeps until exit (tests/sanitizers/lsan.supp lists only
+# third-party modules, so leaks in project code still fail the test), and the
+# time limits are four times longer (instrumented code runs 3-10x slower).
+if(CLASSICAL_SPIN_SANITIZE AND BUILD_TESTING)
+    get_property(_classical_spin_tests DIRECTORY PROPERTY TESTS)
+    foreach(_t IN LISTS _classical_spin_tests)
+        set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT
+            "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/sanitizers/lsan.supp:print_suppressions=0")
+        get_property(_timeout TEST ${_t} PROPERTY TIMEOUT)
+        if(_timeout)
+            math(EXPR _timeout "${_timeout} * 4")
+            set_property(TEST ${_t} PROPERTY TIMEOUT ${_timeout})
+        endif()
+    endforeach()
+    unset(_timeout)
+    unset(_classical_spin_tests)
+endif()

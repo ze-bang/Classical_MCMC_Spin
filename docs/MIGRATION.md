@@ -632,3 +632,35 @@ leaked once per object) and never shared by copies (MixedLattice clones shared
 one raw handle). The never-compiled `__CUDACC__` member blocks of lattice.h and
 mixed_lattice.h (a second class layout) and the never-defined `LatticeGPU`
 declarations were removed.
+
+## Build options: portable flags, sanitizers, warnings, imported targets
+
+**What changed.**
+
+- `CLASSICAL_SPIN_NATIVE` (default ON) keeps the host-tuned Release flags
+  (`-march=native -mtune=native -flto -ffp-contract=fast ...`); OFF builds
+  portable binaries with `-O3 -DNDEBUG` only (for clusters whose login and
+  compute nodes differ; CI uses OFF).
+- `CLASSICAL_SPIN_SANITIZE` (default OFF) adds
+  `-fsanitize=address,undefined -fno-sanitize-recover=undefined` to every C++
+  target (and `-O1` in Debug, so the physics tests stay within their time
+  limits); use it with `CMAKE_BUILD_TYPE=Debug`. CTest then runs every test
+  with `tests/sanitizers/lsan.supp`, which silences only the allocations Open
+  MPI keeps until exit, and with four times the usual time limit.
+- `CLASSICAL_SPIN_WARNINGS` (default ON) replaces
+  `CLASSICAL_SPIN_ENABLE_WARNINGS` (`=OFF` still accepted, deprecated): `-Wall -Wextra
+  -Wformat=2 -Wnon-virtual-dtor` without the old list of thirteen `-Wno-*`
+  suppressions. Dependencies are SYSTEM includes, so only project code warns.
+- HDF5 and Boost are linked through their imported targets (`hdf5::hdf5_cpp`,
+  `hdf5::hdf5`, `Boost::headers`; a fallback INTERFACE target wraps the HDF5
+  variables). Boost used to be found but never linked.
+- Executables get `-g1` only in Release (it overrode `-g` in Debug builds).
+- CUDA (untested, no toolchain here): user `CMAKE_CUDA_FLAGS` are appended to
+  instead of overwritten; `--maxrregcount=32`, the duplicated `--use_fast_math`
+  and host `-ffast-math` are gone; one CUDA runtime (`CUDA::cudart`), no
+  unused cuBLAS / cuRAND.
+- `.github/workflows/ci.yml`: Ubuntu 24.04, portable Release build with the
+  full CTest suite, and a Debug ASan/UBSan build running the `physics` label.
+
+**Recover the old behaviour.** `-DCLASSICAL_SPIN_WARNINGS=OFF` silences the
+warnings; the default Release flags are unchanged.

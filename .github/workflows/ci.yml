@@ -1,0 +1,65 @@
+# Continuous integration: a portable Release build running the whole CTest
+# suite, and an AddressSanitizer + UndefinedBehaviorSanitizer Debug build
+# running the physics tests. The GPU backend is not built (no CUDA on the
+# hosted runners); tests/test_gpu_tableaux checks its Runge-Kutta tables on
+# the CPU.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEPS: >-
+    cmake ninja-build g++ libeigen3-dev libboost-dev libhdf5-dev
+    libopenmpi-dev openmpi-bin
+  # The MPI tests start up to 4 ranks; hosted runners may have fewer cores.
+  OMPI_MCA_rmaps_base_oversubscribe: "1"
+  OMPI_MCA_mpi_yield_when_idle: "1"
+
+jobs:
+  release:
+    name: Release (portable flags), full ctest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $DEPS
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCLASSICAL_SPIN_NATIVE=OFF
+      - name: Build
+        run: cmake --build build -j2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j2
+
+  sanitizers:
+    name: Debug + ASan/UBSan, physics tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $DEPS
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCLASSICAL_SPIN_NATIVE=OFF
+          -DCLASSICAL_SPIN_SANITIZE=ON
+      - name: Build
+        run: cmake --build build -j2
+      - name: Test (physics label)
+        run: ctest --test-dir build --output-on-failure -j2 -L physics
