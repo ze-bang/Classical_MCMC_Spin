@@ -613,6 +613,7 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_mixed_md
     test_mixed_pump_probe
     test_phonon_dynamics
+    test_pt_ladder
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
@@ -638,6 +639,16 @@ if(BUILD_TESTING)
                      $<TARGET_FILE:test_mixed_pump_probe>)
     set_tests_properties(physics_test_mixed_pump_probe_mpi4 PROPERTIES TIMEOUT 300 LABELS physics
                          ENVIRONMENT "OMP_NUM_THREADS=1")
+    # Parallel tempering on 4 MPI ranks against exact results (oversubscribed:
+    # the CI container may have fewer cores; it runs as root).
+    add_optimized_executable(test_pt_mpi tests/test_pt_mpi.cpp)
+    add_test(NAME physics_test_pt_mpi
+             COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 --oversubscribe --allow-run-as-root
+                     $<TARGET_FILE:test_pt_mpi>)
+    # Exchange rounds synchronise rank pairs; yielding while idle keeps the
+    # oversubscribed ranks from starving each other.
+    set_tests_properties(physics_test_pt_mpi PROPERTIES TIMEOUT 600 LABELS "physics;mpi"
+                         ENVIRONMENT "OMP_NUM_THREADS=1;OMPI_MCA_mpi_yield_when_idle=1")
     add_test(NAME e1_phonon_regressions COMMAND test_e1_phonon_regressions)
     add_test(NAME mixed_trilinear_regressions COMMAND test_mixed_trilinear_regressions)
     add_test(NAME global_frame_equivalence COMMAND test_global_frame_equivalence)

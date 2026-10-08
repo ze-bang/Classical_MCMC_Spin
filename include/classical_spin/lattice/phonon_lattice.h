@@ -92,6 +92,7 @@
 #endif
 #include "classical_spin/core/spin_config.h"  // For should_rank_write
 #include "classical_spin/mc/mc_common.h"       // Common MC types and algorithms
+#include "classical_spin/mc/parallel_tempering.h"  // replica-exchange engine + ladder tuning
 
 using std::vector;
 using std::string;
@@ -1783,38 +1784,39 @@ public:
     // ============================================================
     // PARALLEL TEMPERING & DIAGNOSTICS — delegated to mc::
     // ============================================================
-
+    
     /**
-     * Parallel tempering with MPI (delegates to mc::parallel_tempering). Each replica
-     * exchanges its spins TOGETHER with its lattice sector (extra_dof hooks), so the
-     * swap criterion uses the total energies of the states actually exchanged.
+     * Parallel tempering on the shared engine (mc::run_parallel_tempering).
+     * Each replica exchanges its spins TOGETHER with its lattice sector
+     * (extra_dof hooks), so the swap criterion uses the total energies of the
+     * states actually exchanged.
      */
-    void parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
+    mc::PTResult parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
                            size_t overrelaxation_rate, size_t swap_rate, size_t probe_rate,
                            string dir_name, const vector<int>& rank_to_write,
                            bool gaussian_move = true, MPI_Comm comm = MPI_COMM_WORLD,
-                           bool verbose = false, const vector<size_t>& sweeps_per_temp = {}) {
-        // Independent per-rank Monte Carlo streams derived from the process seed.
-        int rank; MPI_Comm_rank(comm, &rank);
-        set_seed(lehman_master_seed_value(), 0x5054ULL + static_cast<uint64_t>(rank));
-        mc::parallel_tempering(*this, temp, n_anneal, n_measure,
-            overrelaxation_rate, swap_rate, probe_rate, dir_name, rank_to_write,
-            gaussian_move, comm, verbose, sweeps_per_temp);
+                           bool verbose = false) {
+        (void)verbose;
+        reseed_rng_for_replica(comm, 0x5054ULL);
+        mc::SpinLatticeReplica<PhononLattice> replica(*this, overrelaxation_rate, gaussian_move, gaussian_move);
+        mc::PTOptions o;
+        o.temperatures = std::move(temp);
+        o.n_equilibration = n_anneal;
+        o.n_measurement = n_measure;
+        o.exchange_every = swap_rate;
+        o.probe_every = probe_rate;
+        o.output_dir = std::move(dir_name);
+        o.ranks_to_write = rank_to_write;
+        return mc::run_parallel_tempering(replica, o, comm);
     }
 
-    /** Generate optimized temperature grid (delegates to mc::). */
-    mc::OptimizedTempGridResult generate_optimized_temperature_grid_mpi(
-        double Tmin, double Tmax,
-        size_t warmup_sweeps = 500, size_t sweeps_per_iter = 500,
-        size_t feedback_iters = 20, bool gaussian_move = false,
-        size_t overrelaxation_rate = 0, double target_acceptance = 0.45,
-        double convergence_tol = 0.05, MPI_Comm comm = MPI_COMM_WORLD,
-        bool use_gradient = true) {
-        int rank; MPI_Comm_rank(comm, &rank);
-        set_seed(lehman_master_seed_value(), 0x4F5054ULL + static_cast<uint64_t>(rank));
-        return mc::generate_optimized_temperature_grid_mpi(*this, Tmin, Tmax,
-            warmup_sweeps, sweeps_per_iter, feedback_iters, gaussian_move,
-            overrelaxation_rate, target_acceptance, convergence_tol, comm, use_gradient);
+    /** Temperature-ladder tuning on the shared engine (mc::tune_temperature_ladder). */
+    mc::LadderTuningResult tune_temperature_ladder(const mc::LadderTuningOptions& options,
+                                                   size_t overrelaxation_rate, bool gaussian_move,
+                                                   MPI_Comm comm = MPI_COMM_WORLD) {
+        reseed_rng_for_replica(comm, 0x4F5054ULL);
+        mc::SpinLatticeReplica<PhononLattice> replica(*this, overrelaxation_rate, gaussian_move, gaussian_move);
+        return mc::tune_temperature_ladder(replica, options, comm);
     }
 
     /** Geometric temperature ladder (delegates to mc::). */
@@ -1845,6 +1847,14 @@ public:
     }
 
 private:
+    /// Distinct, reproducible MC stream per replica, derived from the process
+    /// seed and the rank (no wall clock).
+    void reseed_rng_for_replica(MPI_Comm comm, uint64_t stream) {
+        int rank = 0;
+        MPI_Comm_rank(comm, &rank);
+        set_seed(lehman_master_seed_value(), stream + static_cast<uint64_t>(rank));
+    }
+
     // Private Monte Carlo / noise engine (seeded from the process seed; set_seed()).
     std::mt19937 rng;
     std::uniform_real_distribution<double> uniform_dist{0.0, 1.0};

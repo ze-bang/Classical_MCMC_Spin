@@ -5,6 +5,7 @@
 #include "simple_linear_alg.h"
 #include "hdf5_io.h"
 #include "classical_spin/mc/mc_common.h"      // Common MC structs & templates
+#include "classical_spin/mc/parallel_tempering.h"  // replica-exchange engine + ladder tuning
 #include "classical_spin/lattice/pulse_chunking.h"  // default pump-probe tolerances
 #include "classical_spin/dynamics/spin_integrators.h"  // geometric / Langevin spin integrators
 #include "classical_spin/dynamics/drive.h"             // DriveSchedule, Pulse
@@ -1707,138 +1708,22 @@ public:
     // ============================================================
 
     /**
-     * Compute integrated autocorrelation time from energy time series
+     * Integrated autocorrelation time of a series (Gamma method with automatic
+     * windowing) — delegates to mc::compute_autocorrelation.
      */
-    AutocorrelationResult compute_autocorrelation(const vector<double>& energies, 
-                                                   size_t base_interval = 10);
-
-    // ============================================================
-    // BINNING ANALYSIS FOR ERROR ESTIMATION
-    // ============================================================
-
-    /**
-     * Binning analysis for error estimation of a scalar observable
-     * 
-     * Performs recursive blocking to estimate statistical error with autocorrelation.
-     * The error plateaus when bin size exceeds the correlation length.
-     * 
-     * @param data Vector of observable measurements
-     * @return BinningResult containing mean, error, and binning information
-     */
-    static BinningResult binning_analysis(const vector<double>& data) {
-        BinningResult result;
-        
-        if (data.empty()) {
-            result.mean = 0.0;
-            result.error = 0.0;
-            result.tau_int = 1.0;
-            result.optimal_bin_level = 0;
-            return result;
-        }
-        
-        size_t n = data.size();
-        
-        // Compute mean
-        result.mean = std::accumulate(data.begin(), data.end(), 0.0) / double(n);
-        
-        if (n < 4) {
-            // Too few samples for meaningful analysis
-            double var = 0.0;
-            for (double x : data) var += (x - result.mean) * (x - result.mean);
-            result.error = std::sqrt(var / (n * (n - 1)));
-            result.tau_int = 1.0;
-            result.optimal_bin_level = 0;
-            return result;
-        }
-        
-        // Recursive blocking: progressively halve the data by averaging pairs
-        vector<double> binned_data = data;
-        size_t level = 0;
-        size_t max_levels = static_cast<size_t>(std::log2(n)) - 1;
-        
-        result.errors_by_level.reserve(max_levels);
-        
-        while (binned_data.size() >= 4) {
-            size_t m = binned_data.size();
-            
-            // Compute variance at this level
-            double sum = 0.0, sum2 = 0.0;
-            for (double x : binned_data) {
-                sum += x;
-                sum2 += x * x;
-            }
-            double mean_level = sum / m;
-            double var_level = (sum2 / m - mean_level * mean_level);
-            double error_level = std::sqrt(var_level / (m - 1));
-            
-            result.errors_by_level.push_back(error_level);
-            
-            // Block the data: average consecutive pairs
-            vector<double> new_binned;
-            new_binned.reserve(m / 2);
-            for (size_t i = 0; i + 1 < m; i += 2) {
-                new_binned.push_back(0.5 * (binned_data[i] + binned_data[i + 1]));
-            }
-            binned_data = std::move(new_binned);
-            ++level;
-        }
-        
-        // Find optimal level where error has plateaued
-        // Look for where error stops growing significantly
-        result.optimal_bin_level = 0;
-        if (result.errors_by_level.size() > 2) {
-            double max_error = 0.0;
-            for (size_t l = 0; l < result.errors_by_level.size(); ++l) {
-                if (result.errors_by_level[l] > max_error) {
-                    max_error = result.errors_by_level[l];
-                    result.optimal_bin_level = l;
-                }
-            }
-        }
-        
-        // Use error from optimal level, or last level with at least 4 samples
-        if (!result.errors_by_level.empty()) {
-            // Use error from level where error has approximately plateaued
-            size_t use_level = std::min(result.optimal_bin_level + 1, result.errors_by_level.size() - 1);
-            result.error = result.errors_by_level[use_level];
-            
-            // Estimate tau_int from ratio of blocked variance to naive variance
-            if (result.errors_by_level[0] > 1e-20) {
-                double ratio = result.error / result.errors_by_level[0];
-                result.tau_int = 0.5 * ratio * ratio;
-            } else {
-                result.tau_int = 1.0;
-            }
-        } else {
-            result.error = 0.0;
-            result.tau_int = 1.0;
-        }
-        
-        return result;
+    AutocorrelationResult compute_autocorrelation(const vector<double>& energies,
+                                                   size_t base_interval = 10) {
+        return mc::compute_autocorrelation(energies, base_interval);
     }
 
-    /**
-     * Binning analysis for vector observable (component-wise)
-     * 
-     * @param data Vector of vector measurements
-     * @return Vector of BinningResult, one per component
-     */
+    /// Binning analysis of a scalar observable — delegates to mc::binning_analysis.
+    static BinningResult binning_analysis(const vector<double>& data) {
+        return mc::binning_analysis(data);
+    }
+
+    /// Component-wise binning analysis — delegates to mc::binning_analysis_vector.
     static vector<BinningResult> binning_analysis_vector(const vector<SpinVector>& data) {
-        if (data.empty()) return {};
-        
-        size_t dim = data[0].size();
-        vector<BinningResult> results(dim);
-        
-        // Extract each component and analyze separately
-        for (size_t d = 0; d < dim; ++d) {
-            vector<double> component(data.size());
-            for (size_t i = 0; i < data.size(); ++i) {
-                component[i] = data[i](d);
-            }
-            results[d] = binning_analysis(component);
-        }
-        
-        return results;
+        return mc::binning_analysis_vector<SpinVector>(data);
     }
 
     // ============================================================
@@ -2392,7 +2277,10 @@ public:
     ThermodynamicObservables compute_thermodynamic_observables(
         const vector<double>& energies,
         const vector<vector<SpinVector>>& sublattice_mags,
-        double T) const;
+        double T) const {
+        return mc::compute_thermodynamic_observables<SpinVector>(energies, sublattice_mags, T,
+                                                                 lattice_size);
+    }
 
     /**
      * Save comprehensive thermodynamic observables to files
@@ -3661,35 +3549,34 @@ public:
     // ============================================================
 
     /**
-     * Parallel tempering with MPI
-     * Collects: energy, specific heat, sublattice magnetizations, and cross-correlations
-     * All with binning analysis for error estimation
-     * 
-     * @param temp              Temperature ladder (one per MPI rank)
-     * @param n_anneal          Number of equilibration sweeps
-     * @param n_measure         Number of measurement sweeps
-     * @param overrelaxation_rate Apply overrelaxation every N sweeps (0 = disabled)
-     * @param swap_rate         Attempt replica exchange every N sweeps (used when sweeps_per_temp is empty)
-     * @param probe_rate        Record observables every N sweeps
-     * @param dir_name          Output directory
-     * @param rank_to_write     List of ranks that should write output (-1 = all)
-     * @param gaussian_move     Use Gaussian moves (true) or uniform (false)
-     * @param comm              MPI communicator (default: MPI_COMM_WORLD)
-     * @param verbose           If true, save spin configurations
-     * @param accumulate_correlations  If true, accumulate real-space correlations for S(q)
-     * @param n_bond_types      Number of bond types for dimer correlations (default: 3)
-     * @param sweeps_per_temp   Bittner adaptive sweep schedule: sweeps between exchanges per temperature.
-     *                          If non-empty, overrides swap_rate. Each rank does sweeps_per_temp[rank] MC
-     *                          sweeps between exchange attempts, adapting to local autocorrelation time.
-     *                          Computed by generate_optimized_temperature_grid[_mpi].
+     * Parallel tempering (one replica per rank of `comm`) on the shared engine
+     * mc::run_parallel_tempering: deterministic even/odd replica exchange with
+     * labelled replicas (round trips, f(T), per-edge acceptance), proposal
+     * width adapted per temperature while equilibrating and frozen while
+     * measuring, Gamma-method / jackknife statistics.
+     *
+     * @param temp              Temperature ladder, one per rank, strictly increasing
+     * @param n_anneal          Equilibration MC steps
+     * @param n_measure         Measurement MC steps
+     * @param overrelaxation_rate k > 0: one overrelaxation sweep per step and a local
+     *                          sweep every k-th step (as perform_mc_sweeps); 0: local sweeps only
+     * @param swap_rate         MC steps between exchange rounds (0 = no exchanges)
+     * @param probe_rate        MC steps between measurements
+     * @param dir_name          Output directory ("" = no files)
+     * @param rank_to_write     Ranks writing per-temperature files (-1 = all)
+     * @param gaussian_move     Adaptive Gaussian proposals (also selected by local_update)
+     * @param comm              MPI communicator
+     * @param verbose           Unused (kept for source compatibility)
+     * @param accumulate_correlations  Accumulate real-space correlations for S(q)
+     * @param n_bond_types      Number of bond types for dimer correlations
+     * @return per-rank and whole-ladder statistics (see mc::PTResult)
      */
-    void parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
+    mc::PTResult parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
                            size_t overrelaxation_rate, size_t swap_rate, size_t probe_rate,
                            string dir_name, const vector<int>& rank_to_write,
                            bool gaussian_move = true, MPI_Comm comm = MPI_COMM_WORLD,
                            bool verbose = false, bool accumulate_correlations = false,
-                           size_t n_bond_types = 3,
-                           const vector<size_t>& sweeps_per_temp = {});
+                           size_t n_bond_types = 3);
     
     /**
      * Save kagome order parameters to HDF5 file (pyrochlore patch)
@@ -3733,186 +3620,21 @@ public:
     }
 
     /**
-     * Attempt replica exchange between neighboring temperatures
-     * @param comm MPI communicator to use (default: MPI_COMM_WORLD)
+     * Tune the temperature ladder with the replica chain (one replica per rank,
+     * collective): rounds of doubling length measure per-edge rejection (and
+     * the label flow f(T)) and move the interior temperatures — by default to
+     * equal rejection (non-reversible PT schedule, Syed et al., JRSS-B 84, 321
+     * (2022)), or by the Katzgraber et al. flow feedback. The MC step follows
+     * the same schedule as parallel_tempering(), and each rank ends with a
+     * replica equilibrated near its tuned temperature.
      */
-    int attempt_replica_exchange(int rank, int size, const vector<double>& temp,
-                                double curr_Temp, size_t swap_parity, MPI_Comm comm = MPI_COMM_WORLD);
+    mc::LadderTuningResult tune_temperature_ladder(const mc::LadderTuningOptions& options,
+                                                   size_t overrelaxation_rate, bool gaussian_move,
+                                                   MPI_Comm comm = MPI_COMM_WORLD);
 
-    /**
-     * Estimate sampling interval using autocorrelation
-     */
-    size_t estimate_sampling_interval(double curr_Temp, bool gaussian_move, double& sigma,
-                                     size_t overrelaxation_rate, size_t n_measure,
-                                     size_t probe_rate, int rank);
-
-    /**
-     * Gather and save statistics (root process)
-     */
-    void gather_and_save_statistics(int rank, int size, double curr_Temp,
-                                   const vector<double>& energies,
-                                   const vector<SpinVector>& magnetizations,
-                                   vector<double>& heat_capacity, vector<double>& dHeat,
-                                   const vector<double>& temp, const string& dir_name,
-                                   const vector<int>& rank_to_write,
-                                   size_t n_anneal, size_t n_measure,
-                                   double curr_accept, int swap_accept,
-                                   size_t swap_rate, size_t overrelaxation_rate,
-                                   size_t probe_rate, MPI_Comm comm = MPI_COMM_WORLD);
-
-    /**
-     * Gather and save comprehensive statistics with binning analysis (MPI version)
-     * Includes: energy, specific heat, sublattice magnetizations, cross-correlations
-     * @param comm MPI communicator to use (default: MPI_COMM_WORLD)
-     */
-    void gather_and_save_statistics_comprehensive(int rank, int size, double curr_Temp,
-                                   const vector<double>& energies,
-                                   const vector<SpinVector>& magnetizations,
-                                   const vector<vector<SpinVector>>& sublattice_mags,
-                                   vector<double>& heat_capacity, vector<double>& dHeat,
-                                   const vector<double>& temp, const string& dir_name,
-                                   const vector<int>& rank_to_write,
-                                   size_t n_anneal, size_t n_measure,
-                                   double curr_accept, int swap_accept,
-                                   size_t swap_rate, size_t overrelaxation_rate,
-                                   size_t probe_rate, MPI_Comm comm = MPI_COMM_WORLD,
-                                   bool verbose = false);
-
-    // ============================================================
-    // TEMPERATURE LADDER OPTIMIZATION
-    // Based on:
-    //   Katzgraber et al., J. Stat. Mech. P03018 (2006) [arXiv:cond-mat/0602085]
-    //     - Feedback-optimized temperature placement (Δβ_i ∝ 1/f_i)
-    //   Bittner et al., Phys. Rev. Lett. 101, 130603 (2008) [arXiv:0809.0571]
-    //     - Temperature-dependent sweep schedule (n_sweeps_i ∝ τ_int(T_i))
-    // ============================================================
-
-    /**
-     * Generate optimized temperature grid for parallel tempering
-     * 
-     * Combines two key algorithms:
-     * 
-     * 1. Katzgraber et al. (2006) feedback-optimized temperature placement:
-     *    - Measure the "current fraction" f_i at each edge (fraction of replicas
-     *      that make full round trips passing through edge i).
-     *    - In practice, f_i ∝ A_i (acceptance rate at edge i) for uniform swap rates.
-     *    - The feedback rule adjusts Δβ_i ∝ A_i: edges with HIGH acceptance get
-     *      MORE β-spacing, edges with LOW acceptance get LESS spacing (denser temps).
-     *    - This concentrates temperatures at bottlenecks (e.g., phase transitions).
-     *    - Minimizes round-trip time τ_rt = (Σ_i 1/f_i)².
-     * 
-     * 2. Bittner et al. (2008) temperature-dependent sweep schedule:
-     *    - After optimizing the temperature grid, measure the canonical
-     *      autocorrelation time τ_int(T) at each temperature.
-     *    - Set the number of MC sweeps between exchange attempts proportional
-     *      to τ_int(T_i): n_sweeps_i = n_base × τ_int(T_i) / min(τ_int).
-     *    - This ensures each replica is decorrelated before attempting an exchange,
-     *      dramatically reducing round-trip time at critical temperatures.
-     * 
-     * @param Tmin              Minimum (coldest) temperature
-     * @param Tmax              Maximum (hottest) temperature  
-     * @param R                 Number of replicas (temperatures)
-     * @param warmup_sweeps     MC sweeps for initial equilibration per replica
-     * @param sweeps_per_iter   MC sweeps per feedback iteration
-     * @param feedback_iters    Number of feedback optimization iterations
-     * @param gaussian_move     Use Gaussian moves (true) or uniform (false)
-     * @param overrelaxation_rate  Apply overrelaxation every N sweeps (0 = disabled)
-     * @param target_acceptance Target acceptance rate (default: 0.5 per Katzgraber)
-     * @param convergence_tol   Convergence tolerance for acceptance rate uniformity
-     * @return OptimizedTempGridResult containing temperatures, sweep schedule, diagnostics
-     */
-    OptimizedTempGridResult generate_optimized_temperature_grid(
-        double Tmin, double Tmax, size_t R,
-        size_t warmup_sweeps = 500,
-        size_t sweeps_per_iter = 500,
-        size_t feedback_iters = 20,
-        bool gaussian_move = false,
-        size_t overrelaxation_rate = 0,
-        double target_acceptance = 0.5,
-        double convergence_tol = 0.05);
-
-    /**
-     * Legacy wrapper for backward compatibility
-     * Calls the Katzgraber/Bittner-optimized algorithm with default 50% acceptance target
-     */
-    vector<double> optimize_temperature_ladder_roundtrip(
-        double Tmin, double Tmax, size_t R,
-        size_t warmup_sweeps = 200,
-        size_t sweeps_per_iter = 200,
-        size_t feedback_iters = 10,
-        bool gaussian_move = false,
-        size_t overrelaxation_rate = 0) {
-        
-        OptimizedTempGridResult result = generate_optimized_temperature_grid(
-            Tmin, Tmax, R,
-            warmup_sweeps, sweeps_per_iter, feedback_iters,
-            gaussian_move, overrelaxation_rate,
-            0.5,   // Katzgraber optimal for uniform acceptance
-            0.05   // 5% convergence tolerance
-        );
-        return result.temperatures;
-    }
-
-    /**
-     * MPI-distributed temperature grid optimization
-     * 
-     * This version distributes replicas across MPI ranks, same as the main PT simulation.
-     * Each rank handles exactly one replica, making it R times faster than the serial version.
-     * 
-     * Combines:
-     *   Katzgraber et al. (2006) - feedback-optimized temperature placement (Δβ_i ∝ A_i)
-     *   Bittner et al. (2008) - temperature-dependent sweep schedule (n_i ∝ τ_int(T_i))
-     * 
-     * @param Tmin              Minimum (coldest) temperature
-     * @param Tmax              Maximum (hottest) temperature  
-     * @param warmup_sweeps     MC sweeps for initial equilibration
-     * @param sweeps_per_iter   MC sweeps per feedback iteration
-     * @param feedback_iters    Number of feedback optimization iterations
-     * @param gaussian_move     Use Gaussian moves (true) or uniform (false)
-     * @param overrelaxation_rate  Apply overrelaxation every N sweeps (0 = disabled)
-     * @param target_acceptance Target acceptance rate (default: 0.45, Denschlag et al. 2009)
-     * @param convergence_tol   Convergence tolerance for acceptance rate uniformity
-     * @param comm              MPI communicator (default: MPI_COMM_WORLD)
-     * @param use_gradient      If true, use gradient-based optimizer (Miyata et al. 2024); else Katzgraber
-     * @return OptimizedTempGridResult with temperatures, sweep schedule, diagnostics
-     */
-    OptimizedTempGridResult generate_optimized_temperature_grid_mpi(
-        double Tmin, double Tmax,
-        size_t warmup_sweeps = 500,
-        size_t sweeps_per_iter = 500,
-        size_t feedback_iters = 20,
-        bool gaussian_move = false,
-        size_t overrelaxation_rate = 0,
-        double target_acceptance = 0.45,
-        double convergence_tol = 0.05,
-        MPI_Comm comm = MPI_COMM_WORLD,
-        bool use_gradient = true);
-
-    /**
-     * Generate geometric temperature ladder (simple, no optimization)
-     * 
-     * Uses logarithmic spacing: T_i = T_min * (T_max/T_min)^(i/(R-1))
-     * This is optimal for systems with roughly constant specific heat.
-     * 
-     * @param Tmin  Minimum temperature
-     * @param Tmax  Maximum temperature
-     * @param R     Number of temperatures
-     * @return Vector of temperatures in ascending order
-     */
-    static vector<double> generate_geometric_temperature_ladder(
-        double Tmin, double Tmax, size_t R) {
-        
-        vector<double> temps(R);
-        if (R == 1) {
-            temps[0] = Tmin;
-            return temps;
-        }
-        
-        for (size_t i = 0; i < R; ++i) {
-            double frac = double(i) / double(R - 1);
-            temps[i] = Tmin * std::pow(Tmax / Tmin, frac);
-        }
-        return temps;
+    /// Geometric ladder T_i = T_min (T_max/T_min)^(i/(R-1)) (delegates to mc::).
+    static vector<double> generate_geometric_temperature_ladder(double Tmin, double Tmax, size_t R) {
+        return mc::generate_geometric_temperature_ladder(Tmin, Tmax, R);
     }
 
     // ============================================================

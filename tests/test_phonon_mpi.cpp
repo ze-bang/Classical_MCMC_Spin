@@ -6,7 +6,7 @@
 //      2026-10 the gather sent 7 of the 13 doubles per sample, so for every τ not computed
 //      on rank 0 M_global was written as zeros and O_custom as uninitialised memory.
 //   2. Replica exchange of a PhononLattice swaps the lattice sector together with the
-//      spins (mc::has_extra_dof), so the exchanged total energies are those of the
+//      spins (mc::has_extra_dof, mc::SpinLatticeReplica), so the exchanged total energies are those of the
 //      states actually exchanged.
 #include "classical_spin/core/spin_config.h"
 #include "classical_spin/core/unitcell_builders.h"
@@ -126,15 +126,17 @@ void test_replica_exchange_swaps_lattice() {
     double E_partner_before = 0.0;
     const int partner = (g_rank % 2 == 0) ? g_rank + 1 : g_rank - 1;
     const bool paired = partner < size;
-    std::vector<double> temps(size, 1.0);                 // equal temperatures: swap always accepted
-    std::mt19937 rng(1);
+    // Equal temperatures: every swap is accepted. One DEO round (round 0)
+    // pairs the edges (0,1), (2,3), ...
+    mc::SpinLatticeReplica<PhononLattice> replica(L, 0, false, false);
+    mc::ReplicaExchange<mc::SpinLatticeReplica<PhononLattice>> chain(
+        replica, MPI_COMM_WORLD, std::vector<double>(size_t(size), 1.0), mc::detail::shared_exchange_seed(MPI_COMM_WORLD));
     if (paired)
         MPI_Sendrecv(&E_before, 1, MPI_DOUBLE, partner, 9, &E_partner_before, 1, MPI_DOUBLE, partner, 9,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    const int acc = mc::attempt_replica_exchange(L, rng, g_rank, size, temps, 1.0, 0, MPI_COMM_WORLD);
+    chain.exchange_round();
     if (!paired) return;
     const double expect_Q = 0.01 * (partner + 1), expect_V = -0.02 * (partner + 1);
-    check(acc == 1, "equal-temperature swap accepted");
     check(L.phonons.Q_x_E1 == expect_Q && L.phonons.V_y_E1 == expect_V,
           "lattice sector travels with the spins in a replica exchange");
     check(std::abs(L.total_energy() - E_partner_before) < 1e-10 * std::abs(E_partner_before),
