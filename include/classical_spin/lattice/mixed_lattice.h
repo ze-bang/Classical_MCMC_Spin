@@ -589,6 +589,30 @@ public:
         // The RNG is seeded once per process (config key `seed`); constructing
         // a lattice must not reseed it.
 
+        // A lattice no wider than 2|offset| along a bonded direction maps
+        // distinct bonds onto the same pair of sites (their couplings add) or
+        // onto the site itself (folded into the on-site term): a valid
+        // periodic Hamiltonian, but rarely the intended one.
+        {
+            array<long, 3> reach = {0, 0, 0};
+            auto widen = [&](const auto& off) {
+                for (int d = 0; d < 3; ++d) reach[d] = std::max(reach[d], long(std::abs(int(off[d]))));
+            };
+            for (const UnitCell* uc : {&mixed_uc.SU2_cell, &mixed_uc.SU3_cell}) {
+                for (const auto& [atom, b] : uc->bilinear_interaction) widen(b.offset);
+                for (const auto& [atom, t] : uc->trilinear_interaction) { widen(t.offset1); widen(t.offset2); }
+            }
+            for (const auto& [atom, b] : mixed_uc.bilinear_SU2_SU3) widen(b.offset);
+            for (const auto& [atom, b] : mixed_uc.bilinear_drive_SU2_SU3) widen(b.offset);
+            for (const auto& [atom, t] : mixed_uc.trilinear_SU2_SU3) { widen(t.offset1); widen(t.offset2); }
+            const array<size_t, 3> dims = {dim1, dim2, dim3};
+            for (int d = 0; d < 3; ++d)
+                if (reach[d] > 0 && long(dims[d]) < 2 * reach[d] + 1)
+                    cout << "Warning: lattice extent " << dims[d] << " along a" << d + 1 << " is below 2*"
+                         << reach[d] << "+1; periodic images of distinct bonds coincide (their couplings add)"
+                         << endl;
+        }
+
         // Build SU(2) sublattice
         build_sublattice(mixed_uc.SU2_cell, spins_SU2, site_positions_SU2, field_SU2,
                         onsite_interaction_SU2, bilinear_interaction_SU2,
