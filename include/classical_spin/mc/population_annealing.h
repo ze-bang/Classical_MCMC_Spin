@@ -62,6 +62,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #ifdef _OPENMP
@@ -69,6 +70,8 @@
 #endif
 
 #include "classical_spin/mc/parallel_tempering.h"  // detail:: MPI helpers, SpinLatticeReplica
+
+class Lattice;
 
 namespace mc {
 
@@ -258,6 +261,15 @@ PAResult run_population_annealing(std::vector<W*> workers, const PAOptions& o, M
     const size_t lo = detail::pa_block_begin(R, rank, size);
     const size_t n_local = detail::pa_block_begin(R, rank + 1, size) - lo;
     const uint64_t seed = detail::shared_exchange_seed(comm);
+    // Replicas reseed whichever OpenMP thread runs them (dynamic schedule), so
+    // afterwards every thread-local stream sits at a layout-dependent point.
+    // On exit (also by exception) derive a new master from (master, run seed)
+    // and make every thread reseed from it, so code after the run — a second
+    // run, a lattice constructor — is reproducible again.
+    struct StreamReset {
+        uint64_t seed;
+        ~StreamReset() { seed_lehman(detail::mix64(lehman_master_seed_value() ^ seed ^ 0x5041454E44ULL)); }
+    } stream_reset{seed};
     int n_threads = 1;
 #ifdef _OPENMP
     n_threads = std::max(1, std::min<int>(int(workers.size()), omp_get_max_threads()));
@@ -576,12 +588,17 @@ PAResult run_population_annealing(std::vector<W*> workers, const PAOptions& o, M
 }
 
 /**
- * Population-annealing worker for the lattice classes (Lattice, PhononLattice):
- * the parallel-tempering adapter (same MC step policy) plus a uniformly random
- * initial state and the global-frame order parameter |m| and m^2 per site.
+ * Population-annealing worker for Lattice: the parallel-tempering adapter (same
+ * MC step policy) plus a uniformly random initial state and the global-frame
+ * order parameter |m| and m^2 per site. (PhononLattice draws from a private
+ * generator that the per-replica streams do not reach, and its lattice
+ * coordinates have no beta = 0 distribution, so it needs its own worker.)
  */
 template <class L>
 class LatticePopulationWorker : public SpinLatticeReplica<L> {
+    static_assert(std::is_same_v<L, ::Lattice>,
+                  "LatticePopulationWorker supports Lattice only (see the class comment)");
+
 public:
     LatticePopulationWorker(L& lat, size_t overrelaxation_rate, bool gaussian_move)
         : SpinLatticeReplica<L>(lat, overrelaxation_rate, gaussian_move, gaussian_move) {

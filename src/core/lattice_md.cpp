@@ -586,7 +586,8 @@ void Lattice::molecular_dynamics(double T_start, double T_end, double dt_initial
     const size_t D = spin_dim;
     vector<double> energy(grid.n), norm_err(grid.n), mags(3 * D), scratch(N_atoms * D);
     const size_t report_every = std::max<size_t>(1, grid.n / 10);
-    const double s_len = double(spin_length);
+    // Conserved |S|: spin_length, or |n| = 2/sqrt(3) for qutrit pure states on CP^2.
+    const double s_len = su3_cp2 ? 2.0 / std::sqrt(3.0) : double(spin_length);
 
     integrate_on_grid(x, grid, active_drive, settings, [&](const double* xs, size_t k, double t) {
         measure_magnetizations(xs, mags.data(), scratch.data());

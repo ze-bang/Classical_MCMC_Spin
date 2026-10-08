@@ -214,6 +214,21 @@ void test_qutrits_cp2() {
     }
     check_close(impurity, 0.0, 1e-12, "every sampled state is a pure qutrit state");
 
+    // Cluster moves and the Neel initialiser are not defined on CP^2.
+    {
+        Lattice c(uc, 2, 2, 1, 1.0f);
+        bool wolff = false, sw = false, neel = false;
+        try { c.wolff_update(1.0); } catch (const std::invalid_argument&) { wolff = true; }
+        try { c.swendsen_wang_sweep(1.0); } catch (const std::invalid_argument&) { sw = true; }
+        try { c.init_neel(f); } catch (const std::invalid_argument&) { neel = true; }
+        ck_true(wolff && sw && neel, "cluster moves and init_neel refuse SU(3) spins on CP^2");
+        // Switching to the sphere puts the spins back on |S| = spin_length.
+        c.set_su3_mc_manifold("sphere");
+        double dev = 0.0;
+        for (const auto& s : c.spins) dev = std::max(dev, std::abs(s.norm() - 1.0));
+        check_close(dev, 0.0, 1e-12, "su3_mc_manifold = sphere rescales the spins to spin_length");
+    }
+
     // Legacy bracket -> legacy sphere; explicit switches.
     UnitCell legacy = cp2::qutrit_cell(1);
     legacy.poisson_bracket = 1.0;

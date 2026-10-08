@@ -2377,7 +2377,16 @@ public:
         } else {
             throw std::invalid_argument("unknown su3_mc_manifold '" + name + "' (valid: cp2, sphere)");
         }
-        project_su3_states();
+        if (su3_cp2) {
+            project_su3_states();
+        } else {
+            // Back on the sphere |S| = spin_length (CP^2 states have |n| = 2/sqrt 3).
+            const double s = double(spin_length);
+            for (auto& v : spins) {
+                const double n = v.norm();
+                if (n > 0.0 && std::abs(n - s) > 1e-12 * s) v *= s / n;
+            }
+        }
     }
 
     /// On CP^2, replace every spin by its closest pure qutrit state (exact for
@@ -2699,6 +2708,14 @@ public:
         return dE_true - dE_emb;
     }
 
+    /// Embedded-Ising cluster moves reflect spins about a plane of R^n, which is
+    /// not an isometry of CP^2: refuse them for qutrit (su3_cp2) spins.
+    void require_cluster_moves(const char* who) const {
+        if (su3_cp2)
+            throw std::invalid_argument(string(who) + ": cluster moves are not defined for SU(3) spins on CP^2 "
+                                        "(use local updates, or su3_mc_manifold = sphere)");
+    }
+
     /**
      * Wolff single-cluster update. Returns the number of spins flipped
      * (0 if the cluster touched the ghost spin or was rejected by the
@@ -2709,6 +2726,7 @@ public:
      *        the field enters the residual filter.
      */
     size_t wolff_update(double T, bool use_ghost_field = false) {
+        require_cluster_moves("wolff_update");
         if (T <= 0) return 0;
         const double beta = 1.0 / T;
 
@@ -2804,6 +2822,7 @@ public:
      * Returns the number of clusters flipped.
      */
     size_t swendsen_wang_sweep(double T, bool use_ghost_field = false) {
+        require_cluster_moves("swendsen_wang_sweep");
         if (T <= 0) return 0;
 
         const double beta = 1.0 / T;
@@ -3972,6 +3991,8 @@ public:
      * Initialize with Néel (antiferromagnetic) configuration
      */
     void init_neel(const SpinVector& direction) {
+        if (su3_cp2)
+            throw std::invalid_argument("init_neel: -n is not a qutrit pure state; no Neel state on CP^2");
         SpinVector spin_up = direction.normalized() * spin_length;
         SpinVector spin_down = -spin_up;
         

@@ -135,6 +135,16 @@ void test_layout_independence() {
     seed_lehman(77);
     const auto two = run_ring(300, 2, o, MPI_COMM_WORLD, true);
     ck(same_steps(one, two), "1 vs 2 worker threads: identical results (adaptive Gaussian moves)");
+    // A second run in the same process is reproducible too: the engine leaves
+    // every thread-local stream in a deterministic state.
+    auto second_of_two = [&] {
+        seed_lehman(91);
+        run_ring(200, 2, o, MPI_COMM_WORLD, true);
+        return run_ring(200, 2, o, MPI_COMM_WORLD, true);
+    };
+    const auto r1 = second_of_two();
+    const auto r2 = second_of_two();
+    ck(same_steps(r1, r2), "consecutive runs in one process are reproducible");
     if (g_size > 1) {
         // Whole population on rank 0 alone, same seed.
         seed_lehman(77);
