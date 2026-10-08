@@ -505,6 +505,32 @@ void rk_stage_update_5_kernel(
 );
 
 /**
+ * Up to 13 stage vectors and coefficients of one Runge-Kutta combination
+ * (Butcher-tableau row), passed to rk_lincomb_kernel by value.
+ */
+struct RKCombination {
+    static constexpr int kMaxTerms = 13;
+    const double* k[kMaxTerms];
+    double coef[kMaxTerms];
+    int m;
+};
+
+/**
+ * Generic stage update of the tableau steppers (gpu/ode/integrator.cuh):
+ * out[i] = base_scale * base[i] + dt * Σ_j comb.coef[j] * comb.k[j][i]
+ * (base may be null, then only the sum). Grid-stride loop with a size_t
+ * index; `out` may alias `base` (each element is read before it is written).
+ */
+__global__
+void rk_lincomb_kernel(
+    double* out,
+    const double* base, double base_scale,
+    RKCombination comb,
+    double dt,
+    size_t size
+);
+
+/**
  * Normalize spins to specified length
  */
 __global__

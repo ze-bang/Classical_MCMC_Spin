@@ -16,6 +16,10 @@
 #include "classical_spin/dynamics/grid_integrate.h"
 #include "classical_spin/dynamics/time_grid.h"
 
+#ifdef CUDA_ENABLED
+#include "classical_spin/gpu/device_select.h"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <climits>
@@ -901,11 +905,13 @@ void validate_pulse_shape(double amp, double width, double freq, const char* wha
         (void) pulse_window_chunking;  // superseded by exact-grid integration
         if (use_gpu) {
 #ifdef CUDA_ENABLED
-            check_gpu_supported(spin_state_out != nullptr);
-            return single_pulse_drive_gpu(field_in_SU2, field_in_SU3, t_B,
-                            pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                            pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                            T_start, T_end, step_size, method);
+            if (classical_spin::gpu::device_available()) {
+                check_gpu_supported(spin_state_out != nullptr);
+                return single_pulse_drive_gpu(field_in_SU2, field_in_SU3, t_B,
+                                pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                                pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+                                T_start, T_end, step_size, method, abs_tol, rel_tol);
+            }
 #else
             std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED); "
                          "running single_pulse_drive on the CPU." << endl;
@@ -935,12 +941,14 @@ void validate_pulse_shape(double amp, double width, double freq, const char* wha
         (void) pulse_window_chunking;
         if (use_gpu) {
 #ifdef CUDA_ENABLED
-            check_gpu_supported(spin_state_out != nullptr);
-            return double_pulse_drive_gpu(field_in_1_SU2, field_in_1_SU3, t_B_1,
-                                field_in_2_SU2, field_in_2_SU3, t_B_2,
-                                pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
-                                pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
-                                T_start, T_end, step_size, method);
+            if (classical_spin::gpu::device_available()) {
+                check_gpu_supported(spin_state_out != nullptr);
+                return double_pulse_drive_gpu(field_in_1_SU2, field_in_1_SU3, t_B_1,
+                                    field_in_2_SU2, field_in_2_SU3, t_B_2,
+                                    pulse_amp_SU2, pulse_width_SU2, pulse_freq_SU2,
+                                    pulse_amp_SU3, pulse_width_SU3, pulse_freq_SU3,
+                                    T_start, T_end, step_size, method, abs_tol, rel_tol);
+            }
 #else
             std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED); "
                          "running double_pulse_drive on the CPU." << endl;
@@ -1008,10 +1016,12 @@ void append_hdf5_columns(const std::string& filename, const std::string& group_n
                            double abs_tol, double rel_tol) {
         if (use_gpu) {
 #ifdef CUDA_ENABLED
-            check_gpu_supported();
-            (void) abs_tol; (void) rel_tol;  // the GPU integrators are fixed-step
-            molecular_dynamics_gpu(T_start, T_end, dt_initial, out_dir, save_interval, method);
-            return;
+            if (classical_spin::gpu::device_available()) {
+                check_gpu_supported();
+                molecular_dynamics_gpu(T_start, T_end, dt_initial, out_dir, save_interval, method,
+                                       abs_tol > 0.0 ? abs_tol : 1e-6, rel_tol > 0.0 ? rel_tol : 1e-6);
+                return;
+            }
 #else
             std::cerr << "Warning: GPU support not available (compiled without CUDA_ENABLED); "
                          "running molecular dynamics on the CPU." << endl;
@@ -1282,7 +1292,7 @@ void require_grid_length(const MixedLattice::PumpProbeTrajectory& tr, size_t n, 
         p.abs_tol = abs_tol;
         p.rel_tol = rel_tol;
 #ifdef CUDA_ENABLED
-        p.gpu = use_gpu;
+        p.gpu = use_gpu && classical_spin::gpu::device_available();
         if (p.gpu) check_gpu_supported(save_spin_trajectories);
 #else
         (void) use_gpu;

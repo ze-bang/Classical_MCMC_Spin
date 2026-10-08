@@ -33,6 +33,10 @@
 
 #include <boost/numeric/odeint.hpp>
 
+#ifdef CUDA_ENABLED
+#include "classical_spin/gpu/device_select.h"
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -65,8 +69,10 @@ void warn_no_gpu() {
 }
 
 #ifdef CUDA_ENABLED
-// use_gpu honoured only when the GPU kernels implement the model.
+// use_gpu honoured only when a device is usable (reported once per process)
+// and the GPU kernels implement the model.
 bool gpu_usable(const Lattice& lat) {
+    if (!classical_spin::gpu::device_available()) return false;
     std::string reason;
     if (lat.gpu_supports_model(reason)) return true;
     std::cerr << "Warning: the GPU right-hand side does not support " << reason
@@ -537,7 +543,9 @@ void Lattice::molecular_dynamics(double T_start, double T_end, double dt_initial
     if (use_gpu) {
 #ifdef CUDA_ENABLED
         if (gpu_usable(*this)) {
-            molecular_dynamics_gpu(T_start, T_end, dt_initial, out_dir, save_interval, method);
+            const double tol = (m == OdeMethod::BulirschStoer) ? 1e-8 : 1e-6;
+            molecular_dynamics_gpu(T_start, T_end, dt_initial, out_dir, save_interval, method,
+                                   abs_tol > 0.0 ? abs_tol : tol, rel_tol > 0.0 ? rel_tol : tol);
             return;
         }
 #else
@@ -670,7 +678,7 @@ Lattice::PumpProbeTrajectory Lattice::single_pulse_drive(
 #ifdef CUDA_ENABLED
         if (gpu_usable(*this))
             return single_pulse_drive_gpu(field_in, t_B, pulse_amp, pulse_width, pulse_freq,
-                                          T_start, T_end, step_size, method);
+                                          T_start, T_end, step_size, method, abs_tol, rel_tol);
 #else
         warn_no_gpu();
 #endif
@@ -693,7 +701,7 @@ Lattice::PumpProbeTrajectory Lattice::double_pulse_drive(
         if (gpu_usable(*this))
             return double_pulse_drive_gpu(field_in_1, t_B_1, field_in_2, t_B_2,
                                           pulse_amp, pulse_width, pulse_freq,
-                                          T_start, T_end, step_size, method);
+                                          T_start, T_end, step_size, method, abs_tol, rel_tol);
 #else
         warn_no_gpu();
 #endif
@@ -1256,6 +1264,9 @@ void Lattice::pump_probe_spectroscopy_mpi(const vector<SpinVector>& field_in,
     // rank 0 decides the backend (its GPU runs the batched path alone).
     broadcast_dynamical_state(comm, 0);
     int gpu_flag = use_gpu ? 1 : 0;
+#ifdef CUDA_ENABLED
+    if (rank == 0 && gpu_flag && !classical_spin::gpu::device_available()) gpu_flag = 0;
+#endif
     MPI_Bcast(&gpu_flag, 1, MPI_INT, 0, comm);
     use_gpu = (gpu_flag != 0);
 

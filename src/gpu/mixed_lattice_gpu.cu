@@ -474,17 +474,20 @@ void integrate_mixed_gpu(
     double dt,
     size_t save_interval,
     std::vector<std::pair<double, std::vector<double>>>& trajectory,
-    const std::string& method
+    const std::string& method,
+    double abs_tol,
+    double rel_tol
 ) {
-    // Delegate to the shared gpu::ode fixed-step driver. The observer snapshots
-    // the combined SU(2)+SU(3) device state to host at each save point.
+    // Delegate to the shared gpu::ode driver (fixed-step or error-controlled,
+    // exact output grid). The observer snapshots the combined SU(2)+SU(3)
+    // device state to host at each output time.
     auto observe = [&](double t_obs, const ::gpu::ode::State& st) {
         thrust::host_vector<double> h_state = st;
         trajectory.push_back({t_obs, std::vector<double>(h_state.begin(), h_state.end())});
     };
 
     ::gpu::ode::integrate(system, state, T_start, T_end, dt, save_interval,
-                          observe, method, system.data.rk_ws);
+                          observe, method, system.data.rk_ws, abs_tol, rel_tol);
 }
 
 void compute_magnetization_mixed_gpu(
@@ -683,13 +686,15 @@ void integrate_mixed_gpu(
     double dt,
     size_t save_interval,
     std::vector<std::pair<double, std::vector<double>>>& trajectory,
-    const std::string& method
+    const std::string& method,
+    double abs_tol,
+    double rel_tol
 ) {
-    if (!handle || !handle->has_state) return;
-    
+    if (!handle) throw std::invalid_argument("integrate_mixed_gpu: null GPU handle");
+    if (!handle->has_state) throw std::invalid_argument("integrate_mixed_gpu: no spin state uploaded");
     GPUMixedODESystem system(handle->data);
-    mixed_gpu::integrate_mixed_gpu(system, handle->state, T_start, T_end, dt, 
-                                    save_interval, trajectory, method);
+    mixed_gpu::integrate_mixed_gpu(system, handle->state, T_start, T_end, dt,
+                                    save_interval, trajectory, method, abs_tol, rel_tol);
 }
 
 void step_mixed_gpu(
@@ -698,8 +703,9 @@ void step_mixed_gpu(
     double dt,
     const std::string& method
 ) {
-    if (!handle || !handle->has_state) return;
-    
+    if (!handle) throw std::invalid_argument("step_mixed_gpu: null GPU handle");
+    if (!handle->has_state) throw std::invalid_argument("step_mixed_gpu: no spin state uploaded");
+
     GPUMixedODESystem system(handle->data);
     mixed_gpu::step_mixed_gpu(system, handle->state, t, dt, method);
 }

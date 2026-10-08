@@ -18,9 +18,7 @@
 #include <iomanip>
 #include <cmath>
 
-#ifdef CUDA_ENABLED
-#include <cuda_runtime.h>
-#endif
+#include "classical_spin/gpu/device_select.h"
 
 using namespace std;
 
@@ -228,29 +226,9 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
         }
     }
     
-#ifdef CUDA_ENABLED
-    // Set GPU device based on local rank (for multi-GPU nodes)
-    if (config.use_gpu) {
-        int device_count;
-        cudaGetDeviceCount(&device_count);
-        if (device_count > 0) {
-            int device_id = rank % device_count;
-            cudaSetDevice(device_id);
-            // Log GPU assignment for all ranks (synchronized output)
-            for (int r = 0; r < size; ++r) {
-                if (rank == r) {
-                    cout << "[Rank " << rank << "] Assigned to GPU " << device_id 
-                         << " (" << device_count << " GPU(s) available)" << endl;
-                }
-                MPI_Barrier(MPI_COMM_WORLD);
-            }
-        } else {
-            if (rank == 0) {
-                cout << "Warning: No GPUs detected, falling back to CPU" << endl;
-            }
-        }
-    }
-#endif
+    // Bind a device (node-local rank) or report once that the GPU is not
+    // usable; the MixedLattice drivers then run on the CPU.
+    classical_spin::gpu::select_device(config.use_gpu, rank);
     
     // Distribute trials across MPI ranks
     const TrialStart start(lattice, config);
@@ -344,29 +322,9 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
         }
     }
     
-#ifdef CUDA_ENABLED
-    // Set GPU device based on local rank (for multi-GPU nodes)
-    if (config.use_gpu) {
-        int device_count;
-        cudaGetDeviceCount(&device_count);
-        if (device_count > 0) {
-            int device_id = rank % device_count;
-            cudaSetDevice(device_id);
-            // Log GPU assignment for all ranks (synchronized output)
-            for (int r = 0; r < size; ++r) {
-                if (rank == r) {
-                    cout << "[Rank " << rank << "] Assigned to GPU " << device_id 
-                         << " (" << device_count << " GPU(s) available)" << endl;
-                }
-                MPI_Barrier(MPI_COMM_WORLD);
-            }
-        } else {
-            if (rank == 0) {
-                cout << "Warning: No GPUs detected, falling back to CPU" << endl;
-            }
-        }
-    }
-#endif
+    // Bind a device (node-local rank) or report once that the GPU is not
+    // usable; the MixedLattice drivers then run on the CPU.
+    classical_spin::gpu::select_device(config.use_gpu, rank);
     
     // Prepare per-sublattice pulse directions for SU2
     // Normalize all pump directions
@@ -743,29 +701,9 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         }
     }
     
-#ifdef CUDA_ENABLED
-    // Set GPU device based on local rank (for multi-GPU nodes)
-    if (config.use_gpu) {
-        int device_count;
-        cudaGetDeviceCount(&device_count);
-        if (device_count > 0) {
-            int device_id = rank % device_count;
-            cudaSetDevice(device_id);
-            // Log GPU assignment for all ranks (synchronized output)
-            for (int r = 0; r < size; ++r) {
-                if (rank == r) {
-                    cout << "[Rank " << rank << "] Assigned to GPU " << device_id 
-                         << " (" << device_count << " GPU(s) available)" << endl;
-                }
-                MPI_Barrier(MPI_COMM_WORLD);
-            }
-        } else {
-            if (rank == 0) {
-                cout << "Warning: No GPUs detected, falling back to CPU" << endl;
-            }
-        }
-    }
-#endif
+    // Bind a device (node-local rank) or report once that the GPU is not
+    // usable; the MixedLattice drivers then run on the CPU.
+    classical_spin::gpu::select_device(config.use_gpu, rank);
     
     // Setup per-sublattice pulse field directions for SU2
     vector<vector<double>> pump_dirs_norm = config.pump_directions;

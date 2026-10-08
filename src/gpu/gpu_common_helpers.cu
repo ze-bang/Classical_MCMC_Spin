@@ -33,6 +33,22 @@ void update_arrays_three_kernel(
     out[idx] = a1 * in1[idx] + a2 * in2[idx] + a3 * in3[idx];
 }
 
+__global__
+void rk_lincomb_kernel(
+    double* out,
+    const double* base, double base_scale,
+    RKCombination comb,
+    double dt,
+    size_t size
+) {
+    const size_t stride = size_t(blockDim.x) * gridDim.x;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < size; i += stride) {
+        double acc = 0.0;
+        for (int j = 0; j < comb.m; ++j) acc += comb.coef[j] * comb.k[j][i];
+        out[i] = (base ? base_scale * base[i] : 0.0) + dt * acc;
+    }
+}
+
 // ======================= Fused RK Kernels for Performance =======================
 // These kernels combine multiple array updates to reduce kernel launch overhead
 

@@ -688,7 +688,9 @@ void integrate_mixed_gpu(
     double dt,
     size_t save_interval,
     std::vector<std::pair<double, std::vector<double>>>& trajectory,
-    const std::string& method = "ssprk53"
+    const std::string& method = "dopri5",
+    double abs_tol = 1e-8,
+    double rel_tol = 1e-8
 );
 
 /**
@@ -699,7 +701,7 @@ void step_mixed_gpu(
     GPUState& state,
     double t,
     double dt,
-    const std::string& method = "ssprk53"
+    const std::string& method = "rk4"
 );
 
 /**

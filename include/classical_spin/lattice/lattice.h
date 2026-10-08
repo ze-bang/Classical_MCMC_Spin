@@ -35,13 +35,10 @@
 #include "hdf5_io.h"
 #endif
 
-// GPU support: API header for all C++ TUs, full .cuh only for CUDA TUs
+// GPU support: the opaque host API (no .cu file includes this header).
 #ifdef CUDA_ENABLED
 #include "lattice_gpu_api.h"
-#endif
-
-#if defined(CUDA_ENABLED) && defined(__CUDACC__)
-#include "lattice_gpu.cuh"
+#include "classical_spin/gpu/gpu_handle.h"
 #endif
 
 // Optional profiling instrumentation
@@ -3624,79 +3621,6 @@ private:
         const std::vector<std::pair<double, std::vector<double>>>& raw) const;
 
 public:
-#if defined(CUDA_ENABLED) && defined(__CUDACC__)
-    /**
-     * Run molecular dynamics simulation with GPU acceleration (CUDA/Thrust)
-     * Uses true GPU integration - all computation stays on device
-     * Only transfers data to host for HDF5 I/O at save intervals
-     */
-    void molecular_dynamics_gpu(double T_start, double T_end, double dt_initial,
-                           string out_dir = "", size_t save_interval = 100,
-                           string method = "dopri5") {
-#ifndef HDF5_ENABLED
-        std::cerr << "Error: HDF5 support is required for molecular dynamics output." << endl;
-        std::cerr << "Please rebuild with -DHDF5_ENABLED flag and HDF5 libraries." << endl;
-        return;
-#endif
-
-        if (!out_dir.empty()) {
-            std::filesystem::create_directories(out_dir);
-        }
-
-        cout << "Running molecular dynamics with GPU acceleration: t=" << T_start << " → " << T_end << endl;
-        cout << "Integration method: " << method << " (GPU-native)" << endl;
-        cout << "Step size: " << dt_initial << endl;
-
-        // Ensure GPU data is initialized
-        ensure_gpu_data_initialized();
-
-        // Create GPU ODE system
-        gpu::GPUODESystem gpu_system(gpu_data_cache_);
-
-        // Transfer initial state to GPU
-        ODEState h_state = spins_to_state(spins);
-        gpu::GPUState d_state(h_state.begin(), h_state.end());
-
-        // Create HDF5 writer
-        std::unique_ptr<HDF5MDWriter> hdf5_writer;
-        if (!out_dir.empty()) {
-            string hdf5_file = out_dir + "/trajectory.h5";
-            cout << "Writing trajectory to HDF5 file: " << hdf5_file << endl;
-            hdf5_writer = std::make_unique<HDF5MDWriter>(
-                hdf5_file, lattice_size, spin_dim, N_atoms,
-                dim1, dim2, dim3, method + "_gpu_native",
-                dt_initial, T_start, T_end, save_interval, spin_length,
-                &site_positions, 10000);
-        }
-
-        // Integrate on GPU - all computation on device, only transfer for I/O
-        std::vector<std::pair<double, std::vector<double>>> trajectory;
-        gpu::integrate_gpu(gpu_system, d_state, T_start, T_end, dt_initial,
-                          save_interval, trajectory);
-
-        // Write trajectory to HDF5 (post-processing on CPU)
-        size_t save_count = 0;
-        for (const auto& [t, state_vec] : trajectory) {
-            const array<SpinVector, 3> M = measure_magnetizations(state_vec.data());
-            if (hdf5_writer) {
-                hdf5_writer->write_flat_step(t, M[0], M[1], M[2], state_vec.data());
-                save_count++;
-            }
-            if (save_count % 10 == 0) {
-                double E = total_energy_flat(state_vec.data()) / lattice_size;
-                cout << "t=" << t << ", E/N=" << E << ", |M|=" << M[1].norm() << endl;
-            }
-        }
-
-        // Close HDF5 file
-        if (hdf5_writer) {
-            hdf5_writer->close();
-            cout << "HDF5 trajectory saved with " << save_count << " snapshots" << endl;
-        }
-
-        cout << "GPU molecular dynamics complete! (" << trajectory.size() << " saved states)" << endl;
-    }
-#endif // CUDA_ENABLED
 
     // ============================================================
     // OBSERVABLES
@@ -4270,203 +4194,24 @@ public:
         return false;
     }
 
-#if defined(CUDA_ENABLED) && defined(__CUDACC__)
-private:
-    // GPU data cache for avoiding repeated transfers
-    mutable gpu::GPULatticeData gpu_data_cache_;
-    mutable bool gpu_data_initialized_ = false;
-    
-    /**
-     * Ensure GPU lattice data is initialized (lazy initialization)
-     * Uses the modular gpu:: implementation from lattice_gpu.cuh/cu
-     */
-    void ensure_gpu_data_initialized() const {
-        if (gpu_data_initialized_) return;
-
-        if (has_trilinear_interactions()) {
-            throw std::runtime_error(
-                "Lattice::ensure_gpu_data_initialized: this lattice has "
-                "trilinear couplings, but the GPU code path in "
-                "src/gpu/lattice_gpu.cu does not implement them yet. "
-                "Set use_gpu=false, or run on a Hamiltonian without "
-                "trilinear terms. (See audit item T3.)");
-        }
-
-        // Flatten field data
-        vector<double> flat_field;
-        flat_field.reserve(lattice_size * spin_dim);
-        for (size_t i = 0; i < lattice_size; ++i) {
-            for (size_t d = 0; d < spin_dim; ++d) {
-                flat_field.push_back(field[i](d));
-            }
-        }
-        
-        // Flatten onsite interaction matrices
-        vector<double> flat_onsite;
-        flat_onsite.reserve(lattice_size * spin_dim * spin_dim);
-        for (size_t i = 0; i < lattice_size; ++i) {
-            for (size_t r = 0; r < spin_dim; ++r) {
-                for (size_t c = 0; c < spin_dim; ++c) {
-                    flat_onsite.push_back(onsite_interaction[i](r, c));
-                }
-            }
-        }
-        
-        // Flatten bilinear interaction data
-        vector<double> flat_bilinear;
-        vector<size_t> flat_partners;
-        vector<size_t> num_bilinear_per_site;
-        
-        flat_bilinear.reserve(lattice_size * num_bi * spin_dim * spin_dim);
-        flat_partners.reserve(lattice_size * num_bi);
-        num_bilinear_per_site.reserve(lattice_size);
-        
-        for (size_t i = 0; i < lattice_size; ++i) {
-            num_bilinear_per_site.push_back(bilinear_partners[i].size());
-            for (size_t n = 0; n < num_bi; ++n) {
-                if (n < bilinear_partners[i].size()) {
-                    flat_partners.push_back(bilinear_partners[i][n]);
-                    for (size_t r = 0; r < spin_dim; ++r) {
-                        for (size_t c = 0; c < spin_dim; ++c) {
-                            flat_bilinear.push_back(bilinear_interaction[i][n](r, c));
-                        }
-                    }
-                } else {
-                    flat_partners.push_back(0);
-                    for (size_t j = 0; j < spin_dim * spin_dim; ++j) {
-                        flat_bilinear.push_back(0.0);
-                    }
-                }
-            }
-        }
-        
-        // Create GPU data using the modular implementation
-        gpu_data_cache_ = gpu::create_gpu_lattice_data(
-            lattice_size, spin_dim, N_atoms, num_bi,
-            flat_field, flat_onsite, flat_bilinear, 
-            flat_partners, num_bilinear_per_site
-        );
-        
-        gpu_data_initialized_ = true;
-    }
-    
-    /**
-     * Update GPU pulse parameters
-     */
-    void update_gpu_pulse() const {
-        vector<double> flat_field_drive;
-        flat_field_drive.reserve(2 * N_atoms * spin_dim);
-        for (size_t p = 0; p < 2; ++p) {
-            for (size_t d = 0; d < field_drive[p].size(); ++d) {
-                flat_field_drive.push_back(field_drive[p](d));
-            }
-        }
-        
-        gpu::set_gpu_pulse(
-            gpu_data_cache_,
-            flat_field_drive,
-            field_drive_amp,
-            field_drive_width,
-            field_drive_freq,
-            t_pulse[0],
-            t_pulse[1]
-        );
-    }
-    
-    /**
-     * GPU version of single_pulse_drive using true GPU integration
-     * Uses gpu::integrate_gpu for pure GPU execution without per-step host transfers
-     */
-    vector<pair<double, array<SpinVector, 3>>> single_pulse_drive_gpu(
-               const vector<SpinVector>& field_in, double t_B,
-               double pulse_amp, double pulse_width, double pulse_freq,
-               double T_start, double T_end, double step_size,
-               string method = "dopri5") {
-        
-        // Set up pulse on CPU side first
-        set_pulse(field_in, t_B, vector<SpinVector>(N_atoms, SpinVector::Zero(spin_dim)), 
-                 0.0, pulse_amp, pulse_width, pulse_freq);
-        
-        // Ensure GPU data is initialized and update pulse
-        ensure_gpu_data_initialized();
-        update_gpu_pulse();
-        
-        // Create GPU ODE system
-        gpu::GPUODESystem gpu_system(gpu_data_cache_);
-        
-        // Transfer initial state to GPU
-        ODEState h_state = spins_to_state(spins);
-        gpu::GPUState d_state(h_state.begin(), h_state.end());
-        
-        // Calculate save interval from step size
-        double total_time = T_end - T_start;
-        size_t total_steps = static_cast<size_t>(total_time / step_size) + 1;
-        size_t save_interval = 1;  // Save every step for trajectory output
-        
-        // Integrate on GPU - all computation stays on device
-        std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_system, d_state, T_start, T_end, step_size, 
-                          save_interval, raw_trajectory);
-        
-        // Convert raw snapshots to the magnetisation trajectory
-        PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
-        clear_pulse();
-        return trajectory;
-    }
-    
-    /**
-     * GPU version of double_pulse_drive using true GPU integration
-     */
-    vector<pair<double, array<SpinVector, 3>>> double_pulse_drive_gpu(
-               const vector<SpinVector>& field_in_1, double t_B_1,
-               const vector<SpinVector>& field_in_2, double t_B_2,
-               double pulse_amp, double pulse_width, double pulse_freq,
-               double T_start, double T_end, double step_size,
-               string method = "dopri5") {
-        
-        // Set up two-pulse configuration
-        set_pulse(field_in_1, t_B_1, field_in_2, t_B_2, 
-                 pulse_amp, pulse_width, pulse_freq);
-        
-        // Ensure GPU data is initialized and update pulse
-        ensure_gpu_data_initialized();
-        update_gpu_pulse();
-        
-        // Create GPU ODE system
-        gpu::GPUODESystem gpu_system(gpu_data_cache_);
-        
-        // Transfer initial state to GPU
-        ODEState h_state = spins_to_state(spins);
-        gpu::GPUState d_state(h_state.begin(), h_state.end());
-        
-        // Integrate on GPU
-        std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_system, d_state, T_start, T_end, step_size, 
-                          1, raw_trajectory);
-        
-        // Convert raw snapshots to the magnetisation trajectory
-        PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
-        clear_pulse();
-        return trajectory;
-    }
-#endif // defined(CUDA_ENABLED) && defined(__CUDACC__)
 
 // =============================================================================
-// GPU Implementation using opaque API (for C++ TUs compiled with g++)
-// This section is used when CUDA_ENABLED but not compiling with NVCC
+// GPU backend glue (opaque API of lattice_gpu_api.h; untested here: no CUDA
+// toolchain in CI). Methods and tolerances follow gpu::integrate_gpu.
 // =============================================================================
-#if defined(CUDA_ENABLED) && !defined(__CUDACC__)
+#ifdef CUDA_ENABLED
 private:
-    // GPU data handle (opaque pointer managed by CUDA library)
-    mutable gpu::GPULatticeDataHandle* gpu_handle_ = nullptr;
-    mutable bool gpu_data_initialized_ = false;
+    // Device copy of the Hamiltonian, uploaded on first GPU use. Freed by the
+    // destructor; a copied Lattice starts without one (DeviceHandle never
+    // shares a handle between objects).
+    mutable classical_spin::gpu::DeviceHandle<gpu::GPULatticeDataHandle, &gpu::destroy_gpu_lattice_data> gpu_handle_;
     
     /**
      * Ensure GPU lattice data is initialized (lazy initialization)
      * Uses the opaque API from lattice_gpu_api.h
      */
     void ensure_gpu_data_initialized() const {
-        if (gpu_data_initialized_) return;
+        if (gpu_handle_) return;
 
         if (has_trilinear_interactions()) {
             throw std::runtime_error(
@@ -4526,13 +4271,10 @@ private:
         }
         
         // Create GPU data using opaque API
-        gpu_handle_ = gpu::create_gpu_lattice_data(
+        gpu_handle_.reset(gpu::create_gpu_lattice_data(
             lattice_size, spin_dim, N_atoms, num_bi,
-            flat_field, flat_onsite, flat_bilinear, 
-            flat_partners, num_bilinear_per_site
-        );
-        
-        gpu_data_initialized_ = true;
+            flat_field, flat_onsite, flat_bilinear,
+            flat_partners, num_bilinear_per_site));
     }
     
     /**
@@ -4550,7 +4292,7 @@ private:
         }
         
         gpu::set_gpu_pulse(
-            gpu_handle_,
+            gpu_handle_.get(),
             flat_field_drive,
             field_drive_amp,
             field_drive_width,
@@ -4565,7 +4307,7 @@ private:
      */
     void molecular_dynamics_gpu(double T_start, double T_end, double dt_initial,
                            string out_dir = "", size_t save_interval = 100,
-                           string method = "dopri5") {
+                           string method = "dopri5", double abs_tol = 1e-6, double rel_tol = 1e-6) {
 #ifndef HDF5_ENABLED
         std::cerr << "Error: HDF5 support is required for molecular dynamics output." << endl;
         return;
@@ -4583,7 +4325,7 @@ private:
         
         // Transfer initial state to GPU
         ODEState h_state = spins_to_state(spins);
-        gpu::set_gpu_spins(gpu_handle_, h_state);
+        gpu::set_gpu_spins(gpu_handle_.get(), h_state);
         
         // Create HDF5 writer
         std::unique_ptr<HDF5MDWriter> hdf5_writer;
@@ -4599,8 +4341,8 @@ private:
         
         // Integrate on GPU
         std::vector<std::pair<double, std::vector<double>>> trajectory;
-        gpu::integrate_gpu(gpu_handle_, T_start, T_end, dt_initial, 
-                          save_interval, trajectory, method);
+        gpu::integrate_gpu(gpu_handle_.get(), T_start, T_end, dt_initial,
+                          save_interval, trajectory, method, abs_tol, rel_tol);
         
         // Write trajectory to HDF5 (post-processing on CPU)
         size_t save_count = 0;
@@ -4683,7 +4425,7 @@ private:
         measure_magnetizations(ground.data(), baseline.data(), scratch.data());
 
         std::cout << "[GPU batched 2DCS] " << (n_tau + 1) << " replicas (1 reference + "
-                  << n_tau << " delays), rk4" << std::endl;
+                  << n_tau << " delays), " << spec.settings.method << std::endl;
         const double t_pulse2_disabled = grid.t_end() + 100.0 * std::max(spec.width, 1.0);
         std::vector<double> batch_tau2(n_tau + 1);
         batch_tau2[0] = t_pulse2_disabled;
@@ -4700,8 +4442,9 @@ private:
                 for (size_t c = 0; c < spin_dim; ++c)
                     flat_frames[(a * spin_dim + r) * spin_dim + c] = sublattice_frames[a](r, c);
         gpu::BatchedMagResult batched = gpu::integrate_gpu_batched(
-            gpu_handle_, flat_init, batch_tau2, flat_afm, flat_frames,
-            grid.t0, grid.t_end(), grid.dt, /*save_interval=*/1, /*method=*/"rk4");
+            gpu_handle_.get(), flat_init, batch_tau2, flat_afm, flat_frames,
+            grid.t0, grid.t_end(), grid.dt, /*save_interval=*/1, spec.settings.method,
+            spec.settings.abs_tol, spec.settings.rel_tol);
         clear_pulse();
         if (batched.n_time_points != grid.n || batched.B != n_tau + 1) {
             throw std::runtime_error("pump_probe_spectroscopy_gpu_batched: GPU returned " +
@@ -4736,7 +4479,7 @@ private:
                const vector<SpinVector>& field_in, double t_B,
                double pulse_amp, double pulse_width, double pulse_freq,
                double T_start, double T_end, double step_size,
-               string method = "dopri5") {
+               string method = "dopri5", double abs_tol = 1e-8, double rel_tol = 1e-8) {
         
         // Set up pulse
         set_pulse(field_in, t_B, vector<SpinVector>(N_atoms, SpinVector::Zero(spin_dim)), 
@@ -4748,12 +4491,12 @@ private:
         
         // Transfer initial state to GPU
         ODEState h_state = spins_to_state(spins);
-        gpu::set_gpu_spins(gpu_handle_, h_state);
+        gpu::set_gpu_spins(gpu_handle_.get(), h_state);
         
         // Integrate on GPU
         std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_handle_, T_start, T_end, step_size, 
-                          1, raw_trajectory, method);
+        gpu::integrate_gpu(gpu_handle_.get(), T_start, T_end, step_size,
+                          1, raw_trajectory, method, abs_tol, rel_tol);
         
         // Convert raw snapshots to the magnetisation trajectory
         PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
@@ -4769,7 +4512,7 @@ private:
                    const vector<SpinVector>& field_in_2, double t_B_2,
                    double pulse_amp, double pulse_width, double pulse_freq,
                    double T_start, double T_end, double step_size,
-                   string method = "dopri5") {
+                   string method = "dopri5", double abs_tol = 1e-8, double rel_tol = 1e-8) {
         
         // Set up two-pulse configuration
         set_pulse(field_in_1, t_B_1, field_in_2, t_B_2, 
@@ -4781,19 +4524,19 @@ private:
         
         // Transfer initial state to GPU
         ODEState h_state = spins_to_state(spins);
-        gpu::set_gpu_spins(gpu_handle_, h_state);
+        gpu::set_gpu_spins(gpu_handle_.get(), h_state);
         
         // Integrate on GPU
         std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_handle_, T_start, T_end, step_size, 
-                          1, raw_trajectory, method);
+        gpu::integrate_gpu(gpu_handle_.get(), T_start, T_end, step_size,
+                          1, raw_trajectory, method, abs_tol, rel_tol);
         
         // Convert raw snapshots to the magnetisation trajectory
         PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
         clear_pulse();
         return trajectory;
     }
-#endif // defined(CUDA_ENABLED) && !defined(__CUDACC__)
+#endif // CUDA_ENABLED
 
 };
 

@@ -134,22 +134,12 @@ void get_gpu_mixed_spins(
 );
 
 /**
- * Perform GPU integration using specified method
- * 
- * Available methods:
- * - "euler": Explicit Euler (1st order)
- * - "rk2" or "midpoint": Modified midpoint (2nd order)
- * - "rk4": Classic Runge-Kutta (4th order)
- * - "dopri5": Dormand-Prince 5(4) - recommended
- * - "ssprk53": SSP RK 5-stage 3rd order (default, optimized for spin dynamics)
- * 
- * @param handle GPU data handle
- * @param T_start Start time
- * @param T_end End time
- * @param dt Step size
- * @param save_interval Steps between trajectory saves
- * @param trajectory Output: (time, state) pairs saved at intervals
- * @param method Integration method (default: ssprk53)
+ * Integrate on the GPU from the uploaded state and record (t, state) on the
+ * output grid t_k = T_start + k * save_interval * dt (the samples that fit
+ * into [T_start, T_end]). Methods as gpu::integrate_gpu (lattice_gpu_api.h):
+ * euler, rk2, rk4, ssprk53 (fixed step); rk5 / rk54, dopri5 (default), rk78
+ * (error-controlled with abs_tol / rel_tol, dt = initial step); any other name,
+ * a null handle or a missing state throws std::invalid_argument.
  */
 void integrate_mixed_gpu(
     GPUMixedLatticeDataHandle* handle,
@@ -158,22 +148,19 @@ void integrate_mixed_gpu(
     double dt,
     size_t save_interval,
     std::vector<std::pair<double, std::vector<double>>>& trajectory,
-    const std::string& method = "ssprk53"
+    const std::string& method = "dopri5",
+    double abs_tol = 1e-8,
+    double rel_tol = 1e-8
 );
 
 /**
- * Single integration step on GPU
- * 
- * @param handle GPU data handle
- * @param t Current time
- * @param dt Step size
- * @param method Integration method (default: ssprk53)
+ * One step of size dt (no error control).
  */
 void step_mixed_gpu(
     GPUMixedLatticeDataHandle* handle,
     double t,
     double dt,
-    const std::string& method = "ssprk53"
+    const std::string& method = "rk4"
 );
 
 /**

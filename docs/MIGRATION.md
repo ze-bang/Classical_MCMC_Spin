@@ -588,3 +588,47 @@ normalised per site (1/N); the accumulator is per unit cell.
 
 **Recover the old behaviour.** Compute |Σ_i S_i^x e^{iq·r_i}|²/N directly from
 `spins` if needed.
+
+## GPU integrators: correct RKF7(8), real error control, strict method names (untested: no CUDA toolchain)
+
+**What changed.** The GPU steppers read their Butcher tableaux from
+`gpu/ode/rk_tableaux.h`, the constants `tests/test_gpu_tableaux.cpp` checks on
+the CPU (measured orders 8/7 for Fehlberg, 5/4 for Dormand-Prince and Cash-Karp).
+
+- `rk78`/`rkf78` used Fehlberg's a53/a54 swapped (order ~5) and propagated the
+  11-stage 7th-order weights; it is now the full 13-stage 8th-order solution
+  with the 7th-order error estimate (as Boost.Odeint).
+- `dopri5`, `rk5`/`rkck54`/`rk54`/`rkf54` and `rk78` are error-controlled on the
+  GPU (max-norm error test with abs_tol / rel_tol as on the CPU, step factor
+  0.9 err^(-1/(q+1)) in [0.2, 5]); `dt` is only the initial step. They used to
+  take fixed steps of the output spacing with the tolerances discarded. The
+  tolerances of `molecular_dynamics`, `single/double_pulse_drive` and the
+  batched 2DCS scan are passed through (Lattice and MixedLattice).
+- `bulirsch_stoer`/`bs` (a 2nd-order midpoint step on the GPU), Adams,
+  geometric and unknown method names throw `std::invalid_argument` on the GPU
+  path instead of silently running another method (unknown names used to run
+  ssprk53, the batched scan forced rk4).
+- GPU trajectories are sampled on t_k = T_start + k dt_out, the
+  `TimeGrid::covering` grid of the CPU drivers (the old loop accumulated
+  t += dt and took one step past T_end, so GPU and CPU trajectories differed in
+  length).
+- API defaults: `integrate_gpu` / `integrate_mixed_gpu` default to `dopri5`
+  (was `ssprk53`); null handles or a missing uploaded state throw.
+
+**Recover the old behaviour.** Fixed steps of the output spacing: use `rk4` or
+`ssprk53` explicitly.
+
+## GPU device selection and handle lifetime (untested: no CUDA toolchain)
+
+**What changed.** `classical_spin::gpu::select_device` (gpu/device_select.h) is
+the one device-selection routine: it checks the CUDA return codes, binds by the
+node-local rank from the launcher environment (non-collective; was global rank
+modulo device count on an unchecked, possibly uninitialised count) and reports
+once. Without a usable device the Lattice and MixedLattice dynamics drivers run
+on the CPU (the "falling back to CPU" message used to be printed while the GPU
+path was still taken). The opaque GPU handles of Lattice and MixedLattice are
+owned by `DeviceHandle` (gpu/gpu_handle.h): freed in the destructor (they
+leaked once per object) and never shared by copies (MixedLattice clones shared
+one raw handle). The never-compiled `__CUDACC__` member blocks of lattice.h and
+mixed_lattice.h (a second class layout) and the never-defined `LatticeGPU`
+declarations were removed.
