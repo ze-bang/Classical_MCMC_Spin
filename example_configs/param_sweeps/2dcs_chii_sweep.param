@@ -1,5 +1,8 @@
 # Example configuration for exchange parameter sweep with 2DCS spectroscopy
-# This sweeps over chii parameter in TmFeO3 while running 2DCS at each point
+# This sweeps the Fe-Tm bilinear coupling K^- (lambda_2 - S^y channel,
+# key Kminus_2y) in TmFeO3 while running 2DCS at each point. Earlier versions
+# swept `chii`, a key of the legacy code that the current TmFeO3 builder never
+# reads, so every point ran the same Hamiltonian.
 
 # System specification
 system = tmfeo3
@@ -10,7 +13,7 @@ spin_length = 1.0
 simulation_mode = parameter_sweep
 
 # Parameter sweep settings
-sweep_parameter = chii               # Sweep over Fe-Tm coupling
+sweep_parameter = Kminus_2y          # Sweep over the Fe-Tm coupling K^-_{2y}
 sweep_start = 0.0                    # Starting value
 sweep_end = 0.1                      # Ending value
 sweep_step = 0.01                    # Step size

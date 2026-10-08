@@ -535,3 +535,92 @@ extent, e.g. the honeycomb J3 offset (1,−2,0) on a lattice one cell wide. A
 lattice narrower than 2|offset| + 1 along a bonded direction prints a warning:
 periodic images of distinct bonds then land on the same pair and their
 couplings add.
+
+## Config files: unknown keys are errors
+
+**What changed.** A key that is neither a typed `SpinConfig` field (or one of
+its aliases, e.g. `dt`, `h`, `tbc`, `temperature_start`) nor a registered
+Hamiltonian / model parameter is an error naming file, line and the nearest
+known key (`anealing_steps` → "did you mean 'annealing_steps'?"). Hamiltonian
+keys are registered in `src/core/spin_config.cpp` (literal names plus key
+families such as `mode<i>_omega`, `Kminus<orbit>_<λ><axis>`, `h_tm_<a>`);
+`tests/test_config.cpp` scans `src/` and `include/` and fails if a literal key
+read through `get_param`/`has_param`/`was_set` is missing, so the registry
+cannot fall behind the builders. A line without `=` or `:` is also an error
+(it was skipped). A key given twice prints a warning (the last value wins, as
+before).
+
+**Why.** Unknown keys were stored as Hamiltonian parameters and never read, so a
+typo (`anealing_steps`, `Gama`) silently ran the default and a whole example
+(`Pyrochlore/field_scan.param`, keys `field_scan_*`) ran something else than it
+said.
+
+**Recover the old behaviour.** `allow_unknown_keys = true` keeps unknown numeric
+keys as Hamiltonian parameters with a warning (anywhere in the file).
+
+## Config files: strict numbers and booleans
+
+**What changed.** Integer keys accept `1e5` or `100000.0` when the value is
+integral and in range, and reject fractional (`2.7`), negative (for counts) and
+overflowing values; doubles must be finite and consume the whole value
+(`1.5abc` is an error); `seed` is parsed exactly to 64 bits. Booleans are
+`true/false`, `yes/no`, `on/off`, `1/0` in any case; anything else is an error
+(`ture` used to mean false, and `auto_su3_pump`/`fix_strain` only knew
+`true`/`1`). `lattice_size` needs exactly three values. Errors name the key and
+the line.
+
+**Why.** `std::stoull("1e5")` is 1 and `stoull("-1")` is 2^64 − 1, so
+`annealing_steps = 1e5` ran one sweep and `lattice_size = -8` asked for 10^19
+sites.
+
+**Recover the old behaviour.** Not supported (write the value in range).
+
+## Config: one key/value entry point (`SpinConfig::set`), lossless `to_file`
+
+**What changed.** `SpinConfig::set(key, value)` is the single entry point for a
+key: `from_file`/`from_string` call it for every line and parameter sweeps
+apply their values through it (`set_value`, printed with `%.17g`). It returns
+false for an unknown key. `to_file` writes every typed key and Hamiltonian
+parameter at full precision under the name the parser expects
+(`simulation_mode`, not `simulation`; the old name is accepted as an alias), so
+`from_file(to_file(c))` reproduces `c` (tested for every key). The legacy
+single-axis sweep keys `sweep_parameter/start/end/step` set element 0 of the
+N-dimensional lists and are written in that form. `explicit_keys`/`was_set`
+store canonical names (an alias marks its canonical key). `field_direction` is
+still normalised on input; a vector that is already unit length is kept
+bitwise.
+
+**Why.** Sweeps only wrote the Hamiltonian map, so sweeping a typed field
+(`pump_amplitude`, `probe_time`, `T_start`, `md_*`, `tau_*`, ...) ran N identical
+simulations; `to_file` output did not parse.
+
+## Config validation
+
+**What changed.** `SpinConfig::validation_errors()` (used by `validate()` and by
+`spin_solver` before anything is built) rejects:
+`cooling_rate` outside (0, 1), `T_end <= 0` or `T_start < T_end` whenever a run
+anneals (SA, and the ground-state preparation of MD / pump-probe / 2DCS without
+`initial_spin_config`; the TmFeO3 2DCS runner always anneals) or runs parallel
+tempering, `probe_rate = 0` or `pt_exchange_frequency = 0` (PT),
+`md_timestep <= 0`, `md_save_interval = 0` or `md_time_end < md_time_start`
+(every dynamics mode and family), a zero or wrong-sign `tau_step` (2DCS, every
+family; NCTO checks its effective default scan), lattice sizes of 0,
+`num_trials < 1`, non-positive spin lengths, a `field_direction` or `g_factor`
+without 3 components, system/mode combinations the driver does not implement
+(NCTO + parallel tempering, `kinetic_barrier`/`gneb`, `custom`), and parameter
+sweeps without parameters, with inconsistent list lengths, unknown or
+non-numeric swept keys, or invalid grids. `SA` with `annealing_steps = 0` (an
+energy evaluation) skips the schedule checks.
+
+**Why.** `T_end = 0` (two shipped examples) and `cooling_rate >= 1` never
+terminated, `probe_rate = 0` divided by zero, unsupported modes printed an error
+and exited 0.
+
+**Example configs fixed.** `Pyrochlore/field_scan.param` is now the field scan
+it describes (a parameter sweep over `field_strength`, 0 → 5 step 0.1, with
+`T_end = 0.001`, `T_zero = true`); `Pyrochlore/md_pyrochlore.param` uses
+`T_end = 0.001`, `T_zero = true`; `param_sweeps/2dcs_chii_sweep.param` and
+`2dcs_sweep_example.param` use the Fe–Tm coupling `Kminus_2y` instead of
+`chii` (a legacy key the current TmFeO3 builder never read);
+`Pyrochlore/pt_non_kramer_field_sweep.param` ends at 2.9 (the same eight
+points it ran before; 1.5 → 3.0 is not a whole number of 0.2 steps).

@@ -26,7 +26,7 @@ mpirun -np 32 ./build/spin_solver example_configs/param_sweeps/3d_parameter_swee
 | `field_sweep_example.param` | Kitaev | field_strength | 0.0 → 2.0 | MD |
 | `pump_amplitude_sweep.param` | Kitaev | pump_amplitude | 0.0 → 2.0 | Pump-probe |
 | `probe_delay_sweep_example.param` | BCAO | probe_time | 10.0 → 100.0 | Pump-probe |
-| `2dcs_chii_sweep.param` | TmFeO₃ | chii | 0.0 → 0.1 | 2DCS |
+| `2dcs_chii_sweep.param` | TmFeO₃ | Kminus_2y | 0.0 → 0.1 | 2DCS |
 | `pump_probe_sweep_example.param` | Kitaev | pump_amplitude | 0.0 → 2.0 | Pump-probe |
 | `2dcs_sweep_example.param` | TmFeO₃ | pump_frequency | 0.0 → 5.0 | 2DCS |
 
@@ -91,7 +91,7 @@ sweep_base_simulation = simulated_annealing
 - `T_end` - Final temperature
 
 ### Mixed Lattice (TmFeO₃)
-- `chii` - Fe-Tm bilinear coupling
+- `Kminus_2y` (and the other `Kminus_*`) - Fe-Tm bilinear coupling
 - `e1`, `e2` - Tm crystal field levels
 - `tm_alpha_scale`, `tm_beta_scale` - Tm wavefunction scaling
 

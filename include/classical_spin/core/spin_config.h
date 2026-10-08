@@ -3,6 +3,7 @@
 
 #include <string>
 #include <array>
+#include <cstdint>
 #include <vector>
 #include <map>
 #include <set>
@@ -313,13 +314,69 @@ struct SpinConfig {
     
     // MPI parameters
     bool use_mpi = true;
-    
-    // Parse configuration from file
-    static SpinConfig from_file(const string& filename);
-    
-    // Write configuration to file
+
+    // Escape hatch for keys this version does not know (e.g. read by an external
+    // tool): store them as Hamiltonian parameters with a warning instead of
+    // rejecting the file. Off by default, so a typo is an error.
+    bool allow_unknown_keys = false;
+
+    // ----------------------------------------------------------------
+    // Key/value interface. Every key a config file may contain is either
+    //   - a typed key (a field above, possibly under an alias such as
+    //     `dt` for md_timestep), or
+    //   - a registered Hamiltonian parameter: a key read through get_param /
+    //     has_param by a unit-cell builder, a model factory or a runner
+    //     (see is_hamiltonian_key; the registry lives in spin_config.cpp and
+    //     tests/test_config.cpp checks it against the sources).
+    // ----------------------------------------------------------------
+
+    /**
+     * Parse a configuration file (`key = value` or `key: value` lines, `#`
+     * comments). Every line goes through set(). Unknown keys are an error
+     * naming file, line and the nearest known key, unless allow_unknown_keys
+     * is set. Throws std::runtime_error. `verbose` prints warnings
+     * (deprecated keys, duplicates); MPI callers pass rank == 0.
+     */
+    static SpinConfig from_file(const string& filename, bool verbose = true);
+
+    /// Same as from_file for configuration text; `source` names it in messages.
+    static SpinConfig from_string(const string& text, const string& source = "<string>",
+                                  bool verbose = true);
+
+    /**
+     * Set one key from its text value: the single entry point shared by the
+     * file parser and parameter sweeps. Returns false, changing nothing, when
+     * `key` is neither a typed key nor a registered Hamiltonian parameter.
+     * Throws std::invalid_argument naming the key for a malformed value
+     * (integers accept "1e5" or "100000.0" only when integral and in range;
+     * booleans are true/false/yes/no/on/off/1/0).
+     */
+    bool set(const string& key, const string& value);
+
+    /// set() with a numeric value printed losslessly (%.17g); throws
+    /// std::invalid_argument for an unknown key (with a suggestion).
+    void set_value(const string& key, double value);
+
+    /// Canonical text of a typed key or Hamiltonian parameter, as written by
+    /// to_file (accepted by set). Throws std::invalid_argument if unknown/unset.
+    string get(const string& key) const;
+
+    /// Canonical names of every typed key, in to_file order.
+    static vector<string> typed_keys();
+    /// Typed key or alias.
+    static bool is_typed_key(const string& key);
+    /// Registered Hamiltonian / model parameter (literal name or a key family
+    /// such as mode<i>_omega, Kminus<orbit>_<lambda><axis>).
+    static bool is_hamiltonian_key(const string& key);
+    static bool is_known_key(const string& key) { return is_typed_key(key) || is_hamiltonian_key(key); }
+    /// Nearest known key by edit distance, or "" if nothing is close.
+    static string suggest_key(const string& key);
+
+    /// Write every typed key and Hamiltonian parameter at full precision;
+    /// from_file(to_file(c)) reproduces c.
     void to_file(const string& filename) const;
-    
+    void write(std::ostream& out) const;
+
     // Get specific Hamiltonian parameters with defaults
     double get_param(const string& key, double default_val = 0.0) const {
         auto it = hamiltonian_params.find(key);
@@ -330,24 +387,49 @@ struct SpinConfig {
         return hamiltonian_params.find(key) != hamiltonian_params.end();
     }
 
-    // Keys given explicitly in the parsed file (typed fields included), so a caller can
+    // Keys given explicitly (canonical names, typed fields included), so a caller can
     // tell "absent, use the model default" from "set to the generic SpinConfig default".
     std::set<string> explicit_keys;
     bool was_set(const string& key) const {
         return explicit_keys.count(key) > 0 || has_param(key);
     }
-    
-    // Set Hamiltonian parameter
+
+    // Set Hamiltonian parameter (programmatic use; no registry check)
     void set_param(const string& key, double value) {
         hamiltonian_params[key] = value;
     }
-    
-    // Validate configuration
+
+    /// One axis of a parameter sweep: the key and its grid.
+    struct SweepAxis {
+        string name;
+        vector<double> values;
+    };
+    /// Validated sweep axes (sweep_parameters with their grids, see sweep_grid);
+    /// throws std::invalid_argument if the sweep keys are inconsistent.
+    vector<SweepAxis> sweep_axes() const;
+
+    /// Every problem that would make a run fail, hang or silently misbehave
+    /// (empty = valid). Pure: no output, identical on every MPI rank.
+    vector<string> validation_errors() const;
+
+    // Validate configuration (prints validation_errors() to stderr)
     bool validate() const;
-    
+
     // Print configuration
     void print() const;
 };
+
+/// Simulation types implemented for a system (the driver's dispatch table).
+bool simulation_supported(SystemType system, SimulationType simulation);
+
+/**
+ * Grid of a parameter sweep built by index: n = llround((end - start) / step) + 1
+ * points start + k * step, so the endpoint is kept and no round-off accumulates
+ * (repeated addition dropped 2.0 from 0 -> 2 step 0.1). Throws
+ * std::invalid_argument for a non-finite value, step == 0, a step pointing away
+ * from `end`, or a range that is not a whole number of steps (to 1e-6 steps).
+ */
+vector<double> sweep_grid(double start, double end, double step, const string& name = "sweep");
 
 // Utility functions for parsing
 inline string trim(const string& str) {

@@ -26,7 +26,7 @@ field_direction = 1, 1, 1
 # Parameter sweep configuration using parallel tempering
 sweep_parameter = field_strength
 sweep_start = 1.5
-sweep_end = 3.0
+sweep_end = 2.9                     # 1.5, 1.7, ..., 2.9 (the range must be a whole number of steps)
 sweep_step = 0.2
 sweep_base_simulation = parallel_tempering
 

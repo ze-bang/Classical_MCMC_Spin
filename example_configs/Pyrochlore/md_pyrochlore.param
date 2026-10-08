@@ -27,7 +27,8 @@ h = 0.0                     # Alternative specification
 
 # Simulated Annealing (equilibration)
 T_start = 5.0
-T_end = 0.0                 # Target temperature for MD
+T_end = 0.001               # Target temperature for MD (> 0: T_end = 0 never terminated)
+T_zero = true               # finish the annealing with a T = 0 quench
 annealing_steps = 100000
 overrelaxation_rate = 10
 use_twist_boundary = false

@@ -615,10 +615,14 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_phonon_dynamics
     test_pt_ladder
     test_unitcell_geometry
+    test_config
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
 endforeach()
+# test_config parses every example configuration and scans the sources for
+# get_param keys (the Hamiltonian-key registry must cover them).
+target_compile_definitions(test_config PRIVATE CLASSICAL_SPIN_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_optimized_executable(test_md_mpi_scan tests/test_md_mpi_scan.cpp)
 
 if(BUILD_TESTING)

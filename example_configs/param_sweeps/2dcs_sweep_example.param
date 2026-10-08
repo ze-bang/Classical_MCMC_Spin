@@ -55,7 +55,7 @@ Ka = 0.0
 Kc = -0.09
 D1 = 0.0
 D2 = 0.0
-chii = 0.05
+Kminus_2y = 0.05                     # Fe-Tm coupling K^-_{2y} (was `chii`, never read)
 e1 = 0.97
 e2 = 3.97
 
