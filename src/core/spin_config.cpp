@@ -179,6 +179,12 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "pt_snapshot_rate") {
                 config.pt_snapshot_rate = stoull(value);
             }
+            else if (key == "pt_adaptive_sigma") {
+                config.pt_adaptive_sigma = parse_bool(value);
+            }
+            else if (key == "pt_uniform_every") {
+                config.pt_uniform_every = stoull(value);
+            }
             // Optimized temperature grid parameters (Bittner et al.)
             else if (key == "pt_optimize_temperatures") {
                 config.pt_optimize_temperatures = parse_bool(value);

@@ -125,6 +125,8 @@ struct SpinConfig {
     bool pt_accumulate_correlations = false;  // Accumulate real-space correlations for S(q)
     size_t pt_n_bond_types = 3;               // Number of bond types for dimer correlations
     size_t pt_snapshot_rate = 0;              // >0: dump raw spin snapshots every N measurement sweeps
+    bool pt_adaptive_sigma = false;           // tune the Gaussian step per replica during equilibration
+    size_t pt_uniform_every = 0;              // >0: every n-th Metropolis sweep uses uniform proposals
     
     // Optimized temperature grid parameters
     bool pt_optimize_temperatures = true;          // Use feedback-optimized temperature grid

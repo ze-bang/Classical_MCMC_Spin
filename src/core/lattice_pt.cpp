@@ -59,6 +59,27 @@
         double sigma = 1000.0;
         int swap_accept = 0;
         double curr_accept = 0;
+
+        // Metropolis proposal control (see Lattice::pt_adaptive_sigma / pt_uniform_every).
+        // Default (both off): unchanged behaviour, sigma = 1000 i.e. effectively uniform proposals.
+        if (pt_adaptive_sigma && gaussian_move) sigma = 1.0;
+        size_t metro_count = 0, tune_n = 0;
+        double tune_acc = 0.0;
+        auto pt_metropolis = [&](bool tune) {
+            const bool uniform = (pt_uniform_every > 0 && (metro_count % pt_uniform_every) == 0);
+            ++metro_count;
+            const double a = metropolis(curr_Temp, gaussian_move && !uniform, uniform ? 1000.0 : sigma);
+            if (tune && pt_adaptive_sigma && gaussian_move && !uniform) {
+                tune_acc += a;
+                if (++tune_n == 100) {
+                    const double r = tune_acc / tune_n;
+                    if (r < 0.4) sigma *= 0.8;
+                    else if (r > 0.6) sigma = std::min(sigma * 1.25, 1000.0);
+                    tune_acc = 0.0; tune_n = 0;
+                }
+            }
+            return a;
+        };
         
         // Determine exchange frequency: Bittner adaptive or fixed
         // When using adaptive sweeps, the exchange frequency is set to the maximum
@@ -130,10 +151,10 @@
             if (overrelaxation_rate > 0) {
                 overrelaxation();
                 if (i % overrelaxation_rate == 0) {
-                    curr_accept += metropolis(curr_Temp, gaussian_move, sigma);
+                    curr_accept += pt_metropolis(true);
                 }
             } else {
-                curr_accept += metropolis(curr_Temp, gaussian_move, sigma);
+                curr_accept += pt_metropolis(true);
             }
             
             // Attempt replica exchange (use adaptive or fixed rate)
@@ -153,10 +174,10 @@
                 if (overrelaxation_rate > 0) {
                     overrelaxation();
                     if (i % overrelaxation_rate == 0) {
-                        metropolis(curr_Temp, gaussian_move, sigma);
+                        pt_metropolis(false);
                     }
                 } else {
-                    metropolis(curr_Temp, gaussian_move, sigma);
+                    pt_metropolis(false);
                 }
                 if (effective_swap_rate > 0 && i % effective_swap_rate == 0) {
                     attempt_replica_exchange(rank, size, temp, curr_Temp, i / effective_swap_rate, comm);
@@ -213,15 +234,15 @@
         }
         std::vector<float> snap_buf(snap_file.is_open() ? lattice_size * spin_dim : 0);
 
-        cout << "Rank " << rank << ": Measuring..." << endl;
+        cout << "Rank " << rank << ": Measuring... (T=" << curr_Temp << ", proposal sigma=" << sigma << ")" << endl;
         for (size_t i = 0; i < n_measure; ++i) {
             if (overrelaxation_rate > 0) {
                 overrelaxation();
                 if (i % overrelaxation_rate == 0) {
-                    curr_accept += metropolis(curr_Temp, gaussian_move, sigma);
+                    curr_accept += pt_metropolis(false);
                 }
             } else {
-                curr_accept += metropolis(curr_Temp, gaussian_move, sigma);
+                curr_accept += pt_metropolis(false);
             }
             
             if (effective_swap_rate > 0 && i % effective_swap_rate == 0) {

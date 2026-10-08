@@ -474,6 +474,14 @@ public:
     // rank_<r>/snapshots_energy.bin, for observables computed offline.
     size_t pt_snapshot_rate = 0;
 
+    // Parallel tempering proposals. pt_adaptive_sigma (needs gaussian_move): each
+    // replica tunes its Gaussian step width during equilibration towards a 40-60%
+    // acceptance (frozen for the measurement, so detailed balance holds there).
+    // pt_uniform_every > 0: every n-th Metropolis sweep uses uniform proposals
+    // instead (large moves, e.g. Ising flips). Both off by default.
+    bool pt_adaptive_sigma = false;
+    size_t pt_uniform_every = 0;
+
     // Spin configuration and positions
     SpinConfig spins;                // Current spin configuration
     vector<Eigen::Vector3d> site_positions; // Real-space positions

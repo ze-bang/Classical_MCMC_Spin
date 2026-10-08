@@ -187,6 +187,8 @@ void run_parallel_tempering(Lattice& lattice, const SpinConfig& config, int rank
     }
     
     lattice.pt_snapshot_rate = config.pt_snapshot_rate;
+    lattice.pt_adaptive_sigma = config.pt_adaptive_sigma;
+    lattice.pt_uniform_every = config.pt_uniform_every;
 
     // Re-initialize spins after temperature optimization (or geometric grid setup)
     // This ensures each rank starts with fresh random spins - the optimization
