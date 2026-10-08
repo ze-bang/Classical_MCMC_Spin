@@ -213,17 +213,13 @@ void set_gpu_pulse(
 }
 
 /**
- * Perform GPU integration with selectable method
- * 
- * Available methods (matching CPU Boost.Odeint options):
- * - "euler": Explicit Euler (1st order)
- * - "rk2" or "midpoint": Modified midpoint (2nd order)
- * - "rk4": Classic Runge-Kutta 4th order
- * - "rk5" or "rkck54": Cash-Karp 5(4) - simulated as RK5 fixed step
- * - "dopri5": Dormand-Prince 5(4) - default
- * - "rk78" or "rkf78": Runge-Kutta-Fehlberg 7(8)
- * - "ssprk53": Strong Stability Preserving RK 5-stage 3rd order (optimized for spin dynamics)
- * - "bulirsch_stoer" or "bs": Bulirsch-Stoer (high accuracy)
+ * Integrate on the GPU and record (t, state) on the output grid
+ * t_k = T_start + k * save_interval * dt (gpu::ode::integrate).
+ *
+ * Methods (gpu/ode/rk_tableaux.h): euler, rk2/midpoint, rk4, ssprk53 take
+ * fixed steps dt; rk5 (rkck54, rk54, rkf54), dopri5 and rk78 (rkf78) are
+ * error-controlled with abs_tol / rel_tol (dt is the initial step). Any other
+ * name throws std::invalid_argument.
  */
 void integrate_gpu(
     GPUODESystem& system,
@@ -233,46 +229,21 @@ void integrate_gpu(
     double dt,
     size_t save_interval,
     std::vector<std::pair<double, std::vector<double>>>& trajectory,
-    const std::string& method
+    const std::string& method,
+    double abs_tol,
+    double rel_tol
 ) {
-    // Time stepping (delegated to the shared gpu::ode fixed-step driver).
-    // The observer snapshots the device state to host at each save point,
-    // reproducing the historical sampling (every save_interval steps plus the
-    // final state).
     auto observe = [&](double t_obs, const gpu::ode::State& st) {
         thrust::host_vector<double> h_state = st;
         trajectory.push_back({t_obs, std::vector<double>(h_state.begin(), h_state.end())});
     };
 
     gpu::ode::integrate(system, state, T_start, T_end, dt, save_interval,
-                        observe, method, system.data.rk_ws);
-}
-
-// Overload for backward compatibility (defaults to ssprk53)
-void integrate_gpu(
-    GPUODESystem& system,
-    GPUState& state,
-    double T_start,
-    double T_end,
-    double dt,
-    size_t save_interval,
-    std::vector<std::pair<double, std::vector<double>>>& trajectory
-) {
-    integrate_gpu(system, state, T_start, T_end, dt, save_interval, trajectory, "ssprk53");
+                        observe, method, system.data.rk_ws, abs_tol, rel_tol);
 }
 
 /**
- * Single integration step on GPU with selectable method
- * 
- * Available methods:
- * - "euler": Explicit Euler (1st order, 1 stage)
- * - "rk2" or "midpoint": Modified midpoint (2nd order, 2 stages)
- * - "rk4": Classic Runge-Kutta (4th order, 4 stages)
- * - "rk5" or "rkck54": Cash-Karp style (5th order, 6 stages)
- * - "dopri5": Dormand-Prince (5th order, 7 stages) - default
- * - "rk78" or "rkf78": Fehlberg (8th order, 13 stages)
- * - "ssprk53": SSP RK (3rd order, 5 stages, optimized for stability)
- * - "bulirsch_stoer" or "bs": Modified midpoint extrapolation
+ * One step of size dt (no error control; see gpu::ode::step).
  */
 void step_gpu(
     GPUODESystem& system,
@@ -446,8 +417,11 @@ void compute_batched_mag_kernel(
 }
 
 /**
- * Internal batched integration: RK4 over B τ-replicas with on-device
- * magnetization extraction.
+ * Internal batched integration over B tau-replicas with on-device
+ * magnetization extraction, on the output grid of gpu::ode::integrate (the
+ * TimeGrid::covering grid of the CPU drivers). Any GPU method; the
+ * error-controlled ones share one adaptive step across all replicas (the
+ * error norm is the maximum over replicas).
  *
  * Returns a BatchedMagResult (declared in lattice_gpu_api.h) using only the
  * gpu:: namespace types internally.
@@ -459,13 +433,19 @@ static gpu::BatchedMagResult integrate_gpu_batched_internal(
     const std::vector<double>& afm_signs,
     const std::vector<double>& sublattice_frames,
     double T_start, double T_end, double dt,
-    size_t save_interval
+    size_t save_interval,
+    const std::string& method,
+    double abs_tol, double rel_tol
 ) {
     const size_t N        = data.lattice_size;
     const size_t spin_dim = data.spin_dim;
     const size_t N_atoms  = data.N_atoms;
     const size_t max_bi   = data.max_bilinear;
     const size_t B        = tau2_values.size();
+
+    if (flat_initial_state.size() != N * spin_dim || afm_signs.size() != N_atoms ||
+        sublattice_frames.size() != N_atoms * spin_dim * spin_dim)
+        throw std::invalid_argument("integrate_gpu_batched: initial state, AFM signs or frames have the wrong size");
 
     const size_t array_size = B * N * spin_dim;
     const size_t mag_stride = B * 3 * spin_dim;
@@ -495,7 +475,6 @@ static gpu::BatchedMagResult integrate_gpu_batched_internal(
     const double* d_afm_ptr         = thrust::raw_pointer_cast(d_afm.data());
     const double* d_frames_ptr      = thrust::raw_pointer_cast(d_frames.data());
 
-    double* d_state_ptr      = thrust::raw_pointer_cast(d_state.data());
     double* d_lf_ptr         = thrust::raw_pointer_cast(d_local_field.data());
     double* d_mags_ptr       = thrust::raw_pointer_cast(d_mags.data());
 
@@ -513,7 +492,8 @@ static gpu::BatchedMagResult integrate_gpu_batched_internal(
             data.pulse_amp, data.pulse_width, data.pulse_freq,
             data.t_pulse_1, d_t2_ptr,
             t, N, spin_dim, N_atoms, max_bi, B);
-        cudaDeviceSynchronize();
+        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(cudaDeviceSynchronize());
     };
 
     // Adapt the batched RHS to the gpu::ode System concept so it can drive the
@@ -525,21 +505,22 @@ static gpu::BatchedMagResult integrate_gpu_batched_internal(
                     thrust::raw_pointer_cast(out.data()), tt);
     };
     gpu::ode::Workspace ws;
-    ws.ensure(array_size, 4);
 
-    // Helper: extract magnetizations, append to result
     gpu::BatchedMagResult result;
     result.B             = B;
     result.spin_dim      = spin_dim;
     result.n_time_points = 0;
 
-    auto snapshot = [&](double t) {
+    // Observer: magnetizations of every replica. The adaptive driver swaps the
+    // state buffer, so the pointer is taken from `st`, never cached.
+    auto snapshot = [&](double t, const gpu::ode::State& st) {
         thrust::fill(d_mags.begin(), d_mags.end(), 0.0);
         compute_batched_mag_kernel<<<grid_llg, block_llg>>>(
-            d_state_ptr, d_mags_ptr,
+            thrust::raw_pointer_cast(st.data()), d_mags_ptr,
             d_afm_ptr, d_frames_ptr,
             B, N, N_atoms, spin_dim);
-        cudaDeviceSynchronize();
+        GPU_CHECK(cudaGetLastError());
+        GPU_CHECK(cudaDeviceSynchronize());
 
         // Download B * 3 * spin_dim doubles
         thrust::host_vector<double> h_mags = d_mags;
@@ -550,28 +531,12 @@ static gpu::BatchedMagResult integrate_gpu_batched_internal(
         ++result.n_time_points;
     };
 
-    // ---- Time loop ----
-    double t    = T_start;
-    size_t step = 0;
-
-    while (t < T_end - 1e-12) {
-        if (step % save_interval == 0) snapshot(t);
-
-        // One RK4 step over all B replicas via the shared gpu::ode stepper.
-        gpu::ode::step(batched_system, d_state, t, dt, "rk4", ws);
-
-        t += dt;
-        ++step;
-    }
-
-    // Final snapshot
-    snapshot(t);
+    gpu::ode::integrate(batched_system, d_state, T_start, T_end, dt, save_interval, snapshot, method, ws,
+                        abs_tol, rel_tol);
 
     // Normalize all magnetizations by N
     const double inv_N = 1.0 / static_cast<double>(N);
     for (auto& v : result.mag_data) v *= inv_N;
-
-    GPU_CHECK_KERNEL();
 
     return result;
 }
@@ -685,6 +650,14 @@ void get_gpu_spins(
     thrust::copy(handle->state.begin(), handle->state.end(), flat_spins.begin());
 }
 
+namespace {
+// API misuse is an error, not a silent no-op that leaves the output empty.
+void require_state(const GPULatticeDataHandle* handle, const char* what) {
+    if (!handle) throw std::invalid_argument(std::string(what) + ": null GPU handle");
+    if (!handle->has_state) throw std::invalid_argument(std::string(what) + ": no spin state uploaded (set_gpu_spins)");
+}
+}  // namespace
+
 void integrate_gpu(
     GPULatticeDataHandle* handle,
     double T_start,
@@ -692,13 +665,14 @@ void integrate_gpu(
     double dt,
     size_t save_interval,
     std::vector<std::pair<double, std::vector<double>>>& trajectory,
-    const std::string& method
+    const std::string& method,
+    double abs_tol,
+    double rel_tol
 ) {
-    if (!handle || !handle->has_state) return;
-    
+    require_state(handle, "integrate_gpu");
     GPUODESystem system(handle->data);
-    gpu::integrate_gpu(system, handle->state, T_start, T_end, dt, 
-                       save_interval, trajectory, method);
+    gpu::integrate_gpu(system, handle->state, T_start, T_end, dt,
+                       save_interval, trajectory, method, abs_tol, rel_tol);
 }
 
 void step_gpu(
@@ -707,8 +681,7 @@ void step_gpu(
     double dt,
     const std::string& method
 ) {
-    if (!handle || !handle->has_state) return;
-    
+    require_state(handle, "step_gpu");
     GPUODESystem system(handle->data);
     gpu::step_gpu(system, handle->state, t, dt, method);
 }
@@ -771,23 +744,17 @@ BatchedMagResult integrate_gpu_batched(
     const std::vector<double>& sublattice_frames,
     double T_start, double T_end, double dt,
     size_t save_interval,
-    const std::string& method
+    const std::string& method,
+    double abs_tol,
+    double rel_tol
 ) {
-    if (!handle) return BatchedMagResult{};
-    if (tau2_values.empty()) return BatchedMagResult{};
-
-    // Only RK4 is supported for batched mode (validated to be bit-identical with CPU).
-    // For other methods, warn and fall back to rk4.
-    if (method != "rk4") {
-        std::cerr << "[integrate_gpu_batched] method='" << method
-                  << "' is not supported in batched mode; using rk4." << std::endl;
-    }
-
+    if (!handle) throw std::invalid_argument("integrate_gpu_batched: null GPU handle");
+    if (tau2_values.empty()) throw std::invalid_argument("integrate_gpu_batched: no replicas (tau2_values empty)");
     return integrate_gpu_batched_internal(
         handle->data,
         flat_initial_state, tau2_values,
         afm_signs, sublattice_frames,
-        T_start, T_end, dt, save_interval);
+        T_start, T_end, dt, save_interval, method, abs_tol, rel_tol);
 }
 
 } // namespace gpu

@@ -1,0 +1,21 @@
+# LeakSanitizer suppressions for CLASSICAL_SPIN_SANITIZE builds.
+#
+# Only third-party runtime libraries are listed: Open MPI (and the PMIx /
+# hwloc / libevent components it loads) keeps allocations from MPI_Init alive
+# until process exit by design, which LeakSanitizer reports as leaks in every
+# MPI program. A pattern matches when ANY frame of the allocation stack is in
+# that module, so leaks of project code (whose stacks never pass through these
+# libraries) are still reported.
+leak:libmpi.so
+leak:libopen-pal.so
+leak:libopen-rte.so
+leak:libpmix.so
+leak:libhwloc.so
+leak:libevent
+leak:libmca_common
+leak:mca_
+# Components Open MPI dlopen()s and unloads again before exit: their
+# allocations show up with an "<unknown module>" frame under the dynamic
+# loader's initialiser (the project never calls dlopen itself).
+leak:dl_open_worker
+leak:ld-linux-x86-64.so

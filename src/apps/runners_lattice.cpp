@@ -19,9 +19,7 @@
 #include <iomanip>
 #include <cmath>
 
-#ifdef CUDA_ENABLED
-#include <cuda_runtime.h>
-#endif
+#include "classical_spin/gpu/device_select.h"
 
 using namespace std;
 
@@ -217,24 +215,10 @@ void report_dynamics_config(const Lattice& lattice, const SpinConfig& config) {
 }
 
 /// The GPU flag handed to the drivers: config.use_gpu only when a device is
-/// actually usable (this rank is then bound to one, round robin), so a
-/// "falling back to the CPU" message is true.
+/// actually usable (classical_spin::gpu::select_device binds this rank to one
+/// and reports once), so a "running on the CPU" message is true.
 bool select_gpu(const SpinConfig& config, int rank) {
-    if (!config.use_gpu) return false;
-#ifdef CUDA_ENABLED
-    int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-        if (rank == 0) cout << "Warning: no usable GPU; running on the CPU" << endl;
-        return false;
-    }
-    const int device_id = job_rank() % device_count;
-    cudaSetDevice(device_id);
-    cout << "[Rank " << rank << "] GPU " << device_id << " of " << device_count << endl;
-    return true;
-#else
-    if (rank == 0) cout << "GPU requested but not compiled in (CUDA_ENABLED); running on the CPU" << endl;
-    return false;
-#endif
+    return classical_spin::gpu::select_device(config.use_gpu, job_rank());
 }
 
 /**

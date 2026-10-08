@@ -266,11 +266,14 @@ int main(int argc, char** argv) {
     std::cout << "\n=== Section B: GPU steppers converge to CPU error-controlled dopri5 reference (tol 1e-11) ===\n";
     auto reference = drive("dopri5", false, 0.01, 1e-11);
 
-    struct GpuConv { std::string method; std::vector<double> dts; double finest_tol; };
+    // dopri5 is error-controlled on the GPU (tol 1e-10, dt = output step):
+    // its error is set by the tolerance, so every dt must meet finest_tol
+    // instead of showing a dt trend.
+    struct GpuConv { std::string method; std::vector<double> dts; double finest_tol; bool adaptive; };
     const std::vector<GpuConv> convs = {
-        {"rk4",     {0.004, 0.002, 0.001, 0.0005}, 1e-6},
-        {"dopri5",  {0.004, 0.002, 0.001, 0.0005}, 1e-6},
-        {"ssprk53", {0.004, 0.002, 0.001, 0.0005}, 1e-5},
+        {"rk4",     {0.004, 0.002, 0.001, 0.0005}, 1e-6, false},
+        {"dopri5",  {0.004, 0.002, 0.001, 0.0005}, 1e-6, true},
+        {"ssprk53", {0.004, 0.002, 0.001, 0.0005}, 1e-5, false},
     };
 
     for (const auto& cv : convs) {
@@ -287,9 +290,11 @@ int main(int argc, char** argv) {
                       << std::setw(18) << d << "\n";
         }
         const double finest = errs.back();
-        const bool decreasing = std::isfinite(errs.front()) &&
-                                std::isfinite(finest) &&
-                                finest <= errs.front();
+        bool all_within = true;
+        for (double e : errs) all_within = all_within && std::isfinite(e) && e <= cv.finest_tol;
+        const bool decreasing = cv.adaptive ? all_within
+                                            : (std::isfinite(errs.front()) && std::isfinite(finest) &&
+                                               finest <= errs.front());
         const bool converged = std::isfinite(finest) && finest <= cv.finest_tol;
         const bool ok = decreasing && converged;
         if (!ok) ++failures;

@@ -7,6 +7,7 @@
 #include "classical_spin/mc/mc_common.h"      // Common MC structs & templates
 #include "classical_spin/mc/parallel_tempering.h"  // replica-exchange engine + ladder tuning
 #include "classical_spin/lattice/pulse_chunking.h"  // default pump-probe tolerances
+#include "classical_spin/lattice/correlation_accumulator.h"  // FFT spin / dimer correlations
 #include "classical_spin/dynamics/spin_integrators.h"  // geometric / Langevin spin integrators
 #include "classical_spin/dynamics/drive.h"             // DriveSchedule, Pulse
 #include "classical_spin/dynamics/time_grid.h"         // TimeGrid, delay_grid
@@ -36,13 +37,10 @@
 #include "hdf5_io.h"
 #endif
 
-// GPU support: API header for all C++ TUs, full .cuh only for CUDA TUs
+// GPU support: the opaque host API (no .cu file includes this header).
 #ifdef CUDA_ENABLED
 #include "lattice_gpu_api.h"
-#endif
-
-#if defined(CUDA_ENABLED) && defined(__CUDACC__)
-#include "lattice_gpu.cuh"
+#include "classical_spin/gpu/gpu_handle.h"
 #endif
 
 // Optional profiling instrumentation
@@ -84,359 +82,6 @@ struct SAParams {
     vector<double> probe_T;
     vector<double> probe_acc;
     vector<double> probe_tau;
-};
-
-/**
- * Real-space correlation accumulator for efficient finite-T structure factor calculation
- * 
- * Stores spin-spin and dimer-dimer correlations binned by displacement, enabling:
- * - Post-hoc Fourier transform to any q-point: S(q) = Σ_Δr C(Δr) exp(-i q·Δr)
- * - Fixed storage regardless of number of MC samples
- * - Online error estimation via binning analysis
- * 
- * Storage: O(N_cells × N_sub² × 9) for spin correlations
- *        + O(N_cells × N_bond × N_bond²) for dimer correlations
- * vs O(N_sites × N_samples) for full snapshots
- */
-struct RealSpaceCorrelationAccumulator {
-    // ========== LATTICE GEOMETRY ==========
-    size_t dim1, dim2, dim3;           // Lattice dimensions
-    size_t n_sites;                     // Total sites
-    size_t n_sublattices;               // Sites per unit cell (N_atoms)
-    size_t spin_dim;                    // Dimension of spin vectors
-    
-    // ========== INDEXING WITH SYMMETRY ==========
-    // Cell displacements: (Δn1, Δn2, Δn3) → linear index
-    // For PBC: Δn1 ∈ [0, dim1), Δn2 ∈ [0, dim2), Δn3 ∈ [0, dim3)
-    size_t n_cell_displacements;        // dim1 * dim2 * dim3
-    
-    // Sublattice pairs with symmetry: (sub_i, sub_j) with sub_i ≤ sub_j
-    // For n_sub=4: (0,0), (0,1), (0,2), (0,3), (1,1), (1,2), (1,3), (2,2), (2,3), (3,3)
-    size_t n_sublattice_pairs;          // n_sublattices * (n_sublattices + 1) / 2
-    
-    // Spin components with symmetry: (α, β) with α ≤ β
-    // (x,x), (x,y), (x,z), (y,y), (y,z), (z,z) = 6 components
-    static constexpr size_t n_spin_components = 6;
-    
-    // ========== SPIN-SPIN CORRELATIONS ==========
-    // C^{αβ}_{sub_pair}(Δcell) = <S_i^α S_j^β + S_i^β S_j^α> / 2  for α≠β
-    //                          = <S_i^α S_j^α>                     for α=β
-    // Shape: [n_cell_displacements][n_sublattice_pairs][n_spin_components]
-    vector<double> spin_corr_sum;       // Σ samples
-    vector<double> spin_corr_sq_sum;    // Σ samples² (for error)
-    
-    // Sublattice-resolved single-site averages (for connected correlator)
-    vector<Eigen::Vector3d> spin_mean_sum;      // [n_sublattices] Σ <S_α>
-    vector<Eigen::Vector3d> spin_mean_sq_sum;   // For error estimation
-    
-    // ========== DIMER-DIMER CORRELATIONS ==========
-    // Bond type = sublattice pair (i,j) with i ≤ j that the bond connects
-    // For pyrochlore (n_sub=4): 10 bond types
-    size_t n_bond_types;                // = n_sublattice_pairs
-    
-    // Dimer components: D^α = S_i^α S_j^α for α ∈ {x, y, z}
-    static constexpr size_t n_dimer_components = 3;  // x, y, z
-    
-    // Dimer correlation: <D^α_μ(0) D^α_ν(ΔR)> for same spin component α
-    // Shape: [n_cell_displacements][n_bond_types][n_bond_types][n_dimer_components]
-    // Flattened: [cell_disp * n_bond_types * n_bond_types * 3]
-    vector<double> dimer_corr_sum;      // Σ samples
-    vector<double> dimer_corr_sq_sum;   // For error
-    
-    // Bond-type and component resolved means: <D^α_μ>
-    // Shape: [n_bond_types][n_dimer_components]
-    vector<double> dimer_mean_sum;      // <D^α_μ> for each bond type and component
-    vector<double> dimer_mean_sq_sum;   // For error
-    
-    // ========== DISPLACEMENT GEOMETRY ==========
-    vector<Eigen::Vector3d> cell_displacement_vectors;  // Real-space ΔR for each cell offset
-    vector<array<int, 3>> cell_displacement_indices;    // (Δn1, Δn2, Δn3)
-    vector<Eigen::Vector3d> sublattice_positions_;      // Sublattice positions within unit cell
-
-    // ========== CACHED LOOKUP TABLES (filled once in initialize()) ==========
-    //
-    // Pre-computed displaced_cell_idx[disp_idx * n_cells + cell_i] = cell_j,
-    // where cell_j is the cell index obtained by translating cell_i by the
-    // displacement (dn1, dn2, dn3) corresponding to disp_idx, modulo PBC.
-    //
-    // This lookup is purely geometric (depends only on dim1*dim2*dim3) and was
-    // previously rebuilt on **every** call to
-    // accumulate_spin_correlations / accumulate_dimer_correlations — a 24 MB
-    // allocation per measurement on a 12³ unit-cell grid. Cached here so the
-    // hot accumulation loop becomes a flat array lookup with no allocation.
-    vector<size_t> displaced_cell_idx_cache;            // size n_cells * n_cells
-
-    // Reusable scratch buffer for the per-call sublattice-resolved spin
-    // layout used by accumulate_spin_correlations. Allocated once on first
-    // use, sized to n_sublattices * n_cells. This replaces a fresh
-    // vector<vector<Eigen::Vector3d>> on every call.
-    mutable vector<Eigen::Vector3d> spins_by_sub_buf;   // size n_sublattices * n_cells
-    
-    // ========== BOOKKEEPING ==========
-    size_t n_samples;                   // Number of accumulated samples
-    bool initialized;
-    
-    // ========== CONSTRUCTORS ==========
-    RealSpaceCorrelationAccumulator() : n_samples(0), initialized(false) {}
-    
-    /**
-     * Initialize for given lattice geometry
-     * 
-     * @param d1, d2, d3    Lattice dimensions
-     * @param n_sub         Number of sublattices (atoms per unit cell)
-     * @param n_bonds       Number of distinct bond types (ignored, will be set to n_sublattice_pairs)
-     * @param sdim          Spin dimension (typically 3)
-     * @param lattice_vectors  The 3 lattice vectors (a1, a2, a3)
-     * @param sublattice_positions  Positions within unit cell for each sublattice
-     */
-    void initialize(size_t d1, size_t d2, size_t d3, 
-                   size_t n_sub, size_t /* n_bonds */, size_t sdim,
-                   const array<Eigen::Vector3d, 3>& lattice_vectors,
-                   const vector<Eigen::Vector3d>& sublattice_positions);
-    
-    /**
-     * Get cell displacement index (no sublattice info)
-     */
-    size_t cell_displacement_index(size_t dn1, size_t dn2, size_t dn3) const {
-        return (dn1 * dim2 + dn2) * dim3 + dn3;
-    }
-    
-    /**
-     * Get sublattice pair index with symmetry: (i,j) → index, requires i ≤ j
-     * For n_sub=4: (0,0)→0, (0,1)→1, (0,2)→2, (0,3)→3, (1,1)→4, (1,2)→5, ...
-     * This is also the bond type index for bonds connecting sublattices i and j.
-     */
-    size_t sublattice_pair_index(size_t sub_i, size_t sub_j) const {
-        size_t s_min = std::min(sub_i, sub_j);
-        size_t s_max = std::max(sub_i, sub_j);
-        return s_min * (2 * n_sublattices - s_min - 1) / 2 + s_max;
-    }
-    
-    /**
-     * Inverse of sublattice_pair_index: index → (sub_i, sub_j) with i ≤ j
-     * Also gives the sublattices that a bond type connects.
-     */
-    pair<size_t, size_t> bond_type_to_sublattices(size_t bond_type) const {
-        // Triangular number inversion
-        size_t sub_i = 0;
-        size_t cumsum = n_sublattices;
-        while (bond_type >= cumsum) {
-            sub_i++;
-            cumsum += (n_sublattices - sub_i);
-        }
-        size_t sub_j = bond_type - (sub_i == 0 ? 0 : sub_i * n_sublattices - sub_i * (sub_i + 1) / 2);
-        return {sub_i, sub_j};
-    }
-    
-    /**
-     * Get bond center position for a given bond type (within unit cell)
-     * Bond center = (r_sub_i + r_sub_j) / 2
-     */
-    Eigen::Vector3d bond_center(size_t bond_type) const;
-    
-    /**
-     * Get spin component index with symmetry: (α,β) → index, requires α ≤ β
-     * (0,0)→0, (0,1)→1, (0,2)→2, (1,1)→3, (1,2)→4, (2,2)→5
-     */
-    static size_t spin_component_index(size_t alpha, size_t beta) {
-        size_t a_min = std::min(alpha, beta);
-        size_t a_max = std::max(alpha, beta);
-        return a_min * (2 * 3 - a_min - 1) / 2 + a_max;
-    }
-    
-    /**
-     * Get full spin correlation index
-     * @return Index into spin_corr_sum array
-     */
-    size_t spin_corr_index(size_t cell_disp_idx, size_t sub_pair_idx, size_t spin_comp_idx) const {
-        return (cell_disp_idx * n_sublattice_pairs + sub_pair_idx) * n_spin_components + spin_comp_idx;
-    }
-    
-    /**
-     * Get dimer correlation index
-     * Shape: [n_cell_displacements][n_bond_types][n_bond_types][n_dimer_components]
-     * @param cell_disp_idx  Cell displacement index
-     * @param type_mu        Bond type at origin
-     * @param type_nu        Bond type at displaced cell
-     * @param comp           Dimer component (0=x, 1=y, 2=z)
-     */
-    size_t dimer_corr_index(size_t cell_disp_idx, size_t type_mu, size_t type_nu, size_t comp) const {
-        return ((cell_disp_idx * n_bond_types + type_mu) * n_bond_types + type_nu) * n_dimer_components + comp;
-    }
-    
-    /**
-     * Get dimer mean index
-     * Shape: [n_bond_types][n_dimer_components]
-     */
-    size_t dimer_mean_index(size_t bond_type, size_t comp) const {
-        return bond_type * n_dimer_components + comp;
-    }
-    
-    /**
-     * Accumulate one sample of spin-spin correlations
-     * Call this every probe_rate MC sweeps
-     * 
-     * Uses symmetry: C^{αβ}_{ij} = C^{βα}_{ji}, so we store symmetrized form
-     * 
-     * OPTIMIZED: Pre-compute spin arrays organized by sublattice for cache efficiency,
-     * then use direct indexing instead of per-cell modular arithmetic.
-     * 
-     * @param spins         Current spin configuration [n_sites]
-     * @param site_to_sub   Mapping from site index to sublattice index (unused, kept for API)
-     * @param site_to_cell  Mapping from site index to (n1, n2, n3) cell indices (unused, kept for API)
-     */
-    void accumulate_spin_correlations(
-        const vector<Eigen::VectorXd>& spins,
-        const function<size_t(size_t)>& /* site_to_sublattice */,
-        const function<array<size_t, 3>(size_t)>& /* site_to_cell */) 
-;
-    
-    /**
-     * Accumulate dimer-dimer correlations
-     * 
-     * Dimer operator: D^α_b = S_i^α S_j^α for α ∈ {x, y, z}
-     * Correlator: <D^α_μ(0) D^α_ν(ΔR)> for each component α
-     * 
-     * OPTIMIZED: Pre-compute cell displacement lookup, avoid repeated modular arithmetic.
-     * 
-     * @param spins         Current spin configuration
-     * @param bonds         List of (site_i, site_j) pairs defining bonds
-     * @param bond_types    Bond type index for each bond (= sublattice pair index)
-     * @param bond_cells    Unit cell indices (n1, n2, n3) for each bond's "home" cell
-     */
-    void accumulate_dimer_correlations(
-        const vector<Eigen::VectorXd>& spins,
-        const vector<array<size_t, 2>>& bonds,
-        const vector<size_t>& bond_types,
-        const vector<array<size_t, 3>>& bond_cells)
-;
-    
-    /**
-     * Compute spin structure factor S^{αβ}(q) at arbitrary q-point
-     * Sublattice-resolved: S(q) = Σ_{ΔR,s,s'} C_{ss'}(ΔR) exp(-i q·(ΔR + r_s' - r_s))
-     * 
-     * @param q           Wavevector in Cartesian coordinates
-     * @param connected   If true, subtract <S_i><S_j> (use for susceptibility)
-     * @return 3x3 matrix S^{αβ}(q) (symmetric form)
-     */
-    Eigen::Matrix3d compute_Sq(const Eigen::Vector3d& q, bool connected = true) const;
-    
-    /**
-     * Compute dimer structure factor at arbitrary q
-     * S_D^{αμν}(q) = Σ_ΔR χ^α_D(ΔR,μ,ν) exp(-i q·Δr_bond)
-     * 
-     * where Δr_bond = ΔR + center(ν) - center(μ) is the displacement between bond centers
-     * and center(μ) = (r_{sub_i} + r_{sub_j})/2 for a bond connecting sublattices i,j
-     * 
-     * Returns array of 3 matrices [n_bond_types × n_bond_types], one per component (x,y,z)
-     * 
-     * @param q           Wavevector in Cartesian coordinates  
-     * @param connected   If true, subtract <D^α_μ><D^α_ν>
-     * @return array of 3 matrices for x, y, z dimer components
-     */
-    array<Eigen::MatrixXd, 3> compute_Sq_dimer(const Eigen::Vector3d& q, bool connected = true) const;
-    
-    /**
-     * Compute total dimer structure factor (sum over components)
-     * S_D^{μν}(q) = Σ_α S_D^{αμν}(q) = Σ_α Σ_ΔR <D^α_μ(0) D^α_ν(ΔR)> exp(-i q·ΔR)
-     */
-    Eigen::MatrixXd compute_Sq_dimer_total(const Eigen::Vector3d& q, bool connected = true) const;
-    
-    /**
-     * Compute S(q) with error estimate using variance
-     * Returns (mean, error) pair for each matrix element
-     */
-    pair<Eigen::Matrix3d, Eigen::Matrix3d> compute_Sq_with_error(
-        const Eigen::Vector3d& q, bool connected = true) const 
-    {
-        if (n_samples < 2) {
-            return {compute_Sq(q, connected), Eigen::Matrix3d::Zero()};
-        }
-        
-        // For proper error estimation, return zero error for now
-        // (would need jackknife/bootstrap for correlated samples)
-        return {compute_Sq(q, connected), Eigen::Matrix3d::Zero()};
-    }
-    
-    /**
-     * Reset accumulator (keep geometry, clear statistics)
-     */
-    void reset() {
-        std::fill(spin_corr_sum.begin(), spin_corr_sum.end(), 0.0);
-        std::fill(spin_corr_sq_sum.begin(), spin_corr_sq_sum.end(), 0.0);
-        for (auto& m : spin_mean_sum) m.setZero();
-        for (auto& m : spin_mean_sq_sum) m.setZero();
-        std::fill(dimer_corr_sum.begin(), dimer_corr_sum.end(), 0.0);
-        std::fill(dimer_corr_sq_sum.begin(), dimer_corr_sq_sum.end(), 0.0);
-        std::fill(dimer_mean_sum.begin(), dimer_mean_sum.end(), 0.0);
-        std::fill(dimer_mean_sq_sum.begin(), dimer_mean_sq_sum.end(), 0.0);
-        n_samples = 0;
-    }
-    
-    /**
-     * Merge another accumulator into this one (for MPI reduction)
-     */
-    void merge(const RealSpaceCorrelationAccumulator& other);
-    
-    /**
-     * Get storage size in bytes
-     */
-    size_t storage_bytes() const {
-        size_t spin_storage = spin_corr_sum.size() * 2 * sizeof(double);
-        spin_storage += n_sublattices * 2 * sizeof(Eigen::Vector3d);
-        size_t dimer_storage = dimer_corr_sum.size() * 2 * sizeof(double);
-        dimer_storage += n_bond_types * 2 * sizeof(double);
-        size_t geometry_storage = cell_displacement_vectors.size() * sizeof(Eigen::Vector3d);
-        geometry_storage += cell_displacement_indices.size() * sizeof(array<int, 3>);
-        geometry_storage += sublattice_positions_.size() * sizeof(Eigen::Vector3d);
-        return spin_storage + dimer_storage + geometry_storage;
-    }
-    
-#ifdef HDF5_ENABLED
-    /**
-     * Save correlation data to HDF5 file
-     * 
-     * Data layout:
-     * - spin_corr_sum: [n_cell_displacements × n_sublattice_pairs × 6] flattened
-     * - dimer_corr_sum: [n_cell_displacements × n_bond_type_pairs] flattened
-     * 
-     * Sublattice pair (i,j) with i≤j maps to index: i*(2*n_sub - i - 1)/2 + j
-     * Spin component (α,β) with α≤β: xx=0, xy=1, xz=2, yy=3, yz=4, zz=5
-     */
-    void save_hdf5(const string& filename, const string& group_name = "/correlations") const;
-#endif
-    
-    /**
-     * Save spin structure factor to text file for a grid of q-points
-     * 
-     * @param filename      Output file path
-     * @param q1_range      Range in reciprocal lattice units for q1 (min, max)
-     * @param q2_range      Range in reciprocal lattice units for q2 (min, max)
-     * @param q3_range      Range in reciprocal lattice units for q3 (min, max)
-     * @param n_q           Number of q-points per dimension
-     * @param b1, b2, b3    Reciprocal lattice vectors
-     * @param connected     Whether to compute connected correlator
-     */
-    void save_structure_factor_grid(
-        const string& filename,
-        pair<double, double> q1_range,
-        pair<double, double> q2_range,
-        pair<double, double> q3_range,
-        size_t n_q1, size_t n_q2, size_t n_q3,
-        const Eigen::Vector3d& b1,
-        const Eigen::Vector3d& b2,
-        const Eigen::Vector3d& b3,
-        bool connected = true) const 
-;
-    
-    /**
-     * MPI reduce: gather accumulators from all ranks and merge
-     * After this call, rank 0 has the combined accumulator
-     * 
-     * @param comm  MPI communicator
-     * @return Combined accumulator (valid on rank 0 only)
-     */
-    void mpi_reduce(MPI_Comm comm = MPI_COMM_WORLD);
 };
 
 /**
@@ -3675,8 +3320,9 @@ public:
      * @param gaussian_move     Adaptive Gaussian proposals (also selected by local_update)
      * @param comm              MPI communicator
      * @param verbose           Unused (kept for source compatibility)
-     * @param accumulate_correlations  Accumulate real-space correlations for S(q)
-     * @param n_bond_types      Number of bond types for dimer correlations
+     * @param accumulate_correlations  Accumulate spin and nearest-shell dimer correlations
+     *                          (create_correlation_accumulator) into rank_dir/correlations_T*.h5
+     * @param n_bond_types      Ignored (bond classes come from the unit cell)
      * @return per-rank and whole-ladder statistics (see mc::PTResult)
      */
     mc::PTResult parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
@@ -3703,28 +3349,11 @@ public:
                                        const vector<Eigen::Matrix3d>& nematic_global) const;
     
     /**
-     * Internal helper to accumulate correlations (avoids name conflict with parameter)
+     * One sample of the current configuration into both channels of `acc`
+     * (spin correlations, and dimer correlations when it has bond classes).
      */
     void accumulate_correlations_internal(RealSpaceCorrelationAccumulator& acc) const {
-        // Define site-to-sublattice mapping
-        auto site_to_sublattice = [this](size_t site) -> size_t {
-            return site % N_atoms;
-        };
-        
-        // Define site-to-cell mapping
-        auto site_to_cell = [this](size_t site) -> array<size_t, 3> {
-            size_t cell_idx = site / N_atoms;
-            size_t n3 = cell_idx % dim3;
-            size_t n2 = (cell_idx / dim3) % dim2;
-            size_t n1 = cell_idx / (dim2 * dim3);
-            return {n1, n2, n3};
-        };
-        
-        // Accumulate spin-spin correlations
-        acc.accumulate_spin_correlations(spins, site_to_sublattice, site_to_cell);
-        
-        // Accumulate dimer-dimer correlations (extracts bonds from bilinear_partners)
-        accumulate_dimer_correlations(acc);
+        acc.add_sample(spins);
     }
 
     /**
@@ -4081,277 +3710,111 @@ private:
         const std::vector<std::pair<double, std::vector<double>>>& raw) const;
 
 public:
-#if defined(CUDA_ENABLED) && defined(__CUDACC__)
-    /**
-     * Run molecular dynamics simulation with GPU acceleration (CUDA/Thrust)
-     * Uses true GPU integration - all computation stays on device
-     * Only transfers data to host for HDF5 I/O at save intervals
-     */
-    void molecular_dynamics_gpu(double T_start, double T_end, double dt_initial,
-                           string out_dir = "", size_t save_interval = 100,
-                           string method = "dopri5") {
-#ifndef HDF5_ENABLED
-        std::cerr << "Error: HDF5 support is required for molecular dynamics output." << endl;
-        std::cerr << "Please rebuild with -DHDF5_ENABLED flag and HDF5 libraries." << endl;
-        return;
-#endif
-
-        if (!out_dir.empty()) {
-            std::filesystem::create_directories(out_dir);
-        }
-
-        cout << "Running molecular dynamics with GPU acceleration: t=" << T_start << " → " << T_end << endl;
-        cout << "Integration method: " << method << " (GPU-native)" << endl;
-        cout << "Step size: " << dt_initial << endl;
-
-        // Ensure GPU data is initialized
-        ensure_gpu_data_initialized();
-
-        // Create GPU ODE system
-        gpu::GPUODESystem gpu_system(gpu_data_cache_);
-
-        // Transfer initial state to GPU
-        ODEState h_state = spins_to_state(spins);
-        gpu::GPUState d_state(h_state.begin(), h_state.end());
-
-        // Create HDF5 writer
-        std::unique_ptr<HDF5MDWriter> hdf5_writer;
-        if (!out_dir.empty()) {
-            string hdf5_file = out_dir + "/trajectory.h5";
-            cout << "Writing trajectory to HDF5 file: " << hdf5_file << endl;
-            hdf5_writer = std::make_unique<HDF5MDWriter>(
-                hdf5_file, lattice_size, spin_dim, N_atoms,
-                dim1, dim2, dim3, method + "_gpu_native",
-                dt_initial, T_start, T_end, save_interval, spin_length,
-                &site_positions, 10000);
-        }
-
-        // Integrate on GPU - all computation on device, only transfer for I/O
-        std::vector<std::pair<double, std::vector<double>>> trajectory;
-        gpu::integrate_gpu(gpu_system, d_state, T_start, T_end, dt_initial,
-                          save_interval, trajectory);
-
-        // Write trajectory to HDF5 (post-processing on CPU)
-        size_t save_count = 0;
-        for (const auto& [t, state_vec] : trajectory) {
-            const array<SpinVector, 3> M = measure_magnetizations(state_vec.data());
-            if (hdf5_writer) {
-                hdf5_writer->write_flat_step(t, M[0], M[1], M[2], state_vec.data());
-                save_count++;
-            }
-            if (save_count % 10 == 0) {
-                double E = total_energy_flat(state_vec.data()) / lattice_size;
-                cout << "t=" << t << ", E/N=" << E << ", |M|=" << M[1].norm() << endl;
-            }
-        }
-
-        // Close HDF5 file
-        if (hdf5_writer) {
-            hdf5_writer->close();
-            cout << "HDF5 trajectory saved with " << save_count << " snapshots" << endl;
-        }
-
-        cout << "GPU molecular dynamics complete! (" << trajectory.size() << " saved states)" << endl;
-    }
-#endif // CUDA_ENABLED
 
     // ============================================================
     // OBSERVABLES
     // ============================================================
 
     /**
-     * Compute global magnetization: M = Σ S_i / N (transformed to global frame)
+     * Global-frame magnetization per site, M = (1/N) Σ_i F_{s(i)} S_i: the
+     * sublattice sums first (O(N d)), then one frame rotation per sublattice.
      */
     SpinVector magnetization_global() const {
+        vector<SpinVector> sum(N_atoms, SpinVector::Zero(spin_dim));
+        for (size_t i = 0; i < lattice_size; ++i) sum[i % N_atoms] += spins[i];
         SpinVector M = SpinVector::Zero(spin_dim);
-        
-        for (size_t i = 0; i < dim1; ++i) {
-            for (size_t j = 0; j < dim2; ++j) {
-                for (size_t k = 0; k < dim3; ++k) {
-                    for (size_t l = 0; l < N_atoms; ++l) {
-                        size_t current_site_index = flatten_index(i, j, k, l);
-                        
-                        // Transform spin to global frame: spin_global = R * spin_local
-                        // where R = sublattice_frames[l] has columns [x_local | y_local | z_local]
-                        SpinVector spin_global = SpinVector::Zero(spin_dim);
-                        for (size_t mu = 0; mu < spin_dim; ++mu) {
-                            for (size_t nu = 0; nu < spin_dim; ++nu) {
-                                spin_global(mu) += sublattice_frames[l](mu, nu) * spins[current_site_index](nu);
-                            }
-                        }
-                        M += spin_global;
-                    }
-                }
-            }
-        }
-        
+        for (size_t a = 0; a < N_atoms; ++a) M += sublattice_frames[a] * sum[a];
         return M / double(lattice_size);
     }
 
     /**
-     * Compute structure factor S(q)
+     * Structure factor of the current configuration, per site and in the
+     * global frame (S_global = F_s S_local):
+     *
+     *     S^{αβ}(q) = (1/N) Σ_ij S_i^α S_j^β e^{-i q·(r_i - r_j)}
+     *               = (1/N) A^α(q) A^β(q)^*,   A(q) = Σ_i S_i e^{-i q·r_i},
+     *
+     * a Hermitian spin_dim x spin_dim matrix (direct sum over sites, any q).
+     * For thermal averages use the correlation accumulator, which is
+     * normalised per unit cell (N_atoms times larger).
      */
-    double structure_factor(const Eigen::Vector3d& q) const {
-        std::complex<double> S_q(0, 0);
-        
+    Eigen::MatrixXcd structure_factor_matrix(const Eigen::Vector3d& q) const {
+        Eigen::VectorXcd A = Eigen::VectorXcd::Zero(spin_dim);
         for (size_t i = 0; i < lattice_size; ++i) {
-            double phase = q.dot(site_positions[i]);
-            std::complex<double> exp_iqr(std::cos(phase), std::sin(phase));
-            
-            // Project spin onto first component (generalize for vectorial S(q))
-            S_q += spins[i](0) * exp_iqr;
+            const double phase = q.dot(site_positions[i]);
+            const std::complex<double> e(std::cos(phase), -std::sin(phase));
+            A += (sublattice_frames[i % N_atoms] * spins[i]).cast<std::complex<double>>() * e;
         }
-        
-        return std::norm(S_q) / double(lattice_size);
+        return A * A.adjoint() / double(lattice_size);
+    }
+
+    /** Tr S(q) = (1/N) |Σ_i S_i e^{-i q·r_i}|^2 (global frame, all components). */
+    double structure_factor(const Eigen::Vector3d& q) const {
+        return structure_factor_matrix(q).trace().real();
+    }
+
+    /** Real (symmetric, neutron) part of structure_factor_matrix(q); spin_dim == 3. */
+    Eigen::Matrix3d structure_factor_tensor(const Eigen::Vector3d& q) const {
+        if (spin_dim != 3) throw std::invalid_argument("structure_factor_tensor: needs spin_dim == 3");
+        return structure_factor_matrix(q).real();
     }
 
     // ============================================================
-    // REAL-SPACE CORRELATION ACCUMULATOR
+    // CORRELATION ACCUMULATOR (correlation_accumulator.h)
     // ============================================================
-    
+
     /**
-     * Create a RealSpaceCorrelationAccumulator initialized for this lattice
-     * 
-     * @param n_bond_types  Number of distinct bond types (default: N*(N+1)/2 for N sublattices)
-     * @return Initialized accumulator ready to accumulate samples
+     * Geometry of this lattice for RealSpaceCorrelationAccumulator: cell grid,
+     * sublattice positions and frames, and the bond classes of the unit cell's
+     * bilinear couplings in neighbour shell `dimer_shell` (1 = shortest coupled
+     * bonds, 0 = all coupled bonds; no bond classes = no dimer channel).
      */
-    RealSpaceCorrelationAccumulator create_correlation_accumulator(size_t n_bond_types = 0) const {
+    RealSpaceCorrelationAccumulator::Geometry correlation_geometry(size_t dimer_shell = 1) const {
+        RealSpaceCorrelationAccumulator::Geometry g;
+        g.dim1 = dim1;
+        g.dim2 = dim2;
+        g.dim3 = dim3;
+        g.n_sublattices = N_atoms;
+        g.spin_dim = spin_dim;
+        g.lattice_vectors = {unit_cell.lattice_vectors[0], unit_cell.lattice_vectors[1],
+                             unit_cell.lattice_vectors[2]};
+        g.positions.assign(unit_cell.lattice_pos.begin(), unit_cell.lattice_pos.begin() + N_atoms);
+        g.frames.assign(sublattice_frames.begin(), sublattice_frames.end());
+        g.bond_classes = RealSpaceCorrelationAccumulator::bond_classes_from_unit_cell(unit_cell, dimer_shell);
+        return g;
+    }
+
+    /**
+     * Accumulator for this lattice (correlation_geometry(1), default options).
+     * `n_bond_types` is ignored: bond classes are the geometrically distinct
+     * nearest-shell bonds of the unit cell.
+     */
+    RealSpaceCorrelationAccumulator create_correlation_accumulator(size_t /*n_bond_types*/ = 0) const {
         RealSpaceCorrelationAccumulator acc;
-        
-        if (n_bond_types == 0) {
-            // Default: number of undirected sublattice pairs = N*(N+1)/2
-            // This covers all possible bond types (0,0), (0,1), (1,1), etc.
-            n_bond_types = N_atoms * (N_atoms + 1) / 2;
-        }
-        
-        // Get lattice vectors from unit cell
-        array<Eigen::Vector3d, 3> lattice_vectors = {
-            unit_cell.lattice_vectors[0],
-            unit_cell.lattice_vectors[1],
-            unit_cell.lattice_vectors[2]
-        };
-        
-        // Get sublattice positions
-        vector<Eigen::Vector3d> sublattice_positions(N_atoms);
-        for (size_t atom = 0; atom < N_atoms; ++atom) {
-            sublattice_positions[atom] = unit_cell.lattice_pos[atom];
-        }
-        
-        acc.initialize(dim1, dim2, dim3, N_atoms, n_bond_types, spin_dim,
-                      lattice_vectors, sublattice_positions);
-        
+        acc.initialize(correlation_geometry(1));
         return acc;
     }
-    
-    /**
-     * Accumulate current spin configuration into the correlation accumulator
-     * Call this every probe_rate MC sweeps during measurement phase
-     * 
-     * @param acc  Reference to the accumulator to update
-     */
-    void accumulate_correlations(RealSpaceCorrelationAccumulator& acc) const {
-        // Define site-to-sublattice mapping
-        auto site_to_sublattice = [this](size_t site) -> size_t {
-            return site % N_atoms;
-        };
-        
-        // Define site-to-cell mapping
-        auto site_to_cell = [this](size_t site) -> array<size_t, 3> {
-            size_t cell_idx = site / N_atoms;
-            size_t n3 = cell_idx % dim3;
-            size_t n2 = (cell_idx / dim3) % dim2;
-            size_t n1 = cell_idx / (dim2 * dim3);
-            return {n1, n2, n3};
-        };
-        
-        acc.accumulate_spin_correlations(spins, site_to_sublattice, site_to_cell);
+
+    RealSpaceCorrelationAccumulator create_correlation_accumulator(
+        const RealSpaceCorrelationAccumulator::Options& options, size_t dimer_shell) const {
+        RealSpaceCorrelationAccumulator acc;
+        acc.initialize(correlation_geometry(dimer_shell), options);
+        return acc;
     }
-    
+
+    /** One sample of the spin channel (call every probe_rate sweeps while measuring). */
+    void accumulate_correlations(RealSpaceCorrelationAccumulator& acc) const {
+        acc.accumulate_spin_correlations(spins);
+    }
+
     /**
-     * Accumulate current dimer correlations into the accumulator
-     * 
-     * This extracts bond information from the bilinear_partners structure
-     * and classifies bonds by type based on sublattice pair.
-     * 
-     * Bond type = sorted sublattice pair (sub_i, sub_j) mapped to linear index.
-     * For N sublattices, there are N*(N+1)/2 undirected bond types:
-     *   (0,0), (0,1), (1,1), (0,2), (1,2), (2,2), ...
-     * 
-     * @param acc  Reference to the accumulator to update
+     * One sample of the dimer channel: D^α_c(R) = S^α_i S^α_j over the bond
+     * classes stored in `acc` (RealSpaceCorrelationAccumulator::
+     * bond_classes_from_unit_cell is the only bond -> class map). A no-op when
+     * `acc` has no bond classes.
      */
     void accumulate_dimer_correlations(RealSpaceCorrelationAccumulator& acc) const {
-        // Build bond list from bilinear_partners (only forward bonds to avoid double counting)
-        vector<array<size_t, 2>> bonds;
-        vector<size_t> bond_types;
-        vector<array<size_t, 3>> bond_cells;
-        
-        // Helper: compute bond type from sorted sublattice pair
-        // Maps (min(sub_i, sub_j), max(sub_i, sub_j)) to linear index
-        // Using triangular number indexing: type = max*(max+1)/2 + min
-        auto sublattice_pair_to_bond_type = [](size_t sub_i, size_t sub_j) -> size_t {
-            size_t s_min = std::min(sub_i, sub_j);
-            size_t s_max = std::max(sub_i, sub_j);
-            return s_max * (s_max + 1) / 2 + s_min;
-        };
-        
-        for (size_t site_i = 0; site_i < lattice_size; ++site_i) {
-            size_t sub_i = site_i % N_atoms;
-            size_t cell_i = site_i / N_atoms;
-            size_t n1 = cell_i / (dim2 * dim3);
-            size_t n2 = (cell_i / dim3) % dim2;
-            size_t n3 = cell_i % dim3;
-            
-            for (size_t nb = 0; nb < bilinear_partners[site_i].size(); ++nb) {
-                size_t site_j = bilinear_partners[site_i][nb];
-                
-                // Only count forward bonds (site_i < site_j) to avoid double counting
-                if (site_j > site_i) {
-                    size_t sub_j = site_j % N_atoms;
-                    
-                    // Classify bond type by sorted sublattice pair
-                    size_t bond_type = sublattice_pair_to_bond_type(sub_i, sub_j);
-                    
-                    // Clamp to n_bond_types in case accumulator was initialized with fewer
-                    if (bond_type >= acc.n_bond_types) {
-                        bond_type = bond_type % acc.n_bond_types;
-                    }
-                    
-                    bonds.push_back({site_i, site_j});
-                    bond_types.push_back(bond_type);
-                    bond_cells.push_back({n1, n2, n3});
-                }
-            }
-        }
-        
-        acc.accumulate_dimer_correlations(spins, bonds, bond_types, bond_cells);
-    }
-    
-    /**
-     * Compute full S(q) tensor from current spin configuration
-     * Returns S^{αβ}(q) = (1/N) Σ_{ij} S_i^α S_j^β exp(-i q·(r_i - r_j))
-     * 
-     * @param q  Wavevector in Cartesian coordinates
-     * @return 3x3 structure factor tensor (or spin_dim x spin_dim)
-     */
-    Eigen::Matrix3d structure_factor_tensor(const Eigen::Vector3d& q) const {
-        Eigen::Matrix3d Sq = Eigen::Matrix3d::Zero();
-        
-        // Compute Fourier components
-        Eigen::Vector3cd S_q = Eigen::Vector3cd::Zero();
-        for (size_t i = 0; i < lattice_size; ++i) {
-            double phase = q.dot(site_positions[i]);
-            std::complex<double> exp_iqr(std::cos(phase), std::sin(phase));
-            S_q += spins[i].head<3>().cast<std::complex<double>>() * exp_iqr;
-        }
-        
-        // S^{αβ}(q) = (1/N) S_q^α S_{-q}^β = (1/N) S_q^α conj(S_q^β)
-        for (int a = 0; a < 3; ++a) {
-            for (int b = 0; b < 3; ++b) {
-                Sq(a, b) = std::real(S_q(a) * std::conj(S_q(b))) / double(lattice_size);
-            }
-        }
-        
-        return Sq;
+        if (!acc.bond_classes().empty()) acc.accumulate_dimer_correlations(spins);
     }
 
     // ============================================================
@@ -4812,203 +4275,24 @@ public:
         return false;
     }
 
-#if defined(CUDA_ENABLED) && defined(__CUDACC__)
-private:
-    // GPU data cache for avoiding repeated transfers
-    mutable gpu::GPULatticeData gpu_data_cache_;
-    mutable bool gpu_data_initialized_ = false;
-    
-    /**
-     * Ensure GPU lattice data is initialized (lazy initialization)
-     * Uses the modular gpu:: implementation from lattice_gpu.cuh/cu
-     */
-    void ensure_gpu_data_initialized() const {
-        if (gpu_data_initialized_) return;
-
-        if (has_trilinear_interactions()) {
-            throw std::runtime_error(
-                "Lattice::ensure_gpu_data_initialized: this lattice has "
-                "trilinear couplings, but the GPU code path in "
-                "src/gpu/lattice_gpu.cu does not implement them yet. "
-                "Set use_gpu=false, or run on a Hamiltonian without "
-                "trilinear terms. (See audit item T3.)");
-        }
-
-        // Flatten field data
-        vector<double> flat_field;
-        flat_field.reserve(lattice_size * spin_dim);
-        for (size_t i = 0; i < lattice_size; ++i) {
-            for (size_t d = 0; d < spin_dim; ++d) {
-                flat_field.push_back(field[i](d));
-            }
-        }
-        
-        // Flatten onsite interaction matrices
-        vector<double> flat_onsite;
-        flat_onsite.reserve(lattice_size * spin_dim * spin_dim);
-        for (size_t i = 0; i < lattice_size; ++i) {
-            for (size_t r = 0; r < spin_dim; ++r) {
-                for (size_t c = 0; c < spin_dim; ++c) {
-                    flat_onsite.push_back(onsite_interaction[i](r, c));
-                }
-            }
-        }
-        
-        // Flatten bilinear interaction data
-        vector<double> flat_bilinear;
-        vector<size_t> flat_partners;
-        vector<size_t> num_bilinear_per_site;
-        
-        flat_bilinear.reserve(lattice_size * num_bi * spin_dim * spin_dim);
-        flat_partners.reserve(lattice_size * num_bi);
-        num_bilinear_per_site.reserve(lattice_size);
-        
-        for (size_t i = 0; i < lattice_size; ++i) {
-            num_bilinear_per_site.push_back(bilinear_partners[i].size());
-            for (size_t n = 0; n < num_bi; ++n) {
-                if (n < bilinear_partners[i].size()) {
-                    flat_partners.push_back(bilinear_partners[i][n]);
-                    for (size_t r = 0; r < spin_dim; ++r) {
-                        for (size_t c = 0; c < spin_dim; ++c) {
-                            flat_bilinear.push_back(bilinear_interaction[i][n](r, c));
-                        }
-                    }
-                } else {
-                    flat_partners.push_back(0);
-                    for (size_t j = 0; j < spin_dim * spin_dim; ++j) {
-                        flat_bilinear.push_back(0.0);
-                    }
-                }
-            }
-        }
-        
-        // Create GPU data using the modular implementation
-        gpu_data_cache_ = gpu::create_gpu_lattice_data(
-            lattice_size, spin_dim, N_atoms, num_bi,
-            flat_field, flat_onsite, flat_bilinear, 
-            flat_partners, num_bilinear_per_site
-        );
-        
-        gpu_data_initialized_ = true;
-    }
-    
-    /**
-     * Update GPU pulse parameters
-     */
-    void update_gpu_pulse() const {
-        vector<double> flat_field_drive;
-        flat_field_drive.reserve(2 * N_atoms * spin_dim);
-        for (size_t p = 0; p < 2; ++p) {
-            for (size_t d = 0; d < field_drive[p].size(); ++d) {
-                flat_field_drive.push_back(field_drive[p](d));
-            }
-        }
-        
-        gpu::set_gpu_pulse(
-            gpu_data_cache_,
-            flat_field_drive,
-            field_drive_amp,
-            field_drive_width,
-            field_drive_freq,
-            t_pulse[0],
-            t_pulse[1]
-        );
-    }
-    
-    /**
-     * GPU version of single_pulse_drive using true GPU integration
-     * Uses gpu::integrate_gpu for pure GPU execution without per-step host transfers
-     */
-    vector<pair<double, array<SpinVector, 3>>> single_pulse_drive_gpu(
-               const vector<SpinVector>& field_in, double t_B,
-               double pulse_amp, double pulse_width, double pulse_freq,
-               double T_start, double T_end, double step_size,
-               string method = "dopri5") {
-        
-        // Set up pulse on CPU side first
-        set_pulse(field_in, t_B, vector<SpinVector>(N_atoms, SpinVector::Zero(spin_dim)), 
-                 0.0, pulse_amp, pulse_width, pulse_freq);
-        
-        // Ensure GPU data is initialized and update pulse
-        ensure_gpu_data_initialized();
-        update_gpu_pulse();
-        
-        // Create GPU ODE system
-        gpu::GPUODESystem gpu_system(gpu_data_cache_);
-        
-        // Transfer initial state to GPU
-        ODEState h_state = spins_to_state(spins);
-        gpu::GPUState d_state(h_state.begin(), h_state.end());
-        
-        // Calculate save interval from step size
-        double total_time = T_end - T_start;
-        size_t total_steps = static_cast<size_t>(total_time / step_size) + 1;
-        size_t save_interval = 1;  // Save every step for trajectory output
-        
-        // Integrate on GPU - all computation stays on device
-        std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_system, d_state, T_start, T_end, step_size, 
-                          save_interval, raw_trajectory);
-        
-        // Convert raw snapshots to the magnetisation trajectory
-        PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
-        clear_pulse();
-        return trajectory;
-    }
-    
-    /**
-     * GPU version of double_pulse_drive using true GPU integration
-     */
-    vector<pair<double, array<SpinVector, 3>>> double_pulse_drive_gpu(
-               const vector<SpinVector>& field_in_1, double t_B_1,
-               const vector<SpinVector>& field_in_2, double t_B_2,
-               double pulse_amp, double pulse_width, double pulse_freq,
-               double T_start, double T_end, double step_size,
-               string method = "dopri5") {
-        
-        // Set up two-pulse configuration
-        set_pulse(field_in_1, t_B_1, field_in_2, t_B_2, 
-                 pulse_amp, pulse_width, pulse_freq);
-        
-        // Ensure GPU data is initialized and update pulse
-        ensure_gpu_data_initialized();
-        update_gpu_pulse();
-        
-        // Create GPU ODE system
-        gpu::GPUODESystem gpu_system(gpu_data_cache_);
-        
-        // Transfer initial state to GPU
-        ODEState h_state = spins_to_state(spins);
-        gpu::GPUState d_state(h_state.begin(), h_state.end());
-        
-        // Integrate on GPU
-        std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_system, d_state, T_start, T_end, step_size, 
-                          1, raw_trajectory);
-        
-        // Convert raw snapshots to the magnetisation trajectory
-        PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
-        clear_pulse();
-        return trajectory;
-    }
-#endif // defined(CUDA_ENABLED) && defined(__CUDACC__)
 
 // =============================================================================
-// GPU Implementation using opaque API (for C++ TUs compiled with g++)
-// This section is used when CUDA_ENABLED but not compiling with NVCC
+// GPU backend glue (opaque API of lattice_gpu_api.h; untested here: no CUDA
+// toolchain in CI). Methods and tolerances follow gpu::integrate_gpu.
 // =============================================================================
-#if defined(CUDA_ENABLED) && !defined(__CUDACC__)
+#ifdef CUDA_ENABLED
 private:
-    // GPU data handle (opaque pointer managed by CUDA library)
-    mutable gpu::GPULatticeDataHandle* gpu_handle_ = nullptr;
-    mutable bool gpu_data_initialized_ = false;
+    // Device copy of the Hamiltonian, uploaded on first GPU use. Freed by the
+    // destructor; a copied Lattice starts without one (DeviceHandle never
+    // shares a handle between objects).
+    mutable classical_spin::gpu::DeviceHandle<gpu::GPULatticeDataHandle, &gpu::destroy_gpu_lattice_data> gpu_handle_;
     
     /**
      * Ensure GPU lattice data is initialized (lazy initialization)
      * Uses the opaque API from lattice_gpu_api.h
      */
     void ensure_gpu_data_initialized() const {
-        if (gpu_data_initialized_) return;
+        if (gpu_handle_) return;
 
         if (has_trilinear_interactions()) {
             throw std::runtime_error(
@@ -5068,13 +4352,10 @@ private:
         }
         
         // Create GPU data using opaque API
-        gpu_handle_ = gpu::create_gpu_lattice_data(
+        gpu_handle_.reset(gpu::create_gpu_lattice_data(
             lattice_size, spin_dim, N_atoms, num_bi,
-            flat_field, flat_onsite, flat_bilinear, 
-            flat_partners, num_bilinear_per_site
-        );
-        
-        gpu_data_initialized_ = true;
+            flat_field, flat_onsite, flat_bilinear,
+            flat_partners, num_bilinear_per_site));
     }
     
     /**
@@ -5092,7 +4373,7 @@ private:
         }
         
         gpu::set_gpu_pulse(
-            gpu_handle_,
+            gpu_handle_.get(),
             flat_field_drive,
             field_drive_amp,
             field_drive_width,
@@ -5107,7 +4388,7 @@ private:
      */
     void molecular_dynamics_gpu(double T_start, double T_end, double dt_initial,
                            string out_dir = "", size_t save_interval = 100,
-                           string method = "dopri5") {
+                           string method = "dopri5", double abs_tol = 1e-6, double rel_tol = 1e-6) {
 #ifndef HDF5_ENABLED
         std::cerr << "Error: HDF5 support is required for molecular dynamics output." << endl;
         return;
@@ -5125,7 +4406,7 @@ private:
         
         // Transfer initial state to GPU
         ODEState h_state = spins_to_state(spins);
-        gpu::set_gpu_spins(gpu_handle_, h_state);
+        gpu::set_gpu_spins(gpu_handle_.get(), h_state);
         
         // Create HDF5 writer
         std::unique_ptr<HDF5MDWriter> hdf5_writer;
@@ -5141,8 +4422,8 @@ private:
         
         // Integrate on GPU
         std::vector<std::pair<double, std::vector<double>>> trajectory;
-        gpu::integrate_gpu(gpu_handle_, T_start, T_end, dt_initial, 
-                          save_interval, trajectory, method);
+        gpu::integrate_gpu(gpu_handle_.get(), T_start, T_end, dt_initial,
+                          save_interval, trajectory, method, abs_tol, rel_tol);
         
         // Write trajectory to HDF5 (post-processing on CPU)
         size_t save_count = 0;
@@ -5225,7 +4506,7 @@ private:
         measure_magnetizations(ground.data(), baseline.data(), scratch.data());
 
         std::cout << "[GPU batched 2DCS] " << (n_tau + 1) << " replicas (1 reference + "
-                  << n_tau << " delays), rk4" << std::endl;
+                  << n_tau << " delays), " << spec.settings.method << std::endl;
         const double t_pulse2_disabled = grid.t_end() + 100.0 * std::max(spec.width, 1.0);
         std::vector<double> batch_tau2(n_tau + 1);
         batch_tau2[0] = t_pulse2_disabled;
@@ -5242,8 +4523,9 @@ private:
                 for (size_t c = 0; c < spin_dim; ++c)
                     flat_frames[(a * spin_dim + r) * spin_dim + c] = sublattice_frames[a](r, c);
         gpu::BatchedMagResult batched = gpu::integrate_gpu_batched(
-            gpu_handle_, flat_init, batch_tau2, flat_afm, flat_frames,
-            grid.t0, grid.t_end(), grid.dt, /*save_interval=*/1, /*method=*/"rk4");
+            gpu_handle_.get(), flat_init, batch_tau2, flat_afm, flat_frames,
+            grid.t0, grid.t_end(), grid.dt, /*save_interval=*/1, spec.settings.method,
+            spec.settings.abs_tol, spec.settings.rel_tol);
         clear_pulse();
         if (batched.n_time_points != grid.n || batched.B != n_tau + 1) {
             throw std::runtime_error("pump_probe_spectroscopy_gpu_batched: GPU returned " +
@@ -5278,7 +4560,7 @@ private:
                const vector<SpinVector>& field_in, double t_B,
                double pulse_amp, double pulse_width, double pulse_freq,
                double T_start, double T_end, double step_size,
-               string method = "dopri5") {
+               string method = "dopri5", double abs_tol = 1e-8, double rel_tol = 1e-8) {
         
         // Set up pulse
         set_pulse(field_in, t_B, vector<SpinVector>(N_atoms, SpinVector::Zero(spin_dim)), 
@@ -5290,12 +4572,12 @@ private:
         
         // Transfer initial state to GPU
         ODEState h_state = spins_to_state(spins);
-        gpu::set_gpu_spins(gpu_handle_, h_state);
+        gpu::set_gpu_spins(gpu_handle_.get(), h_state);
         
         // Integrate on GPU
         std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_handle_, T_start, T_end, step_size, 
-                          1, raw_trajectory, method);
+        gpu::integrate_gpu(gpu_handle_.get(), T_start, T_end, step_size,
+                          1, raw_trajectory, method, abs_tol, rel_tol);
         
         // Convert raw snapshots to the magnetisation trajectory
         PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
@@ -5311,7 +4593,7 @@ private:
                    const vector<SpinVector>& field_in_2, double t_B_2,
                    double pulse_amp, double pulse_width, double pulse_freq,
                    double T_start, double T_end, double step_size,
-                   string method = "dopri5") {
+                   string method = "dopri5", double abs_tol = 1e-8, double rel_tol = 1e-8) {
         
         // Set up two-pulse configuration
         set_pulse(field_in_1, t_B_1, field_in_2, t_B_2, 
@@ -5323,19 +4605,19 @@ private:
         
         // Transfer initial state to GPU
         ODEState h_state = spins_to_state(spins);
-        gpu::set_gpu_spins(gpu_handle_, h_state);
+        gpu::set_gpu_spins(gpu_handle_.get(), h_state);
         
         // Integrate on GPU
         std::vector<std::pair<double, std::vector<double>>> raw_trajectory;
-        gpu::integrate_gpu(gpu_handle_, T_start, T_end, step_size, 
-                          1, raw_trajectory, method);
+        gpu::integrate_gpu(gpu_handle_.get(), T_start, T_end, step_size,
+                          1, raw_trajectory, method, abs_tol, rel_tol);
         
         // Convert raw snapshots to the magnetisation trajectory
         PumpProbeTrajectory trajectory = trajectory_from_states(raw_trajectory);
         clear_pulse();
         return trajectory;
     }
-#endif // defined(CUDA_ENABLED) && !defined(__CUDACC__)
+#endif // CUDA_ENABLED
 
 };
 

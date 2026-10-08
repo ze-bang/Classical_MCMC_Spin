@@ -29,9 +29,7 @@
 #include <sstream>
 #include <stdexcept>
 
-#ifdef CUDA_ENABLED
-#include <cuda_runtime.h>
-#endif
+#include "classical_spin/gpu/device_select.h"
 
 using namespace std;
 
@@ -145,24 +143,10 @@ void run_parameter_sweep(const SpinConfig& base_config, MPI_Comm comm) {
         }
     }
 
-#ifdef CUDA_ENABLED
-    // Set GPU device based on local rank (for multi-GPU nodes)
-    // Do this ONCE before the sweep loop to avoid repeated setup
-    if (needs_gpu) {
-        int device_count;
-        cudaGetDeviceCount(&device_count);
-        if (device_count > 0) {
-            int device_id = rank % device_count;
-            cudaSetDevice(device_id);
-            cout << "[Rank " << rank << "] Assigned to GPU " << device_id
-                 << " (parameter sweep, " << device_count << " GPU(s) available)" << endl;
-        } else {
-            if (rank == 0) {
-                cout << "Warning: No GPUs detected, falling back to CPU" << endl;
-            }
-        }
-    }
-#endif
+    // Bind a device once before the sweep loop (node-local rank, the job rank
+    // as fallback), or report once that the GPU is not usable; the drivers
+    // then run on the CPU.
+    classical_spin::gpu::select_device(needs_gpu, job_rank());
 
     const bool is_parallel_tempering = (base_config.sweep_base_simulation == SimulationType::PARALLEL_TEMPERING);
     if (is_parallel_tempering) {

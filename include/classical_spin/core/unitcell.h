@@ -175,7 +175,7 @@ public:
     
     void set_field(const SpinVector& f, size_t index) {
         if (index >= N_atoms) throw out_of_range("Atom index out of range");
-        if (f.size() != N) throw invalid_argument("Field dimension mismatch");
+        if (size_t(f.size()) != N) throw invalid_argument("Field dimension mismatch");
         require_finite(f, "field of atom " + std::to_string(index));
         field[index] = f;
     }
@@ -193,7 +193,7 @@ public:
     void set_bilinear_interaction(const SpinMatrix& J, size_t source, 
                                   size_t partner, const Vector3i& offset,
                                   int bond_type) {
-        if (J.rows() != N || J.cols() != N) {
+        if (size_t(J.rows()) != N || size_t(J.cols()) != N) {
             throw invalid_argument("Bilinear matrix dimension mismatch");
         }
         check_atom(source, "bilinear source");
@@ -209,7 +209,7 @@ public:
             throw invalid_argument("Trilinear tensor dimension mismatch");
         }
         for (const auto& slice : K) {
-            if (slice.rows() != N || slice.cols() != N)
+            if (size_t(slice.rows()) != N || size_t(slice.cols()) != N)
                 throw invalid_argument("Trilinear tensor slice dimension mismatch (each slice must be N x N)");
             require_finite(slice, "trilinear coupling on atom " + std::to_string(source));
         }
@@ -227,7 +227,7 @@ public:
      */
     void set_onsite_interaction(const SpinMatrix& A, size_t index) {
         if (index >= N_atoms) throw out_of_range("Atom index out of range");
-        if (A.rows() != N || A.cols() != N) {
+        if (size_t(A.rows()) != N || size_t(A.cols()) != N) {
             throw invalid_argument("Onsite matrix dimension mismatch");
         }
         require_finite(A, "on-site matrix of atom " + std::to_string(index));
@@ -236,7 +236,7 @@ public:
     
     void set_sublattice_frame(const SpinMatrix& frame, size_t index) {
         if (index >= N_atoms) throw out_of_range("Atom index out of range");
-        if (frame.rows() != N || frame.cols() != N) {
+        if (size_t(frame.rows()) != N || size_t(frame.cols()) != N) {
             throw invalid_argument("Frame matrix dimension mismatch");
         }
         sublattice_frames[index] = frame;

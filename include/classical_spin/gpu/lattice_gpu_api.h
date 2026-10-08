@@ -97,22 +97,18 @@ void get_gpu_spins(
 );
 
 /**
- * Perform GPU integration using specified method
- * 
- * Available methods:
- * - "euler": Explicit Euler (1st order)
- * - "rk2" or "midpoint": Modified midpoint (2nd order)
- * - "rk4": Classic Runge-Kutta (4th order)
- * - "dopri5": Dormand-Prince 5(4) - recommended
- * - "ssprk53": SSP RK 5-stage 3rd order (default, optimized for spin dynamics)
- * 
- * @param handle GPU data handle
- * @param T_start Start time
- * @param T_end End time
- * @param dt Step size
- * @param save_interval Steps between trajectory saves
- * @param trajectory Output: (time, state) pairs saved at intervals
- * @param method Integration method (default: ssprk53)
+ * Integrate on the GPU from the uploaded state and record (t, state) on the
+ * output grid t_k = T_start + k * save_interval * dt, k = 0 .. n-1, with as
+ * many samples as fit into [T_start, T_end] (the TimeGrid::covering grid of
+ * the CPU drivers).
+ *
+ * Methods (gpu/ode/rk_tableaux.h):
+ * - fixed step dt: "euler", "rk2"/"midpoint", "rk4", "ssprk53";
+ * - error-controlled (abs_tol / rel_tol, dt = initial step, max-norm error
+ *   test as Boost.Odeint): "rk5"/"rkck54"/"rk54"/"rkf54" (Cash-Karp 5(4)),
+ *   "dopri5" (default), "rk78"/"rkf78" (Fehlberg 7(8)).
+ * Any other name (bulirsch_stoer, Adams, geometric integrators, typos) throws
+ * std::invalid_argument; a null handle or no uploaded state throws too.
  */
 void integrate_gpu(
     GPULatticeDataHandle* handle,
@@ -121,22 +117,19 @@ void integrate_gpu(
     double dt,
     size_t save_interval,
     std::vector<std::pair<double, std::vector<double>>>& trajectory,
-    const std::string& method = "ssprk53"
+    const std::string& method = "dopri5",
+    double abs_tol = 1e-8,
+    double rel_tol = 1e-8
 );
 
 /**
- * Single integration step on GPU
- * 
- * @param handle GPU data handle
- * @param t Current time
- * @param dt Step size
- * @param method Integration method (default: ssprk53)
+ * One step of size dt (no error control). Same method names as integrate_gpu.
  */
 void step_gpu(
     GPULatticeDataHandle* handle,
     double t,
     double dt,
-    const std::string& method = "ssprk53"
+    const std::string& method = "rk4"
 );
 
 /**
@@ -184,10 +177,12 @@ struct BatchedMagResult {
  * t_pulse_1, amplitude, width, and frequency are taken from the pulse
  * parameters already set on the handle (via set_gpu_pulse).
  *
- * At every save_interval steps the kernel extracts per-replica magnetizations
+ * At every output time the kernel extracts per-replica magnetizations
  * (antiferro, local, global) on-device and copies only those B×3×spin_dim
  * doubles to the host — avoiding the B×N×spin_dim full-state download that
- * would otherwise dominate the runtime.
+ * would otherwise dominate the runtime. Output grid and methods as
+ * integrate_gpu; an error-controlled method shares one adaptive step across
+ * the replicas.
  *
  * @param handle           GPU handle with lattice data + shared pulse params
  * @param flat_initial_state  Initial spin state [N * spin_dim] (same for all replicas)
@@ -197,10 +192,10 @@ struct BatchedMagResult {
  *                           [N_atoms * spin_dim * spin_dim]
  * @param T_start          Integration start time
  * @param T_end            Integration end time
- * @param dt               Fixed step size
- * @param save_interval    Steps between magnetization snapshots (default: 1)
- * @param method           Integration method; only "rk4" is supported for
- *                         batched mode (default: "rk4")
+ * @param dt               Step (fixed-step methods) or initial step (adaptive)
+ * @param save_interval    Steps of dt between magnetization snapshots (default: 1)
+ * @param method           Integration method (see integrate_gpu)
+ * @param abs_tol, rel_tol Tolerances of the error-controlled methods
  */
 BatchedMagResult integrate_gpu_batched(
     GPULatticeDataHandle* handle,
@@ -210,7 +205,9 @@ BatchedMagResult integrate_gpu_batched(
     const std::vector<double>& sublattice_frames,
     double T_start, double T_end, double dt,
     size_t save_interval = 1,
-    const std::string& method = "rk4"
+    const std::string& method = "rk4",
+    double abs_tol = 1e-8,
+    double rel_tol = 1e-8
 );
 
 } // namespace gpu

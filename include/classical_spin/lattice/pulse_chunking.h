@@ -163,12 +163,12 @@ inline std::vector<Segment> build_pulse_segments(
     // and every chunk length is an integer × T_step.  Compiled out in
     // release builds via assert(); in debug a violation indicates a bug
     // in the snapping logic above (not a user-config issue).
-    const double tol = 1e-9 * std::max(1.0, std::abs(T_end - T_start));
+    [[maybe_unused]] const double tol = 1e-9 * std::max(1.0, std::abs(T_end - T_start));
     for (size_t i = 0; i < segments.size(); ++i) {
         if (i + 1 < segments.size()) {
             assert(std::abs(segments[i].t1 - segments[i + 1].t0) <= tol);
         }
-        const double k = (segments[i].t1 - segments[i].t0) / T_step;
+        [[maybe_unused]] const double k = (segments[i].t1 - segments[i].t0) / T_step;
         assert(std::abs(k - std::round(k)) <= 1e-6);
     }
     return segments;

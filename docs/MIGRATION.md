@@ -925,3 +925,132 @@ the model the dynamics integrate.
 
 **Old behaviour.** `su3_mc_manifold = sphere` (or `Lattice::set_su3_mc_manifold("sphere")`);
 a cell with the legacy bracket (`su3_legacy_convention = 1`) keeps the sphere.
+
+## Correlation accumulator: FFT cross spectra, global frame, error bars
+
+**What changed.** `RealSpaceCorrelationAccumulator` (now in
+`lattice/correlation_accumulator.h`) accumulates, per sample, the FFT of every
+sublattice/component field over the cell grid and the cross spectra
+X_ss'^ab(k) = F_sa(k) F_s'b(k)^*, instead of real-space sums over all cell
+pairs. Consequences:
+
+- Cost O(N log N) per sample and no N_c x N_c table (L = 12 pyrochlore with
+  dimers: 5 ms per sample instead of ~2 s; 1.5 GB table at L = 24 gone).
+- Spins are rotated to the global frame with `sublattice_frames`, so
+  `structure_factor(q)` is the physical (neutron) S^ab(q); all sublattice pairs
+  and all (a, b) components are kept complex, so the antisymmetric (chiral)
+  part survives. `compute_Sq` returns its real part, as a 3x3 matrix.
+- q must be commensurate (q.a_i L_i / 2π integer): anything else throws
+  `std::invalid_argument` (the old code silently returned wrong values off the
+  grid). `grid_wavevector(m1, m2, m3)` builds grid points in any zone.
+- Error bars: samples go into `Options::n_bins` (default 16) contiguous bins
+  that are merged pairwise when full; `structure_factor_estimate` and
+  `compute_Sq_with_error` return delete-one-bin jackknife errors (the old error
+  was always zero).
+- Dimers: bond types are now geometrically distinct bond classes of the unit
+  cell (`bond_classes_from_unit_cell`, nearest coupled shell by default) with
+  the bond-centre phase; the old type = sublattice pair lumped up/down
+  tetrahedron bonds together, used two different (i, j) -> type orderings in
+  Lattice and the accumulator, and the wrong centre for inter-cell bonds.
+  Dimer operators use global-frame spins and have their own sample count.
+- `merge` merges every mean (it dropped two thirds of the dimer means), copies
+  into an uninitialised accumulator and throws on any geometry mismatch;
+  `mpi_reduce` is one `MPI_Reduce` on doubles after a collective geometry check.
+- `save_hdf5` writes a new schema (cross spectra, per-bin means, S(q) on the
+  first-zone grid with errors, bond-class table, convention attributes) and
+  throws `std::runtime_error` on HDF5 failure. The old flat `spin_corr_sum` /
+  `dimer_corr_sum` datasets are gone; `real_space_correlation(s, s', a, b)`
+  returns C(d) by inverse FFT.
+- The `n_bond_types` argument of `create_correlation_accumulator` /
+  `parallel_tempering` (config key `pt_n_bond_types`) is ignored.
+
+**Recover the old behaviour.** Not supported (the old output had wrong phases,
+frames and normalisation). Local-frame correlations: initialise with empty
+`Geometry::frames`.
+
+## Lattice::structure_factor / structure_factor_tensor: global frame, all components
+
+**What changed.** `Lattice::structure_factor(q)` returned |Σ_i S_i^x e^{iq·r_i}|²/N
+of the first LOCAL component only; it is now Tr S(q) over all components in the
+global frame. `structure_factor_tensor(q)` uses global-frame spins (was local)
+and `structure_factor_matrix(q)` returns the full complex tensor. Both stay
+normalised per site (1/N); the accumulator is per unit cell.
+
+**Recover the old behaviour.** Compute |Σ_i S_i^x e^{iq·r_i}|²/N directly from
+`spins` if needed.
+
+## GPU integrators: correct RKF7(8), real error control, strict method names (untested: no CUDA toolchain)
+
+**What changed.** The GPU steppers read their Butcher tableaux from
+`gpu/ode/rk_tableaux.h`, the constants `tests/test_gpu_tableaux.cpp` checks on
+the CPU (measured orders 8/7 for Fehlberg, 5/4 for Dormand-Prince and Cash-Karp).
+
+- `rk78`/`rkf78` used Fehlberg's a53/a54 swapped (order ~5) and propagated the
+  11-stage 7th-order weights; it is now the full 13-stage 8th-order solution
+  with the 7th-order error estimate (as Boost.Odeint).
+- `dopri5`, `rk5`/`rkck54`/`rk54`/`rkf54` and `rk78` are error-controlled on the
+  GPU (max-norm error test with abs_tol / rel_tol as on the CPU, step factor
+  0.9 err^(-1/(q+1)) in [0.2, 5]); `dt` is only the initial step. They used to
+  take fixed steps of the output spacing with the tolerances discarded. The
+  tolerances of `molecular_dynamics`, `single/double_pulse_drive` and the
+  batched 2DCS scan are passed through (Lattice and MixedLattice).
+- `bulirsch_stoer`/`bs` (a 2nd-order midpoint step on the GPU), Adams,
+  geometric and unknown method names throw `std::invalid_argument` on the GPU
+  path instead of silently running another method (unknown names used to run
+  ssprk53, the batched scan forced rk4).
+- GPU trajectories are sampled on t_k = T_start + k dt_out, the
+  `TimeGrid::covering` grid of the CPU drivers (the old loop accumulated
+  t += dt and took one step past T_end, so GPU and CPU trajectories differed in
+  length).
+- API defaults: `integrate_gpu` / `integrate_mixed_gpu` default to `dopri5`
+  (was `ssprk53`); null handles or a missing uploaded state throw.
+
+**Recover the old behaviour.** Fixed steps of the output spacing: use `rk4` or
+`ssprk53` explicitly.
+
+## GPU device selection and handle lifetime (untested: no CUDA toolchain)
+
+**What changed.** `classical_spin::gpu::select_device` (gpu/device_select.h) is
+the one device-selection routine: it checks the CUDA return codes, binds by the
+node-local rank from the launcher environment (non-collective; was global rank
+modulo device count on an unchecked, possibly uninitialised count) and reports
+once. Without a usable device the Lattice and MixedLattice dynamics drivers run
+on the CPU (the "falling back to CPU" message used to be printed while the GPU
+path was still taken). The opaque GPU handles of Lattice and MixedLattice are
+owned by `DeviceHandle` (gpu/gpu_handle.h): freed in the destructor (they
+leaked once per object) and never shared by copies (MixedLattice clones shared
+one raw handle). The never-compiled `__CUDACC__` member blocks of lattice.h and
+mixed_lattice.h (a second class layout) and the never-defined `LatticeGPU`
+declarations were removed.
+
+## Build options: portable flags, sanitizers, warnings, imported targets
+
+**What changed.**
+
+- `CLASSICAL_SPIN_NATIVE` (default ON) keeps the host-tuned Release flags
+  (`-march=native -mtune=native -flto -ffp-contract=fast ...`); OFF builds
+  portable binaries with `-O3 -DNDEBUG` only (for clusters whose login and
+  compute nodes differ; CI uses OFF).
+- `CLASSICAL_SPIN_SANITIZE` (default OFF) adds
+  `-fsanitize=address,undefined -fno-sanitize-recover=undefined` to every C++
+  target (and `-O1` in Debug, so the physics tests stay within their time
+  limits); use it with `CMAKE_BUILD_TYPE=Debug`. CTest then runs every test
+  with `tests/sanitizers/lsan.supp`, which silences only the allocations Open
+  MPI keeps until exit, and with four times the usual time limit.
+- `CLASSICAL_SPIN_WARNINGS` (default ON) replaces
+  `CLASSICAL_SPIN_ENABLE_WARNINGS` (`=OFF` still accepted, deprecated): `-Wall -Wextra
+  -Wformat=2 -Wnon-virtual-dtor` without the old list of thirteen `-Wno-*`
+  suppressions. Dependencies are SYSTEM includes, so only project code warns.
+- HDF5 and Boost are linked through their imported targets (`hdf5::hdf5_cpp`,
+  `hdf5::hdf5`, `Boost::headers`; a fallback INTERFACE target wraps the HDF5
+  variables). Boost used to be found but never linked.
+- Executables get `-g1` only in Release (it overrode `-g` in Debug builds).
+- CUDA (untested, no toolchain here): user `CMAKE_CUDA_FLAGS` are appended to
+  instead of overwritten; `--maxrregcount=32`, the duplicated `--use_fast_math`
+  and host `-ffast-math` are gone; one CUDA runtime (`CUDA::cudart`), no
+  unused cuBLAS / cuRAND.
+- `.github/workflows/ci.yml`: Ubuntu 24.04, portable Release build with the
+  full CTest suite, and a Debug ASan/UBSan build running the `physics` label.
+
+**Recover the old behaviour.** `-DCLASSICAL_SPIN_WARNINGS=OFF` silences the
+warnings; the default Release flags are unchanged.
