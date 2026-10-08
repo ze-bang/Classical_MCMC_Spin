@@ -90,6 +90,11 @@ std::unique_ptr<MixedLattice> make_mixed_lattice(const SpinConfig& config) {
     auto lattice = std::make_unique<MixedLattice>(build_tmfeo3(config), config.lattice_size[0],
                                                   config.lattice_size[1], config.lattice_size[2],
                                                   config.spin_length, config.spin_length_su3);
+    // Monte Carlo policy: local update kernel and SU(3) state space (CP^2 by
+    // default, legacy S^7 with su3_legacy_convention or su3_mc_manifold =
+    // sphere); set before the spins are initialised.
+    lattice->local_update = MixedLattice::parse_local_update(config.local_update);
+    lattice->set_su3_mc_manifold(config.su3_mc_manifold);
     if (config.use_ferromagnetic_init) {
         SpinVector dir_su3 = SpinVector::Zero(lattice->spin_dim_SU3);
         const int c = static_cast<int>(config.get_param("su3_init_component", 2.0));

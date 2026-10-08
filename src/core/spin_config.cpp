@@ -309,6 +309,7 @@ vector<KeySpec> build_typed_key_table() {
     add(field("num_trials", &C::num_trials));
     add(field("seed", &C::seed));
     add(field("local_update", &C::local_update));
+    add(field("su3_mc_manifold", &C::su3_mc_manifold));
     add(field("output_dir", &C::output_dir));
     add(unused(field("initial_step_size", &C::initial_step_size),
                "the Gaussian proposal width is adapted during equilibration"));
@@ -927,6 +928,9 @@ vector<string> SpinConfig::validation_errors() const {
         fail("lattice_size: more than 1e9 unit cells");
     if (!(spin_length > 0.0f) || !(spin_length_su3 > 0.0f)) fail("spin_length and spin_length_su3 must be > 0");
     if (field_direction.size() != 3) fail("field_direction needs 3 components");
+    if (!su3_mc_manifold.empty() && su3_mc_manifold != "auto" && su3_mc_manifold != "cp2" &&
+        su3_mc_manifold != "sphere")
+        fail("su3_mc_manifold must be cp2 or sphere (got '" + su3_mc_manifold + "')");
     if (g_factor.size() != 3) fail("g_factor needs 3 components");
 
     // System / mode combination (the driver dispatch table).

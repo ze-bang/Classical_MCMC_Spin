@@ -780,3 +780,129 @@ in every trial (Lattice and TmFeO3), the `run_info.txt` rerun, and clean
 non-zero exits for a misspelt key, an unsupported mode, a missing seed file
 (under MPI) and a non-terminating schedule. Two MPI CTests run `spin_solver`
 directly (`mpi_sweep_uneven`, `mpi_runtime_error_aborts`).
+
+## MixedLattice Monte Carlo: SU(3) sites sampled on CP^2 (`su3_mc_manifold`)
+
+**What changed.** SU(3) (Tm) sites store the Gell-Mann expectations
+n^a = <psi|lambda^a|psi> of a qutrit pure state, and since the SU(3)
+convention change the energy is E = <psi|H|psi> and the dynamics conserve
+that state space, CP^2 (|n|^2 = 4/3, cubic Casimir d_abc n^a n^b n^c = 8/9).
+Monte Carlo now samples the same manifold with its invariant (Fubini-Study,
+Haar) measure:
+
+- uniform proposals psi = normalise(z), z a complex Gaussian 3-vector;
+- small symmetric moves psi' = normalise(psi + sigma z) (the kernel depends
+  only on |<psi|psi'>|, so plain Metropolis is exact); psi is recovered from
+  the stored n without an eigensolver (rho = 1/3 + n.lambda/2 is rank one:
+  `su3::psi_from_pure_expectations`);
+- heat bath: in the eigenbasis of the local H = h.lambda the populations
+  p_k = |<v_k|psi>|^2 are uniform on the simplex under Fubini-Study, so they
+  are drawn exactly from exp(-beta sum_k p_k e_k), with uniform phases;
+- `init_random()` draws Haar-random states, `init_ferromagnetic()` maps the
+  SU(3) direction to its closest pure state (lambda_3 gives |1>), the T = 0
+  descent sets each site to the ground state of its local H (exact
+  diagonalisation), and SA / `greedy_quench` / PT first project SU(3) states
+  that are off the manifold (e.g. loaded legacy seeds) onto it
+  (`project_SU3_to_manifold`).
+
+`spin_length_su3` is not used on CP^2 (|n| = 2/sqrt 3 is fixed by purity).
+
+**Why.** The old sampler drew 8-vectors on the 7-sphere of radius
+`spin_length_su3` (default 1, which contains no pure state at all), with a
+hypercube-biased proposal before the RNG fix: 99.6 % of the proposals were not
+density matrices, the Tm sector had 7 instead of 4 degrees of freedom
+(equipartition 7/2 instead of 2 per site), and annealed states handed to the
+dynamics were on the wrong coadjoint orbit.
+
+**What you see.** Different Tm thermodynamics and SA ground states (now the
+physical ones); SU(3) Monte Carlo outputs satisfy the Casimirs to round-off.
+
+**Recover the old behaviour.** `su3_mc_manifold = sphere` (uniform measure on
+the 7-sphere of radius `spin_length_su3`, the S^7 reflection for
+overrelaxation, -L h/|h| at T = 0). It is also the default when
+`su3_legacy_convention = 1`; `su3_mc_manifold = cp2` overrides that, and
+`auto` (or no key) restores the default of the convention. API:
+`MixedLattice::set_su3_mc_manifold("cp2" | "sphere" | "auto")`.
+
+## MixedLattice Monte Carlo: exact local updates, self-bonds, long bonds
+
+**What changed.**
+
+- With all other spins frozen, the energy of a site is h.S + S^T A S (plus
+  cubic terms if a trilinear has the site in all three slots). The kernels
+  compute h (couplings containing the site once) from the packed buffers and
+  A (symmetrised on-site matrix plus the couplings containing the site twice,
+  e.g. the TmFeO3 vertex W(S_i, S_i, n_k)) from tables merged per partner.
+  `site_energy_SU2_diff` / `site_energy_SU3_diff` equal the total-energy
+  difference for every coupling, including non-symmetric on-site matrices
+  (only the symmetric part enters S^T A S; on-site matrices are symmetrised at
+  build time, so the MD field 2 A S is the true gradient).
+- A bond onto the site's own periodic image (lattice one cell wide along a
+  bonded direction) is folded into the on-site matrix, as in Lattice, and
+  cell coordinates are wrapped with a Euclidean modulo, so bonds longer than
+  the lattice no longer index out of range.
+- **Overrelaxation** reflects each spin about h, which does not depend on the
+  spin: exact and microcanonical where the self energy S^T A S is constant on
+  the sphere; elsewhere (single-ion anisotropy, self-coupled W) the reflection
+  is Metropolis-corrected at temperature T > 0 and skipped at T <= 0
+  (`overrelaxation(double T = 0)`, `overrelaxation_interleaved(T)`,
+  `overrelaxation_parallel(T)`; the PT adapter passes the replica temperature).
+  On CP^2 the S^7 reflection would leave the manifold; SU(3) sites instead get
+  random relative phases in the eigenbasis of H = h.lambda,
+  psi' = V diag(1, e^{i phi_1}, e^{i phi_2}) V^dagger psi: it conserves the
+  populations (hence h.n), maps CP^2 onto itself, and is a random unitary from
+  an inversion-symmetric distribution (unitaries preserve the Fubini-Study
+  measure), so the kernel is symmetric.
+- **T = 0 descent**: `deterministic_sweep(n = 1)` sets every site, in order,
+  to its exact single-site minimiser (trust-region solution of
+  min h.S + S^T A S on the sphere for SU(2) sites with anisotropy or W, the
+  local ground state on CP^2) and returns the largest change; the energy never
+  increases. `greedy_quench` stops when both the energy change and the largest
+  change are below tolerance; SA's T = 0 stage runs to convergence (at most
+  `n_deterministics` sweeps). `deterministic_sweep_interleaved()` and
+  `deterministic_sweep_SU3_exact_diag()` return the largest change too.
+- **Sweeps** visit every site exactly once (natural order, unit cell by unit
+  cell for `*_interleaved`, colour by colour for the OpenMP kernels); they
+  used to draw sites at random with replacement (~37 % untouched per sweep).
+  Site kernels allocate nothing (stack proposals, packed couplings).
+
+**Why.** The old overrelaxation reflected about the full gradient h + 2 A S,
+which conserves neither energy nor measure (2x2x2 TmFeO3: E 33 -> 14 in 20
+sweeps with the default anisotropy); the old T = 0 rule aligned spins with the
+full gradient (2-cycles / energy increases with anisotropy, unphysical SU(3)
+states); self-bonds gave max |dE - ΔE| = 2.4 on a 1x1x1 TmFeO3 lattice.
+
+**Recover the old behaviour.** Not supported (it sampled the wrong
+distribution).
+
+## MixedLattice Monte Carlo: local-update policy, heat bath, adaptive SA
+
+**What changed.**
+
+- The `local_update` key (metropolis | gaussian | heat_bath) now applies to
+  MixedLattice (`MixedLattice::local_update`, `local_sweep()`), as for
+  Lattice. `heat_bath` is rejection-free for SU(2) sites and for SU(3) sites on
+  CP^2 where the local energy is linear, Metropolis-corrected for the self
+  energy elsewhere; SU(3) sites on the legacy sphere use uniform Metropolis.
+  Lattices with at least `parallel_sweep_min_sites` (4096) sites use the
+  coloured OpenMP kernels when more than one thread is available.
+- `simulated_annealing` runs on `mc::annealing_schedule(T_start, T_end,
+  cooling_rate)` (ends exactly at T_end; `cooling_rate` outside (0, 1) or
+  `T_end <= 0` throw instead of looping forever). With Gaussian proposals the
+  width is adapted by `mc::StepSizeController` (Robbins-Monro toward 45 %
+  acceptance) during the first half of the sweeps at each temperature and
+  frozen for the second half (was: sigma = 1000, only ever shrunk). Final
+  measurements use the same local-update policy.
+- `perform_mc_sweeps` returns the mean acceptance of its local sweeps (was the
+  sum).
+- `measure_all_observables` computes the total energy once.
+- Removed (dead or unsafe): the lazy local-field cache (`enable_field_caching`,
+  `init_field_cache`, `invalidate_*`, `get_cached_local_field_*`,
+  `use_field_caching`, `cached_local_field_*`, `field_valid_*`, the
+  `mixed_bilinear_reverse_*` tables; it was never enabled and went stale after
+  any non-interleaved update or replica exchange) and the unused
+  `get_local_field_SU{2,3}_state`.
+- `bench_mixed_mc` (new) times the serial kernels on TmFeO3; `bench_mc`'s
+  `tmfeo3-trilinear` model now actually sets the K^- and W couplings.
+
+New config key: `su3_mc_manifold` (see above).

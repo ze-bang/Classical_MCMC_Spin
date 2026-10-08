@@ -98,6 +98,7 @@
 #define CLASSICAL_SPIN_SU3_COHERENT_STATE_H
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <complex>
@@ -157,6 +158,50 @@ inline Vector8r expectations_from_psi(const Vector3c& psi) {
     return n;
 }
 
+// Closed form of n^a = ⟨ψ|λ^a|ψ⟩ (no matrix products), written to n[0..7]:
+//   n1 + i n2 = 2 ψ̄_0 ψ_1,  n4 + i n5 = 2 ψ̄_0 ψ_2,  n6 + i n7 = 2 ψ̄_1 ψ_2,
+//   n3 = |ψ_0|² − |ψ_1|²,   n8 = (|ψ_0|² + |ψ_1|² − 2|ψ_2|²)/√3.
+// For a normalised ψ the result is a pure state to round-off (|n|² = 4/3).
+inline void pure_expectations(const Complex* psi, double* n) {
+    const Complex z01 = std::conj(psi[0]) * psi[1];
+    const Complex z02 = std::conj(psi[0]) * psi[2];
+    const Complex z12 = std::conj(psi[1]) * psi[2];
+    const double p0 = std::norm(psi[0]), p1 = std::norm(psi[1]), p2 = std::norm(psi[2]);
+    n[0] = 2.0 * z01.real();
+    n[1] = 2.0 * z01.imag();
+    n[2] = p0 - p1;
+    n[3] = 2.0 * z02.real();
+    n[4] = 2.0 * z02.imag();
+    n[5] = 2.0 * z12.real();
+    n[6] = 2.0 * z12.imag();
+    n[7] = (p0 + p1 - 2.0 * p2) * 0.57735026918962576451;  // 1/sqrt(3)
+}
+
+// ψ (up to a global phase, normalised) of a PURE state from its expectations,
+// without an eigensolver: ρ = 1/3 + n·λ/2 = |ψ⟩⟨ψ| has rank one, so every
+// column k of ρ is ψ ψ̄_k; the column of the largest diagonal entry
+// (ρ_kk ≥ 1/3) is the best conditioned. For a mixed or unphysical n this is
+// NOT the closest pure state (use psi_from_expectations for that).
+inline void psi_from_pure_expectations(const double* n, Complex* psi) {
+    const double r3 = 0.57735026918962576451;  // 1/sqrt(3)
+    const double d[3] = {1.0 / 3.0 + 0.5 * (n[2] + r3 * n[7]),
+                         1.0 / 3.0 + 0.5 * (-n[2] + r3 * n[7]),
+                         1.0 / 3.0 - r3 * n[7]};
+    const Complex r01(0.5 * n[0], -0.5 * n[1]);   // ρ_01
+    const Complex r02(0.5 * n[3], -0.5 * n[4]);   // ρ_02
+    const Complex r12(0.5 * n[5], -0.5 * n[6]);   // ρ_12
+    const int k = (d[0] >= d[1]) ? (d[0] >= d[2] ? 0 : 2) : (d[1] >= d[2] ? 1 : 2);
+    if (k == 0) { psi[0] = d[0]; psi[1] = std::conj(r01); psi[2] = std::conj(r02); }
+    else if (k == 1) { psi[0] = r01; psi[1] = d[1]; psi[2] = std::conj(r12); }
+    else { psi[0] = r02; psi[1] = r12; psi[2] = d[2]; }
+    const double nrm = std::sqrt(std::norm(psi[0]) + std::norm(psi[1]) + std::norm(psi[2]));
+    if (nrm > 0.0) {
+        for (int j = 0; j < 3; ++j) psi[j] /= nrm;
+    } else {
+        psi[0] = 1.0; psi[1] = 0.0; psi[2] = 0.0;
+    }
+}
+
 // Build the qutrit density matrix ρ from a Bloch vector:
 //   ρ = (1/3) 1 + (1/2) Σ_a n^a λ^a.
 // (Valid as a density matrix iff ρ ≥ 0 and Tr ρ = 1; the second is
@@ -189,6 +234,22 @@ inline Vector3c psi_from_expectations(const Vector8r& n, double* out_purity = nu
 // -----------------------------------------------------------------------------
 // Local Hamiltonian and propagators
 // -----------------------------------------------------------------------------
+
+// Σ_a h^a λ^a in closed form (= local_hamiltonian(h) without the matrix sums).
+inline Matrix3c gell_mann_sum(const double* h) {
+    const double r3 = 0.57735026918962576451;  // 1/sqrt(3)
+    Matrix3c H;
+    H(0, 0) = h[2] + r3 * h[7];
+    H(1, 1) = -h[2] + r3 * h[7];
+    H(2, 2) = -2.0 * r3 * h[7];
+    H(0, 1) = Complex(h[0], -h[1]);
+    H(0, 2) = Complex(h[3], -h[4]);
+    H(1, 2) = Complex(h[5], -h[6]);
+    H(1, 0) = std::conj(H(0, 1));
+    H(2, 0) = std::conj(H(0, 2));
+    H(2, 1) = std::conj(H(1, 2));
+    return H;
+}
 
 // Lie-Poisson bracket coefficient c in dn^a/dt = c f_{abc} (∂E/∂n^b) n^c for
 // n = ⟨λ⟩ (Tr λ^a λ^b = 2 δ^{ab}): [λ^a, λ^b] = 2i f_{abc} λ^c gives c = 2.
@@ -316,6 +377,62 @@ inline Vector3c ground_state(const Matrix3c& H_loc) {
     Vector3c psi = es.eigenvectors().col(0);  // ascending sort -> smallest is col 0
     psi.normalize();
     return psi;
+}
+
+// Eigen-decomposition of a 3x3 Hermitian matrix: eigenvalues ascending in
+// `ev`, orthonormal eigenvectors in the columns of V. Closed form: Smith's
+// trigonometric solution of the characteristic cubic (CACM 4, 168 (1961))
+// and eigenvectors as cross products of two rows of H - e_k (for Hermitian
+// M, M v = 0 holds for v = m_i x m_j, the plain cross product of two rows);
+// several times faster than the iterative SelfAdjointEigenSolver. Falls back
+// to it when two eigenvalues are closer than 1e-5 of the spectral scale,
+// where the cross products lose accuracy.
+inline void eigen_hermitian3(const Matrix3c& H, Eigen::Vector3d& ev, Matrix3c& V) {
+    const double a00 = H(0, 0).real(), a11 = H(1, 1).real(), a22 = H(2, 2).real();
+    const Complex a01 = H(0, 1), a02 = H(0, 2), a12 = H(1, 2);
+    const double q = (a00 + a11 + a22) / 3.0;
+    const double b00 = a00 - q, b11 = a11 - q, b22 = a22 - q;
+    const double n01 = std::norm(a01), n02 = std::norm(a02), n12 = std::norm(a12);
+    const double p2 = (b00 * b00 + b11 * b11 + b22 * b22 + 2.0 * (n01 + n02 + n12)) / 6.0;
+    if (!(p2 > 1e-300)) {   // multiple of the identity
+        ev.setConstant(q);
+        V.setIdentity();
+        return;
+    }
+    const double p = std::sqrt(p2);
+    const double det = b00 * b11 * b22 + 2.0 * (a01 * a12 * std::conj(a02)).real()
+                     - b00 * n12 - b11 * n02 - b22 * n01;
+    const double r = std::clamp(det / (2.0 * p2 * p), -1.0, 1.0);
+    const double phi = std::acos(r) / 3.0;
+    const double e_max = q + 2.0 * p * std::cos(phi);
+    const double e_min = q + 2.0 * p * std::cos(phi + 2.0943951023931954923);   // + 2 pi / 3
+    const double e_mid = 3.0 * q - e_max - e_min;
+    if (std::min(e_mid - e_min, e_max - e_mid) < 1e-5 * p) {
+        Eigen::SelfAdjointEigenSolver<Matrix3c> es(H);
+        ev = es.eigenvalues();
+        V = es.eigenvectors();
+        return;
+    }
+    auto null_vector = [&](double e) {
+        const Vector3c m0(a00 - e, a01, a02);
+        const Vector3c m1(std::conj(a01), a11 - e, a12);
+        const Vector3c m2(std::conj(a02), std::conj(a12), a22 - e);
+        // Eigen's complex cross() returns conj(a x b); the null vector is the plain a x b.
+        Vector3c best = m0.cross(m1);
+        double best_n = best.squaredNorm();
+        const Vector3c c02 = m0.cross(m2), c12 = m1.cross(m2);
+        if (c02.squaredNorm() > best_n) { best = c02; best_n = c02.squaredNorm(); }
+        if (c12.squaredNorm() > best_n) { best = c12; best_n = c12.squaredNorm(); }
+        return Vector3c(best.conjugate() / std::sqrt(best_n));
+    };
+    const Vector3c v0 = null_vector(e_min);
+    Vector3c v2 = null_vector(e_max);
+    v2 -= v0.dot(v2) * v0;   // dot() conjugates its first argument
+    v2.normalize();
+    ev << e_min, e_mid, e_max;
+    V.col(0) = v0;
+    V.col(1) = v0.cross(v2);   // conj(v0 x v2): Hermitian-orthogonal to v0 and v2
+    V.col(2) = v2;
 }
 
 // Smallest eigenvalue (ground-state energy) of H_loc.

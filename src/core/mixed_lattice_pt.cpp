@@ -5,7 +5,8 @@
  * Parallel tempering and ladder tuning live in mc/parallel_tempering.h; this
  * adapter defines the MixedLattice replica: its state (SU(2) then SU(3)
  * components, so both species travel together on an accepted swap), its MC
- * step (interleaved SU(2)/SU(3) sweeps when mixed couplings exist), the SU(2)
+ * step (MixedLattice::local_sweep with the configured local_update, SU(3)
+ * sites on su3_mc_manifold, cell-interleaved when mixed couplings exist), the SU(2)
  * and SU(3) magnetisations as order parameters, and the MixedLattice
  * per-temperature HDF5 file.
  */
@@ -29,19 +30,20 @@ public:
           interleaved_(use_interleaved && (lat.num_bi_SU2_SU3 > 0 || lat.num_tri_SU2_SU3 > 0)),
           save_spins_(save_spins) {}
 
+    // One step = one overrelaxation sweep at T (Metropolis-corrected where the
+    // local energy is not linear in the site's own spin) when or_rate_ > 0,
+    // plus a local sweep (policy local_update) every or_rate_-th step.
     double mc_step(double T, size_t step, double sigma) {
         if (or_rate_ > 0) {
-            if (interleaved_) lat_.overrelaxation_interleaved();
-            else lat_.overrelaxation();
+            lat_.overrelaxation_sweep(T, interleaved_);
             if (step % or_rate_ != 0) return std::numeric_limits<double>::quiet_NaN();
         }
-        return interleaved_ ? lat_.metropolis_interleaved(T, gaussian_, sigma)
-                            : lat_.metropolis(T, gaussian_, sigma);
+        return lat_.local_sweep(T, gaussian_, sigma, interleaved_);
     }
 
     double energy() const { return lat_.total_energy(); }
     size_t n_sites() const { return lat_.lattice_size_SU2 + lat_.lattice_size_SU3; }
-    bool uses_step_size() const { return gaussian_; }
+    bool uses_step_size() const { return lat_.uses_adaptive_step(gaussian_); }
     size_t state_size() const {
         return lat_.lattice_size_SU2 * lat_.spin_dim_SU2 + lat_.lattice_size_SU3 * lat_.spin_dim_SU3;
     }
@@ -99,6 +101,7 @@ mc::PTResult MixedLattice::parallel_tempering(vector<double> temp, size_t n_anne
                                               string dir_name, const vector<int>& rank_to_write,
                                               bool gaussian_move, bool use_interleaved, MPI_Comm comm,
                                               bool verbose) {
+    project_SU3_to_manifold();   // sample SU(3) sites on su3_mc_manifold from the first step
     MixedLatticeReplica replica(*this, overrelaxation_rate, gaussian_move, use_interleaved, verbose);
     mc::PTOptions o;
     o.temperatures = std::move(temp);
@@ -115,6 +118,7 @@ mc::PTResult MixedLattice::parallel_tempering(vector<double> temp, size_t n_anne
 mc::LadderTuningResult MixedLattice::tune_temperature_ladder(const mc::LadderTuningOptions& options,
                                                              size_t overrelaxation_rate, bool gaussian_move,
                                                              bool use_interleaved, MPI_Comm comm) {
+    project_SU3_to_manifold();
     MixedLatticeReplica replica(*this, overrelaxation_rate, gaussian_move, use_interleaved);
     return mc::tune_temperature_ladder(replica, options, comm);
 }

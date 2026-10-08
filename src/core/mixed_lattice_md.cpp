@@ -804,9 +804,8 @@ void validate_pulse_shape(double amp, double width, double freq, const char* wha
 
         num_bi_SU2 = 0;
         for (const auto& bp : bilinear_partners_SU2) num_bi_SU2 = std::max(num_bi_SU2, bp.size());
-        build_packed_interaction_buffers();
+        build_packed_interaction_buffers();   // also rebuilds the MC local-form tables
         build_color_partition();
-        invalidate_all_fields();
     }
 
 // =============================================================

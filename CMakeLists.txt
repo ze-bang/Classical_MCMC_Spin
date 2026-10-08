@@ -597,6 +597,11 @@ add_optimized_executable(test_hdf5_pt src/test_hdf5_pt.cpp)
 # the local-update kernels in isolation.
 add_optimized_executable(bench_mc src/apps/bench_mc.cpp)
 
+# MixedLattice (TmFeO3, every production coupling class) single-thread sweep
+# timings: Metropolis (uniform / Gaussian / interleaved), overrelaxation,
+# heat bath, T = 0 descent, total energy.
+add_optimized_executable(bench_mixed_mc src/apps/bench_mixed_mc.cpp)
+
 # Molecular-dynamics RHS micro-benchmark (RHS-calls/sec for each LLG /
 # spin-strain ODE kernel on a few canonical models). Same intent as
 # bench_mc but for the time-evolution side of the library.
@@ -634,6 +639,8 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_md_drivers
     test_sa_ground_state
     test_mixed_md
+    test_mixed_mc_exact
+    test_mixed_mc_kernels
     test_mixed_pump_probe
     test_phonon_dynamics
     test_pt_ladder

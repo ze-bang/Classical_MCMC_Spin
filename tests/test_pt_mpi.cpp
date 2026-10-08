@@ -10,7 +10,9 @@
 //     against the Langevin function; sigma adapted toward the target.
 //  3. MixedLattice adapter: free SU(2) spins and free 8-component SU(3)
 //     vectors in fields, <E>/N and both magnetisations vs the exact
-//     Langevin / Bessel-ratio results (both species travel on a swap).
+//     Langevin / Bessel-ratio results (both species travel on a swap; legacy
+//     S^7 manifold), and the same with SU(3) sites on CP^2 (default) against
+//     the simplex integral, with adaptive Gaussian proposals.
 //  4. Bitwise reproducibility for a fixed seed.
 //  5. Ladder tuning (nrpt, katzgraber): valid ladders; nrpt equalises the
 //     measured edge acceptance.
@@ -128,6 +130,7 @@ void test_mixed_free_species() {
     su3.set_field(f3, 0);
     seed_all(606);
     MixedLattice lat(MixedUnitCell(su2, su3), 4, 4, 1, 1.0f, 1.0f);
+    lat.set_su3_mc_manifold("sphere");   // legacy S^7 state space: Bessel-ratio reference
     lat.init_random();
     const auto r = lat.parallel_tempering(T, 2000, 30000, 0, 50, 2, "", {-1}, false, true, MPI_COMM_WORLD);
     auto u3 = [&](double t) {  // <n.h_hat> on S^7: I_4(K) / I_3(K)
@@ -147,6 +150,57 @@ void test_mixed_free_species() {
         ck_stat(all[4 * k + 2], all[4 * k + 3], u3(T[k]), "<m_SU3,3> T=" + std::to_string(T[k]));
     }
     ck(r.bookkeeping_consistent && r.round_trips > 0, "mixed: consistent exchanges and round trips");
+}
+
+// SU(3) sites on CP^2 (the default): with E = -h n_3 the populations
+// p_k = |psi_k|^2 are uniform on the simplex under the Fubini-Study measure,
+// so <n_3> = <p_0 - p_1> with weight exp(beta h (p_0 - p_1)) (2D quadrature).
+double cp2_n3(double h, double T) {
+    std::vector<double> x, w;
+    gauss_legendre(64, x, w);
+    double num = 0.0, den = 0.0;
+    for (size_t a = 0; a < x.size(); ++a)
+        for (size_t b = 0; b < x.size(); ++b) {
+            const double u = 0.5 * (x[a] + 1.0), v = 0.5 * (x[b] + 1.0);
+            const double p0 = u, p1 = (1.0 - u) * v;
+            const double wt = w[a] * w[b] * (1.0 - u) * std::exp(h * (p0 - p1 - 1.0) / T);
+            num += wt * (p0 - p1);
+            den += wt;
+        }
+    return num / den;
+}
+
+void test_mixed_cp2() {
+    if (g_rank == 0) std::printf("\n== PT on MixedLattice: SU(3) sites on CP^2, adaptive Gaussian proposals ==\n");
+    const double h2 = 1.0, h3 = 0.8;
+    const std::vector<double> T = {0.25, 0.45, 0.8, 1.4};
+    const auto axes = std::vector<Eigen::Vector3d>{Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(0, 1, 0),
+                                                   Eigen::Vector3d(0, 0, 1)};
+    UnitCell su2(3, 1, {Eigen::Vector3d::Zero()}, axes);
+    UnitCell su3(8, 1, {Eigen::Vector3d(0.5, 0.5, 0.0)}, axes);
+    su2.set_field(Eigen::Vector3d(0, 0, h2), 0);
+    SpinVector f3 = SpinVector::Zero(8);
+    f3(2) = h3;
+    su3.set_field(f3, 0);
+    seed_all(707);
+    MixedLattice lat(MixedUnitCell(su2, su3), 4, 4, 1, 1.0f, 1.0f);
+    lat.init_random();
+    const auto r = lat.parallel_tempering(T, 2000, 30000, 0, 50, 2, "", {-1}, true, true, MPI_COMM_WORLD);
+    for (size_t k = 0; k < T.size(); ++k) {
+        const double exact = 0.5 * (-h2 * langevin(h2 / T[k]) - h3 * cp2_n3(h3, T[k]));
+        ck_stat(r.energy[k], r.energy_error[k], exact, "CP^2 mixed <E>/N T=" + std::to_string(T[k]));
+    }
+    double mine[2] = {r.thermo.order_parameters.at(1).mean.values[2], r.thermo.order_parameters.at(1).mean.errors[2]};
+    std::vector<double> all(2 * size_t(g_size));
+    MPI_Allgather(mine, 2, MPI_DOUBLE, all.data(), 2, MPI_DOUBLE, MPI_COMM_WORLD);
+    for (size_t k = 0; k < T.size(); ++k)
+        ck_stat(all[2 * k], all[2 * k + 1], cp2_n3(h3, T[k]), "CP^2 <m_SU3,3> T=" + std::to_string(T[k]));
+    double worst = 0.0;
+    for (const auto& n : lat.spins_SU3)
+        worst = std::max(worst, std::abs(n.squaredNorm() - 4.0 / 3.0));
+    double all_worst = 0.0;
+    MPI_Allreduce(&worst, &all_worst, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    ck(all_worst < 1e-12, "CP^2: every replica's SU(3) states keep |n|^2 = 4/3 through exchanges");
 }
 
 void test_reproducible() {
@@ -304,6 +358,7 @@ int main(int argc, char** argv) {
     test_heisenberg_ring();
     test_free_spins_adaptive();
     test_mixed_free_species();
+    test_mixed_cp2();
     test_reproducible();
     test_ladder_tuning();
     test_no_exchange();
