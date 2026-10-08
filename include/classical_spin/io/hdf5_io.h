@@ -112,7 +112,7 @@ public:
                  size_t save_interval,
                  float spin_length = 1.0,
                  const std::vector<Eigen::Vector3d>* positions = nullptr,
-                 size_t reserve_steps = 1000)
+                 [[maybe_unused]] size_t reserve_steps = 1000)
         : filename_(filename),
           lattice_size_(lattice_size),
           spin_dim_(spin_dim),
@@ -471,7 +471,7 @@ public:
                       float spin_length_SU3 = 1.0,
                       const std::vector<Eigen::Vector3d>* positions_SU2 = nullptr,
                       const std::vector<Eigen::Vector3d>* positions_SU3 = nullptr,
-                      size_t reserve_steps = 1000)
+                      [[maybe_unused]] size_t reserve_steps = 1000)
         : filename_(filename),
           lattice_size_SU2_(lattice_size_SU2), spin_dim_SU2_(spin_dim_SU2),
           lattice_size_SU3_(lattice_size_SU3), spin_dim_SU3_(spin_dim_SU3),
@@ -1421,7 +1421,7 @@ public:
                      size_t save_interval,
                      float spin_length = 1.0,
                      const std::vector<Eigen::Vector3d>* positions = nullptr,
-                     size_t reserve_steps = 1000)
+                     [[maybe_unused]] size_t reserve_steps = 1000)
         : filename_(filename),
           lattice_size_(lattice_size),
           current_step_(0)
@@ -1848,7 +1848,7 @@ public:
                  size_t lattice_size,
                  size_t spin_dim,
                  size_t n_sublattices,
-                 size_t n_samples,
+                 [[maybe_unused]] size_t n_samples,
                  size_t n_anneal,
                  size_t n_measure,
                  size_t probe_rate,
@@ -2083,7 +2083,7 @@ public:
                       size_t spin_dim_SU3,
                       size_t n_sublattices_SU2,
                       size_t n_sublattices_SU3,
-                      size_t n_samples,
+                      [[maybe_unused]] size_t n_samples,
                       size_t n_anneal,
                       size_t n_measure,
                       size_t probe_rate,

@@ -208,7 +208,8 @@ int main(int argc, char** argv) {
                 h.swap(h2);
             }
             double m = 0, v = 0; for (double x : h) { m += x; } m /= Ns;
-            for (double x : h) v += (x - m) * (x - m); v = std::sqrt(v / Ns);
+            for (double x : h) v += (x - m) * (x - m);
+            v = std::sqrt(v / Ns);
             for (auto& x : h) x = (x - m) * (nn_sigma / v);
         }
         // Many concurrent runs share (sigma, seed): write a per-process temp, apply

@@ -704,7 +704,7 @@ public:
                          vector<vector<size_t>>& bi_partners,
                          vector<vector<array<size_t, 2>>>& tri_partners,
                          size_t& num_bi, size_t& num_tri,
-                         float spin_length, size_t spin_dim, size_t N_atoms)
+                         [[maybe_unused]] float spin_length, size_t spin_dim, size_t N_atoms)
     {
         const size_t lattice_size = N_atoms * dim1 * dim2 * dim3;
 

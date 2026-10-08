@@ -89,7 +89,7 @@ SpinTensor3 StructureConstants::SU3_structure_constant() {
 }
 
 void StructureConstants::set_permutation(SpinTensor3& A, size_t a, size_t b, size_t c, double val) {
-    if (a >= A.size() || b >= A[a].cols() || c >= A[a].rows()) {
+    if (a >= A.size() || b >= size_t(A[a].cols()) || c >= size_t(A[a].rows())) {
         throw out_of_range("Index out of range in set_permutation");
     }
     if (a == b || b == c || a == c) {

@@ -217,7 +217,7 @@ void report_dynamics_config(const Lattice& lattice, const SpinConfig& config) {
 /// The GPU flag handed to the drivers: config.use_gpu only when a device is
 /// actually usable (classical_spin::gpu::select_device binds this rank to one
 /// and reports once), so a "running on the CPU" message is true.
-bool select_gpu(const SpinConfig& config, int rank) {
+bool select_gpu(const SpinConfig& config, int /*rank*/) {
     return classical_spin::gpu::select_device(config.use_gpu, job_rank());
 }
 

@@ -800,7 +800,6 @@ public:
           bi_flat_wrap(other.bi_flat_wrap),
           bi_flat_J0(other.bi_flat_J0),
           bi_flat_forward(other.bi_flat_forward),
-          onsite_scalar(other.onsite_scalar),
           bi_flat_D2(other.bi_flat_D2),
           color_of_site(other.color_of_site),
           sites_by_color_csr_off(other.sites_by_color_csr_off),
@@ -811,7 +810,6 @@ public:
           twist_angles(other.twist_angles),
           bilinear_wrap_dir(other.bilinear_wrap_dir),
           bilinear_forward(other.bilinear_forward),
-          twist_active(other.twist_active),
           boundary_sites_per_dim(other.boundary_sites_per_dim),
           boundary_thickness(other.boundary_thickness),
           field_drive(other.field_drive),
@@ -823,6 +821,8 @@ public:
           alpha_gilbert(other.alpha_gilbert),
           langevin_temperature(other.langevin_temperature),
           damping_form(other.damping_form),
+          twist_active(other.twist_active),
+          onsite_scalar(other.onsite_scalar),
           local_update(other.local_update),
           parallel_sweep_min_sites(other.parallel_sweep_min_sites),
           su3_cp2(other.su3_cp2)
@@ -3889,7 +3889,7 @@ public:
         
         for (size_t d = 0; d < 3; ++d) {
             file << d << " ";
-            for (size_t i = 0; i < rotation_axis[d].size(); ++i) {
+            for (Eigen::Index i = 0; i < rotation_axis[d].size(); ++i) {
                 file << rotation_axis[d](i) << " ";
             }
             file << twist_angles[d] << "\n";
@@ -3901,8 +3901,8 @@ public:
         for (size_t d = 0; d < 3; ++d) {
             file << "# Dimension " << d << " twist matrix:\n";
             file << d << "\n";
-            for (size_t row = 0; row < twist_matrices[d].rows(); ++row) {
-                for (size_t col = 0; col < twist_matrices[d].cols(); ++col) {
+            for (Eigen::Index row = 0; row < twist_matrices[d].rows(); ++row) {
+                for (Eigen::Index col = 0; col < twist_matrices[d].cols(); ++col) {
                     file << twist_matrices[d](row, col);
                     if (col < twist_matrices[d].cols() - 1) file << " ";
                 }

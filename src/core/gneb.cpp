@@ -124,7 +124,7 @@ GNEBResult GNEBOptimizer::find_mep(const GNEBSpinConfig& initial, const GNEBSpin
         }
         
         // Take optimization step
-        double actual_step;
+        [[maybe_unused]] double actual_step;
         if (params.use_fire) {
             actual_step = fire_step(forces, use_climbing);
         } else {
@@ -671,7 +671,7 @@ size_t GNEBOptimizer::find_climbing_image() const {
     return ci;
 }
 
-double GNEBOptimizer::fire_step(vector<GNEBSpinConfig>& forces, bool climbing) {
+double GNEBOptimizer::fire_step(vector<GNEBSpinConfig>& forces, bool /*climbing*/) {
     // FIRE algorithm: Bitzek et al., Phys. Rev. Lett. 97, 170201 (2006)
     // Read parameters from the active run (falls back to sensible defaults
     // if called outside of find_mep / find_mep_from_path).
@@ -738,7 +738,7 @@ double GNEBOptimizer::fire_step(vector<GNEBSpinConfig>& forces, bool climbing) {
 }
 
 double GNEBOptimizer::steepest_descent_step(vector<GNEBSpinConfig>& forces, 
-                                             double step_size, bool climbing) {
+                                             double step_size, bool /*climbing*/) {
     for (size_t i = 1; i < images.size() - 1; ++i) {
         for (size_t s = 0; s < n_sites; ++s) {
             images[i][s] += step_size * forces[i][s];
@@ -940,8 +940,6 @@ Eigen::MatrixXd HessianAnalyzer::compute_hessian(const GNEBSpinConfig& config, d
     // Dimension of tangent space: 2 per spin (θ, φ in spherical coords)
     size_t dim = 2 * n_sites;
     Eigen::MatrixXd H(dim, dim);
-    
-    double E0 = compute_energy(config);
     
     // For each pair of tangent directions
     for (size_t i = 0; i < dim; ++i) {
