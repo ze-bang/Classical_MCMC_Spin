@@ -4973,7 +4973,8 @@ public:
     /**
      * Whether the GPU right-hand side implements the current model. The GPU
      * kernels have no trilinear term, no damping, no Langevin noise and no
-     * twisted boundaries, and handle spin_dim 3 and 8 only; the dynamics
+     * twisted boundaries, and handle spin_dim 3 and 8 (Gell-Mann bracket
+     * only); the dynamics
      * drivers fall back to the CPU (with a warning naming `reason`) instead of
      * silently integrating a different equation of motion.
      */
@@ -4983,6 +4984,8 @@ public:
         else if (alpha_gilbert != 0.0) reason = "Gilbert damping";
         else if (langevin_temperature != 0.0) reason = "Langevin bath";
         else if (twist_active) reason = "twisted boundaries";
+        // The device RHS hard-codes the Gell-Mann bracket c = 2.
+        else if (spin_dim == 8 && unit_cell.poisson_bracket != 2.0) reason = "SU(3) legacy bracket convention";
         else return true;
         return false;
     }

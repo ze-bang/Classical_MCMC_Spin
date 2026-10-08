@@ -11,6 +11,7 @@
 #include <cmath>
 #include <limits>
 #include "classical_spin/core/simple_linear_alg.h"
+#include "classical_spin/dynamics/time_grid.h"
 
 /**
  * Helper function to create HDF5 file with proper serial access properties.
@@ -1067,14 +1068,12 @@ public:
                       save_spin_trajectories,
                       pulse_field_SU2, pulse_field_SU3, positions_SU2, positions_SU3);
         
-        // Compute and store tau values
-        int n_tau = static_cast<int>(std::abs((tau_end - tau_start) / tau_step)) + 1;
-        std::vector<double> tau_vals(n_tau);
-        for (int i = 0; i < n_tau; ++i) {
-            tau_vals[i] = tau_start + i * tau_step;
-        }
+        // Delay values: the same grid as the drivers (round-off tolerant
+        // count, tau_end included), see dynamics/time_grid.h.
+        const std::vector<double> tau_vals =
+            classical_spin::dynamics::delay_grid(tau_start, tau_end, tau_step, "HDF5MixedPumpProbeWriter delays");
         
-        hsize_t tau_dims[1] = {static_cast<hsize_t>(n_tau)};
+        hsize_t tau_dims[1] = {static_cast<hsize_t>(tau_vals.size())};
         H5::DataSpace tau_space(1, tau_dims);
         H5::DataSet tau_dataset = tau_scan_group_.createDataSet(
             "tau_values", H5::PredType::NATIVE_DOUBLE, tau_space);
@@ -1137,6 +1136,12 @@ public:
             "tau_value", H5::PredType::NATIVE_DOUBLE, attr_space);
         tau_attr.write(H5::PredType::NATIVE_DOUBLE, &tau_value);
         
+        // M1 and M01 must live on the same time grid; writing M01 with M1's
+        // length used to read past the end of a shorter M01.
+        if (M1_trajectory.size() != M01_trajectory.size()) {
+            throw std::runtime_error("HDF5MixedPumpProbeWriter: M1 has " + std::to_string(M1_trajectory.size()) +
+                                     " samples but M01 has " + std::to_string(M01_trajectory.size()));
+        }
         size_t n_times = M1_trajectory.size();
         
         // Write M1 trajectories (SU2 and SU3)
@@ -1302,7 +1307,11 @@ private:
                                   const std::vector<double>* flat_state, size_t n_times) {
         if (flat_state == nullptr || flat_state->empty() || n_times == 0) return;
         const size_t state_dim = flat_state->size() / n_times;
-        if (state_dim == 0 || state_dim * n_times != flat_state->size()) return;
+        if (state_dim == 0 || state_dim * n_times != flat_state->size()) {
+            throw std::runtime_error("HDF5MixedPumpProbeWriter: spin-state buffer '" + name + "' has " +
+                                     std::to_string(flat_state->size()) + " values, not a multiple of " +
+                                     std::to_string(n_times) + " samples");
+        }
 
         hsize_t dims[2] = {n_times, state_dim};
         hsize_t chunk[2] = {std::min((hsize_t)128, dims[0]), dims[1]};

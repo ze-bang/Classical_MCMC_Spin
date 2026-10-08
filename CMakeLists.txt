@@ -601,6 +601,8 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_md_exact
     test_md_drivers
     test_sa_ground_state
+    test_mixed_md
+    test_mixed_pump_probe
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
@@ -618,6 +620,13 @@ if(BUILD_TESTING)
              COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 3 --oversubscribe --allow-run-as-root
                      $<TARGET_FILE:test_md_mpi_scan>)
     set_tests_properties(physics_md_mpi_scan PROPERTIES TIMEOUT 300 LABELS physics
+                         ENVIRONMENT "OMP_NUM_THREADS=1")
+    # The pump-probe test also runs on 4 MPI ranks (dynamic scheduling, error
+    # propagation); the single-rank entry above exercises the serial fallback.
+    add_test(NAME physics_test_mixed_pump_probe_mpi4
+             COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 --oversubscribe --allow-run-as-root
+                     $<TARGET_FILE:test_mixed_pump_probe>)
+    set_tests_properties(physics_test_mixed_pump_probe_mpi4 PROPERTIES TIMEOUT 300 LABELS physics
                          ENVIRONMENT "OMP_NUM_THREADS=1")
     add_test(NAME e1_phonon_regressions COMMAND test_e1_phonon_regressions)
     add_test(NAME mixed_trilinear_regressions COMMAND test_mixed_trilinear_regressions)

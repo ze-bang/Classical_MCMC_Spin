@@ -122,11 +122,15 @@ void Lattice::landau_lifshitz_rhs(const double* x, double* dxdt, double t, const
             dxdt[3 * i + 2] = g * d2;
         }
     } else if (spin_dim == 8) {
-        // SU(3): (a × b)_i = f_ijk a_j b_k over the 54 non-zero structure
+        // SU(3): Lie-Poisson equation dn_a/dt = c f_abc H_b n_c with
+        // c = unit_cell.poisson_bracket (2 for n = <lambda>, since
+        // [lambda_a, lambda_b] = 2i f_abc lambda_c; see core/su3_coherent_state.h).
+        // (a × b)_i = f_ijk a_j b_k over the 54 non-zero structure
         // constants (cross_prod_SU3_flat). The damping term has the same
         // double-bracket form as for SU(2): with P = H × S,
         //   dE/dt = H·(P - (α/|S|) S × P) = -(α/|S|) |P|²  (H·(S × P) = P·(H × S)),
         // and S·(S × P) = 0 conserves |S|.
+        const double bracket = unit_cell.poisson_bracket;
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static) if(N >= kParallelRhsMinSites)
 #endif
@@ -139,6 +143,7 @@ void Lattice::landau_lifshitz_rhs(const double* x, double* dxdt, double t, const
                 drive.accumulate(i % N_atoms, f, B);
                 for (int d = 0; d < 8; ++d) H[d] -= B[d];
             }
+            for (int d = 0; d < 8; ++d) H[d] *= bracket;
             double* out = dxdt + 8 * i;
             cross_prod_SU3_flat(H, S, out, /*accumulate=*/false);
             if (alpha > 0.0) {

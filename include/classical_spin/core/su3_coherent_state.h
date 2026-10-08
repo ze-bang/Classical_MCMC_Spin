@@ -37,36 +37,43 @@
 //   automatic — none of the "8-vector outside the positive cone" failure
 //   modes of the bare Bloch parameterization can occur.
 //
-// Equation of motion (Schrödinger picture, mean-field)
-// ----------------------------------------------------
-//   i ℏ dψ/dt = H_loc[ψ; neighbours] ψ
+// Convention (energy and bracket)
+// ------------------------------
+//   The classical energy of every term is the coherent-state expectation of
+//   the quantum operator it represents, E_classical(n) = ⟨psi|H|psi⟩ with
+//   n^a = ⟨psi|λ^a|psi⟩. For a term linear in λ, H = Σ_a c_a λ^a has
+//   E = c·n; the CEF diag(0, e1, e2) is therefore
+//       diag(0, e1, e2) = (e1+e2)/3 · 1 − (e1/2) λ^3 − ((2 e2 − e1)/(2√3)) λ^8.
+//   Since [λ^a, λ^b] = 2i f_{abc} λ^c, the Heisenberg equation
+//   d⟨λ^a⟩/dt = ⟨i[H, λ^a]⟩ with the mean-field H = Σ_b (∂E/∂n^b) λ^b gives
+//   the Lie-Poisson equation of motion
+//       dn^a/dt = 2 f_{abc} (∂E/∂n^b) n^c,            (kGellMannBracket = 2)
+//   i.e. the bracket {n^a, n^b} = 2 f_{abc} n^c, which is what makes the
+//   coupled SU(2)+SU(3) dynamics reproduce the time-dependent mean-field
+//   (product-state) Schrödinger evolution of the quantum model term by term.
+//   The SU(2) analogue is dS/dt = (∂E/∂S) × S for S = ⟨S_op⟩.
 //
-//   where, for any classical Hamiltonian H_total({n^a_i}), the local 3×3
-//   Hermitian operator is built from the same local SU(3) field h^a_i that
-//   the existing code already computes:
+//   Releases before 2026-10 evolved dn^a/dt = f_{abc} (∂E/∂n^b) n^c and
+//   encoded the CEF at twice its Gell-Mann coefficients, so the bare CEF
+//   lines had the right frequencies but every other λ-linear coupling
+//   (Zeeman, Fe-Tm exchange, drives) acted on Tm with half its torque, and
+//   MC energies weighted the CEF twice. `kLegacyBracket` (with the legacy
+//   CEF encoding, config key `su3_legacy_convention = 1`) reproduces that
+//   behaviour exactly; see docs/MIGRATION.md.
 //
-//       H_loc = h_0 1 + (1/2) Σ_a h^a λ^a.
-//
-//   (See Eq. (5) of Ref. [2]; equivalently Eq. (4) of Ref. [1].)
-//
-//   It is straightforward to check that this is equivalent to the
-//   Bloch-vector EOM that the current code uses,
-//       dn^a/dt = f_{abc} h^b n^c,
-//   provided that the n^a actually come from a physical pure state. The
-//   two pictures differ only at amplitudes where the bare Bloch vector
-//   would leave CP^2.
+//   Pure states satisfy |n|^2 = 4/3 (Tr ρ^2 = 1/3 + |n|^2/2 = 1) and
+//   d_{abc} n^a n^b n^c = 8/9; both Casimirs are conserved by the
+//   Lie-Poisson flow for any Hamiltonian.
 //
 // Time integration
 // ----------------
-//   For frozen neighbours over a step Δt, the exact local propagator is
-//   the unitary
-//       U(Δt) = exp(−i H_loc Δt) = V exp(−i D Δt) V^†,
-//   where H_loc = V D V^† is the 3×3 eigendecomposition. This is the
-//   building block of the symplectic / norm-preserving spherical-midpoint
-//   integrator of Ref. [2]. For a non-self-consistent ("explicit") step,
-//   simply applying U(Δt) once per site preserves ⟨ψ|ψ⟩ = 1 exactly to
-//   floating-point precision (the only error is the mean-field freezing
-//   of neighbours, an O(Δt) commutator term).
+//   The mean-field Schrödinger equation i dψ/dt = H_loc[ψ] ψ, with
+//   H_loc = (bracket/2) Σ_a h^a λ^a and h = ∂E/∂n, is equivalent to the
+//   Bloch equation above. For frozen neighbours over a step Δt the exact
+//   local propagator is the unitary U(Δt) = exp(−i H_loc Δt)
+//   (`propagator_exact`); `implicit_midpoint_step` is the symplectic,
+//   norm-preserving, second-order midpoint rule of Ref. [2] for
+//   self-consistent H_loc[ψ].
 //
 // Static T = 0 update
 // -------------------
@@ -183,37 +190,39 @@ inline Vector3c psi_from_expectations(const Vector8r& n, double* out_purity = nu
 // Local Hamiltonian and propagators
 // -----------------------------------------------------------------------------
 
-// Build the local 3×3 mean-field Hamiltonian from a Gell-Mann field h^a:
-//   H_loc = h_0 1 + (1/2) Σ_a h^a λ^a.
-// `h_a` is the same 8-component local field that the existing
-// `MixedLattice::get_local_field_SU3(_flat)` machinery already computes.
+// Lie-Poisson bracket coefficient c in dn^a/dt = c f_{abc} (∂E/∂n^b) n^c for
+// n = ⟨λ⟩ (Tr λ^a λ^b = 2 δ^{ab}): [λ^a, λ^b] = 2i f_{abc} λ^c gives c = 2.
+inline constexpr double kGellMannBracket = 2.0;
+// Coefficient used before the convention fix (see the header comment).
+inline constexpr double kLegacyBracket = 1.0;
+
+// Local 3×3 mean-field Hamiltonian H_loc = h_0 1 + Σ_a h^a λ^a, the operator
+// whose expectation is the classical energy h_0 + h·n.
 inline Matrix3c local_hamiltonian(const Vector8r& h_a, double h_0 = 0.0) {
     const auto& L = gell_mann();
     Matrix3c H = h_0 * Matrix3c::Identity();
     for (int a = 0; a < 8; ++a) {
-        H.noalias() += 0.5 * h_a(a) * L[a];
+        H.noalias() += h_a(a) * L[a];
     }
     return H;
 }
 
-// Sign convention adapter for the existing code base.
-//
-// The current `get_local_field_SU3` / `get_local_field_SU3_flat_into`
-// returns a vector `H_field[a]` such that the Bloch-EOM in
-// mixed_lattice_md.cpp reads
-//     dn^a/dt = f_{abc} H_field^b n^c
-// (see `cross_prod_SU3_flat`). The Schrödinger-picture Hamiltonian that
-// reproduces this is then exactly
-//     H_loc = (1/2) Σ_a H_field^a λ^a
-// (compute d⟨λ_a⟩/dt = i⟨[H_loc, λ_a]⟩ and use [λ_b, λ_a] = 2 i f_{bac} λ_c,
-//  f_{bac} = −f_{abc}).
-inline Matrix3c local_hamiltonian_from_field(const Vector8r& H_field, double h_0 = 0.0) {
-    return local_hamiltonian(H_field, h_0);
+// Schrödinger-picture generator of the Bloch dynamics driven by the local
+// field H_field = ∂E/∂n returned by `get_local_field_SU3(_flat_into)`:
+//     H_loc = (bracket/2) Σ_a H_field^a λ^a,
+// so that d⟨λ^a⟩/dt = i⟨[H_loc, λ^a]⟩ = bracket f_{abc} H_field^b n^c
+// (use [λ^b, λ^a] = 2i f_{bac} λ^c and f_{bac} = −f_{abc}). With the default
+// bracket this is `local_hamiltonian(H_field)`. A positive rescaling does not
+// change eigenvectors, so ground states do not depend on the bracket.
+inline Matrix3c local_hamiltonian_from_field(const Vector8r& H_field, double h_0 = 0.0,
+                                             double bracket = kGellMannBracket) {
+    return local_hamiltonian(0.5 * bracket * H_field, h_0);
 }
 
 // Exact one-step unitary propagator U(Δt) = exp(−i H_loc Δt) for a 3×3
-// Hermitian H_loc. Uses Eigen's SelfAdjointEigenSolver, which is a hand-tuned
-// 3×3 closed-form path internally, so the cost is small.
+// Hermitian H_loc, from the eigendecomposition H_loc = V D V^† (Eigen's
+// complex SelfAdjointEigenSolver: Householder tridiagonalisation + QR; the
+// closed-form computeDirect path exists only for real matrices).
 inline Matrix3c propagator_exact(const Matrix3c& H_loc, double dt) {
     Eigen::SelfAdjointEigenSolver<Matrix3c> es(H_loc);
     const auto& V = es.eigenvectors();
@@ -232,35 +241,71 @@ inline void unitary_step_explicit(Vector3c& psi, const Matrix3c& H_loc, double d
     if (n > 0.0) psi /= n;
 }
 
-// Spherical-midpoint geometric step of Dahlbom et al., Ref. [2].
-//
-// Implements the implicit midpoint scheme that is symplectic on CP^{N−1}:
-//     ψ_mid          = (ψ_old + ψ_new) / 2
-//     ψ_new − ψ_old  = −i Δt H_loc(ψ_mid) ψ_mid                  (∗)
-// Self-consistently solved by Picard iteration. For frozen neighbours
-// (`H_loc` independent of ψ), one Picard iteration is the same as the
-// explicit step above; the iterative form matters only when `H_loc`
-// itself depends on ψ through self-consistent / on-site nonlinearities
-// (e.g. an on-site SU(3) anisotropy A^{ab} n^a n^b, which we currently
-// do not use, but the implementation is ready for it).
-//
-// `H_loc_of` is any callable Matrix3c(const Vector3c&).
+// Implicit-midpoint step of the mean-field Schrödinger equation, Ref. [2]:
+//     ψ_new − ψ_old = −i Δt H_loc(ψ_mid) ψ_mid,   ψ_mid = (ψ_old + ψ_new)/2.
+// For fixed H = H_loc(ψ_mid) this is the Cayley transform
+//     ψ_new = (1 + iΔt H/2)^{-1} (1 − iΔt H/2) ψ_old,
+// which is unitary, so ⟨ψ|ψ⟩ is conserved to round-off without any
+// renormalisation; the rule is symplectic, time-reversible and second order.
+// The self-consistency in ψ_mid (H_loc depends on ψ through neighbours /
+// on-site nonlinearities) is solved by fixed-point iteration, which
+// converges for Δt ‖∂H/∂ψ‖ small. `H_loc_of` is any callable
+// Matrix3c(const Vector3c& psi_mid). Returns the number of iterations used.
 template <class H_loc_fn>
-inline void spherical_midpoint_step(Vector3c& psi, H_loc_fn H_loc_of, double dt,
-                                    int max_iters = 8, double tol = 1e-12) {
-    Vector3c psi_old = psi;
+inline int implicit_midpoint_step(Vector3c& psi, H_loc_fn H_loc_of, double dt,
+                                  int max_iters = 50, double tol = 1e-14) {
+    const Vector3c psi_old = psi;
     Vector3c psi_new = psi;
-    const Complex mi_dt_half(0.0, -0.5 * dt);
-    for (int it = 0; it < max_iters; ++it) {
-        Vector3c psi_mid = 0.5 * (psi_old + psi_new);
-        Matrix3c H = H_loc_of(psi_mid);
-        Vector3c psi_next = psi_old + mi_dt_half * (H * psi_mid + H * psi_old);
-        psi_next.normalize();
+    const Complex half_idt(0.0, 0.5 * dt);
+    int it = 0;
+    for (; it < max_iters; ++it) {
+        const Vector3c psi_mid = 0.5 * (psi_old + psi_new);
+        const Matrix3c H = H_loc_of(psi_mid);
+        const Matrix3c A = Matrix3c::Identity() + half_idt * H;
+        const Vector3c rhs = psi_old - half_idt * (H * psi_old);
+        const Vector3c psi_next = A.partialPivLu().solve(rhs);
         const double err = (psi_next - psi_new).norm();
         psi_new = psi_next;
-        if (err < tol) break;
+        if (err < tol) { ++it; break; }
     }
     psi = psi_new;
+    return it;
+}
+
+// Former name (the old body was a first-order θ = 1/4 scheme, not the
+// midpoint rule its documentation described).
+template <class H_loc_fn>
+inline void spherical_midpoint_step(Vector3c& psi, H_loc_fn H_loc_of, double dt,
+                                    int max_iters = 50, double tol = 1e-14) {
+    implicit_midpoint_step(psi, H_loc_of, dt, max_iters, tol);
+}
+
+// -----------------------------------------------------------------------------
+// Casimir invariants of n (conserved by the Lie-Poisson flow).
+// -----------------------------------------------------------------------------
+// Quadratic Casimir |n|^2 (= 4/3 for a pure state).
+inline double casimir2(const double* n) {
+    double s = 0.0;
+    for (int a = 0; a < 8; ++a) s += n[a] * n[a];
+    return s;
+}
+
+// Cubic Casimir d_{abc} n^a n^b n^c (= 8/9 for a pure state), with the
+// symmetric Gell-Mann constants d_{abc} = Tr({λ^a, λ^b} λ^c)/4.
+inline double casimir3(const double* n) {
+    static constexpr double r3 = 0.57735026918962576451;  // 1/sqrt(3)
+    const double n1 = n[0], n2 = n[1], n3 = n[2], n4 = n[3];
+    const double n5 = n[4], n6 = n[5], n7 = n[6], n8 = n[7];
+    // Sum over all index orderings of the distinct non-zero d's:
+    //   d_118 = d_228 = d_338 = 1/√3, d_888 = −1/√3,
+    //   d_448 = d_558 = d_668 = d_778 = −1/(2√3),
+    //   d_146 = d_157 = d_256 = d_344 = d_355 = 1/2,
+    //   d_247 = d_366 = d_377 = −1/2.
+    return 3.0 * r3 * (n1 * n1 + n2 * n2 + n3 * n3) * n8
+         - r3 * n8 * n8 * n8
+         - 1.5 * r3 * (n4 * n4 + n5 * n5 + n6 * n6 + n7 * n7) * n8
+         + 3.0 * (n1 * n4 * n6 + n1 * n5 * n7 + n2 * n5 * n6 - n2 * n4 * n7)
+         + 1.5 * n3 * (n4 * n4 + n5 * n5 - n6 * n6 - n7 * n7);
 }
 
 // -----------------------------------------------------------------------------

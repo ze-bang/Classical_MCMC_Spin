@@ -365,6 +365,8 @@ Eigen::VectorXd su2_precession(const Eigen::VectorXd& field, const Eigen::Vector
     return dsdt;
 }
 
+// Lie-Poisson equation of n = <lambda>: dn_i/dt = 2 f_ijk H_j n_k
+// ([lambda_a, lambda_b] = 2i f_abc lambda_c; core/su3_coherent_state.h).
 Eigen::VectorXd su3_precession(const Eigen::VectorXd& field, const Eigen::VectorXd& spin) {
     const auto& f = get_SU3_structure();
     Eigen::VectorXd dsdt = Eigen::VectorXd::Zero(field.size());
@@ -375,7 +377,7 @@ Eigen::VectorXd su3_precession(const Eigen::VectorXd& field, const Eigen::Vector
             }
         }
     }
-    return dsdt;
+    return classical_spin::su3::kGellMannBracket * dsdt;
 }
 
 Lattice make_lattice_from_config(const SpinConfig& config) {

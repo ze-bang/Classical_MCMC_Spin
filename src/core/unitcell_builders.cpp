@@ -30,6 +30,7 @@
  */
 
 #include "classical_spin/core/unitcell_builders.h"
+#include "classical_spin/core/su3_coherent_state.h"
 
 #include <array>
 #include <cmath>
@@ -705,10 +706,23 @@ void apply_tmfeo3_tm_sector(TmFeO3_Tm& Tm_atoms, const SpinConfig& config) {
     const double h = config.field_strength;
 
     // CEF energy splittings as a constant SU(3) field on every Tm site.
-    // For diag(0, e1, e2) the (lambda_3, lambda_8) projections are
-    //   B_3 = e1, B_8 = (2 e2 - e1) / sqrt(3).
-    const double alpha = e1 * tm_alpha_scale;
-    const double beta  = (2.0 * e2 - e1) / std::sqrt(3.0) * tm_beta_scale;
+    // The classical energy of every term is its coherent-state expectation,
+    // E = <psi|H|psi> with n = <lambda> (core/su3_coherent_state.h), and
+    //   diag(0, e1, e2) = (e1 + e2)/3 - (e1/2) lambda_3 - ((2 e2 - e1)/(2 sqrt3)) lambda_8,
+    // so with E = -field . n the field carries the Gell-Mann coefficients
+    //   B_3 = e1/2,  B_8 = (2 e2 - e1) / (2 sqrt3).
+    // Together with the bracket dn_a/dt = 2 f_abc (dE/dn_b) n_c this puts the
+    // CEF lines at e1, e2 and e2 - e1 while Zeeman, Fe-Tm and drive couplings
+    // (defined through J = mu <lambda>) keep their full quantum weight.
+    // su3_legacy_convention = 1 restores the pre-2026-10 encoding (twice the
+    // coefficients, with bracket 1): identical CEF frequencies, but every
+    // other lambda-linear torque on Tm halved and the CEF doubled in MC.
+    const bool legacy_su3 = config.get_param("su3_legacy_convention", 0.0) != 0.0;
+    const double cef_scale = legacy_su3 ? 1.0 : 0.5;
+    Tm_atoms.poisson_bracket = legacy_su3 ? classical_spin::su3::kLegacyBracket
+                                          : classical_spin::su3::kGellMannBracket;
+    const double alpha = cef_scale * e1 * tm_alpha_scale;
+    const double beta  = cef_scale * (2.0 * e2 - e1) / std::sqrt(3.0) * tm_beta_scale;
     // Optional ordered-state-induced static mixing fields (T-odd terms made
     // legal below T_N by the Gamma_2 order): h_tm_a adds a constant field on
     // Gell-Mann component a (1-indexed), e.g. h_tm_6 mixes levels 2<->3.
@@ -1145,6 +1159,11 @@ MixedUnitCell build_tmfeo3(const SpinConfig& config) {
 
     apply_tmfeo3_fe_sector(Fe_atoms, config);
     apply_tmfeo3_tm_sector(Tm_atoms, config);
+    // Staggered Tm observable of the mixed lattice: (+,-,+,-) over the four
+    // Tm sites (identity frames) -- the alternation MixedLattice used to take
+    // from the parity of the flat site index, which equals the atom parity
+    // for this 4-atom cell.
+    Tm_atoms.set_afm_sublattice_signs({+1.0, -1.0, +1.0, -1.0});
 
     MixedUnitCell mixed_uc(Fe_atoms, Tm_atoms);
     apply_tmfeo3_fe_tm_couplings(mixed_uc, config);

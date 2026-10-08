@@ -491,7 +491,8 @@ void test_su3_damping_and_dims() {
             n2 += x[8 * i + a] * x[8 * i + a];
             s_dot += x[8 * i + a] * f[8 * i + a];
         }
-        predicted -= lat.alpha_gilbert / std::sqrt(n2) * p2;
+        // dn/dt = c (P - (alpha/|S|) S x P) with P = H x S and bracket c.
+        predicted -= lat.unit_cell.poisson_bracket * lat.alpha_gilbert / std::sqrt(n2) * p2;
     }
     // The RHS is only as good as its field: H must be ∂E/∂S also across the
     // periodic wrap of the chain (boundary bonds once dropped components 3..7).
@@ -510,7 +511,7 @@ void test_su3_damping_and_dims() {
     }
     check(fd_err < 1e-7, "SU(3) field = finite-difference gradient incl. wrapped bonds (" + sci(fd_err) + ")");
     check(predicted < -1e-3, "random SU(3) state has a non-zero dissipation rate");
-    check_close(dEdt, predicted, 1e-12 * std::abs(predicted) + 1e-14, "dE/dt = -(alpha/|S|) sum |H x S|^2");
+    check_close(dEdt, predicted, 1e-12 * std::abs(predicted) + 1e-14, "dE/dt = -c (alpha/|S|) sum |H x S|^2");
     check_close(s_dot, 0.0, 1e-13, "S . dS/dt = 0 (|S| conserved)");
     // Along a damped trajectory the energy decreases monotonically.
     double E_prev = lat.total_energy_flat(x.data());
