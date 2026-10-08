@@ -5,6 +5,7 @@
 #include "simple_linear_alg.h"
 #include "classical_spin/core/spin_config.h"  // For should_rank_write
 #include "classical_spin/core/su3_coherent_state.h"  // SU(3) coherent-state utilities
+#include "classical_spin/core/su3_mc.h"              // SU(3) Monte Carlo moves on CP^2
                                                      // (Zhang & Batista, PRB 104, 104409 (2021))
 #include "classical_spin/mc/mc_common.h"      // Common MC structs & templates
 #include "classical_spin/mc/parallel_tempering.h"  // replica-exchange engine + ladder tuning
@@ -1926,15 +1927,6 @@ public:
         for (int d = 0; d < 3; ++d) out[d] *= f;
     }
 
-    /// Complex normal deviate with independent real and imaginary parts of variance 1/6, so that
-    /// psi + sigma z moves a normalised qutrit state by the same typical geodesic angle as an SU(2)
-    /// Gaussian move of width sigma (E|z_perp|^2 = 2/3 in both cases).
-    static inline std::complex<double> complex_normal_sixth() {
-        constexpr double s = 0.40824829046386301637;   // 1/sqrt(6)
-        const double re = random_normal_lehman();
-        return {s * re, s * random_normal_lehman()};
-    }
-
     /**
      * Symmetric SU(3) proposal on the configured manifold.
      * CP^2: psi' = normalise(z) (Haar / Fubini-Study) or
@@ -1945,18 +1937,8 @@ public:
      */
     inline void propose_SU3(const double* n, bool gaussian, double sigma, double* out) const {
         if (su3_on_cp2()) {
-            std::complex<double> psi[3];
-            if (gaussian) {
-                classical_spin::su3::psi_from_pure_expectations(n, psi);
-                for (int k = 0; k < 3; ++k) psi[k] += sigma * complex_normal_sixth();
-            } else {
-                for (int k = 0; k < 3; ++k) psi[k] = complex_normal_sixth();
-            }
-            const double nrm2 = std::norm(psi[0]) + std::norm(psi[1]) + std::norm(psi[2]);
-            if (nrm2 < 1e-300) { for (int a = 0; a < 8; ++a) out[a] = n[a]; return; }
-            const double inv = 1.0 / std::sqrt(nrm2);
-            for (int k = 0; k < 3; ++k) psi[k] *= inv;
-            classical_spin::su3::pure_expectations(psi, out);
+            if (gaussian) classical_spin::su3::propose_cp2(n, sigma, out);
+            else classical_spin::su3::random_cp2(out);
             return;
         }
         const double L = double(spin_length_SU3);
@@ -2011,37 +1993,7 @@ public:
      * is a truncated exponential on [0, 1 - p_2]. Writes n[0..7].
      */
     static void sample_linear_cp2(const double* h, double beta, double* n) {
-        using classical_spin::su3::Matrix3c;
-        Eigen::Vector3d ev;
-        Matrix3c V;
-        classical_spin::su3::eigen_hermitian3(classical_spin::su3::gell_mann_sum(h), ev, V);
-        const double a = beta * (ev(1) - ev(0)), b = beta * (ev(2) - ev(0));
-        double p2 = 0.0;
-        for (;;) {
-            const double u = random_double_lehman(0.0, 1.0);
-            p2 = (b > 1e-12) ? -std::log1p(u * std::expm1(-b)) / b : u;
-            p2 = std::clamp(p2, 0.0, 1.0);
-            const double acc = (a > 1e-12) ? std::expm1(-a * (1.0 - p2)) / std::expm1(-a) : 1.0 - p2;
-            if (random_double_lehman(0.0, 1.0) < acc) break;
-        }
-        const double w = 1.0 - p2;
-        const double u = random_double_lehman(0.0, 1.0);
-        double p1 = (a * w > 1e-12) ? -std::log1p(u * std::expm1(-a * w)) / a : u * w;
-        p1 = std::clamp(p1, 0.0, w);
-        const double p0 = std::max(0.0, 1.0 - p1 - p2);
-        const double phi1 = random_double_lehman(0.0, 2.0 * M_PI);
-        const double phi2 = random_double_lehman(0.0, 2.0 * M_PI);
-        const std::complex<double> c0(std::sqrt(p0), 0.0);
-        const std::complex<double> c1 = std::polar(std::sqrt(p1), phi1), c2 = std::polar(std::sqrt(p2), phi2);
-        std::complex<double> psi[3];
-        double nrm2 = 0.0;
-        for (int k = 0; k < 3; ++k) {
-            psi[k] = c0 * V(k, 0) + c1 * V(k, 1) + c2 * V(k, 2);
-            nrm2 += std::norm(psi[k]);
-        }
-        const double inv = 1.0 / std::sqrt(nrm2);
-        for (int k = 0; k < 3; ++k) psi[k] *= inv;
-        classical_spin::su3::pure_expectations(psi, n);
+        classical_spin::su3::sample_linear_cp2(h, beta, n);
     }
 
     // ---- single-site kernels (return true if the site changed) ----
@@ -2154,19 +2106,7 @@ public:
         double h[8], nn[8];
         linear_field_SU3(j, h);
         if (su3_on_cp2()) {
-            using classical_spin::su3::Matrix3c;
-            Eigen::Vector3d ev;
-            Matrix3c V;
-            classical_spin::su3::eigen_hermitian3(classical_spin::su3::gell_mann_sum(h), ev, V);
-            std::complex<double> psi[3];
-            classical_spin::su3::psi_from_pure_expectations(n, psi);
-            std::complex<double> c[3];
-            for (int k = 0; k < 3; ++k)
-                c[k] = std::conj(V(0, k)) * psi[0] + std::conj(V(1, k)) * psi[1] + std::conj(V(2, k)) * psi[2];
-            c[1] *= std::polar(1.0, random_double_lehman(0.0, 2.0 * M_PI));
-            c[2] *= std::polar(1.0, random_double_lehman(0.0, 2.0 * M_PI));
-            for (int k = 0; k < 3; ++k) psi[k] = V(k, 0) * c[0] + V(k, 1) * c[1] + V(k, 2) * c[2];
-            classical_spin::su3::pure_expectations(psi, nn);
+            classical_spin::su3::randomize_phases_cp2(h, n, nn);
         } else {
             double hh = 0.0, nh = 0.0;
             for (int a = 0; a < 8; ++a) { hh += h[a] * h[a]; nh += n[a] * h[a]; }

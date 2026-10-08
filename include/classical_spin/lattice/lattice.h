@@ -11,6 +11,7 @@
 #include "classical_spin/dynamics/drive.h"             // DriveSchedule, Pulse
 #include "classical_spin/dynamics/time_grid.h"         // TimeGrid, delay_grid
 #include "classical_spin/io/spin_table.h"               // spin configuration text files
+#include "classical_spin/core/su3_mc.h"                 // SU(3) Monte Carlo moves on CP^2
 #include <vector>
 #include <functional>
 #include <random>
@@ -698,6 +699,9 @@ public:
         if (!(spin_l > 0.0f) || !std::isfinite(spin_l))
             throw std::invalid_argument("Lattice: spin_length must be positive and finite");
         uc.validate();
+        // 8-component spins of a Gell-Mann-bracket cell are qutrit pure states
+        // (CP^2); see set_su3_mc_manifold.
+        su3_cp2 = (uc.N == 8 && uc.poisson_bracket == 2.0);
         lattice_size = N_atoms * dim1 * dim2 * dim3;
         
         // Initialize arrays
@@ -852,8 +856,9 @@ public:
                         pos += k * unit_cell.lattice_vectors[2];
                         site_positions[site_idx] = pos;
 
-                        // Initialize spin randomly on sphere
-                        spins[site_idx] = gen_random_spin(spin_length);
+                        // Uniformly random initial state (sphere or CP^2)
+                        spins[site_idx].resize(spin_dim);
+                        random_state_into(spins[site_idx].data());
 
                         // Copy field from unit cell
                         field[site_idx] = unit_cell.field[atom];
@@ -1174,7 +1179,8 @@ public:
           langevin_temperature(other.langevin_temperature),
           damping_form(other.damping_form),
           local_update(other.local_update),
-          parallel_sweep_min_sites(other.parallel_sweep_min_sites)
+          parallel_sweep_min_sites(other.parallel_sweep_min_sites),
+          su3_cp2(other.su3_cp2)
     {}
 
     // ============================================================
@@ -1239,6 +1245,39 @@ public:
      */
     void gen_random_spin_into(double* out, float spin_l) const {
         random_point_on_sphere(out, spin_dim, double(spin_l));
+    }
+
+    /// Uniformly random local state: uniform on the sphere |S| = spin_length,
+    /// or a Haar-random pure state on CP^2 (su3_cp2).
+    void random_state_into(double* out) const {
+        if (su3_cp2) classical_spin::su3::random_cp2(out);
+        else random_point_on_sphere(out, spin_dim, double(spin_length));
+    }
+
+    /**
+     * Symmetric single-site proposal shared by the serial and coloured
+     * Metropolis sweeps: a uniformly random state, or a small move of width
+     * sigma — S + sigma u renormalised (u uniform with |u| = spin_length) on
+     * the sphere, psi + sigma z on CP^2 (classical_spin::su3::propose_cp2).
+     * Returns false only in the measure-zero case S + sigma u = 0.
+     */
+    inline bool propose_spin(const double* old_spin, bool gaussian, double sigma, double* out) const {
+        if (su3_cp2) {
+            if (gaussian) classical_spin::su3::propose_cp2(old_spin, sigma, out);
+            else classical_spin::su3::random_cp2(out);
+            return true;
+        }
+        gen_random_spin_into(out, spin_length);
+        if (!gaussian) return true;
+        double sum_sq = 0.0;
+        for (size_t d = 0; d < spin_dim; ++d) {
+            out[d] = old_spin[d] + sigma * out[d];
+            sum_sq += out[d] * out[d];
+        }
+        if (sum_sq < 1e-20) return false;
+        const double inv_norm = double(spin_length) / std::sqrt(sum_sq);
+        for (size_t d = 0; d < spin_dim; ++d) out[d] *= inv_norm;
+        return true;
     }
 
     /**
@@ -2420,22 +2459,8 @@ public:
                 const double rand_uni  = rand_uniforms[j];
                 double*      old_spin  = spins[site].data();
 
-                // Build the proposed spin in `new_spin_buf` with no
-                // allocation. For Gaussian moves we add a length-spin_length
-                // offset and renormalise (rejection if it underflows).
-                if (gaussian_move) {
-                    gen_random_spin_into(new_spin_buf, spin_length);
-                    double sum_sq = 0.0;
-                    for (size_t d = 0; d < spin_dim; ++d) {
-                        new_spin_buf[d] = old_spin[d] + sigma * new_spin_buf[d];
-                        sum_sq += new_spin_buf[d] * new_spin_buf[d];
-                    }
-                    if (sum_sq < 1e-20) continue;  // pathological: skip
-                    const double inv_norm = double(spin_length) / std::sqrt(sum_sq);
-                    for (size_t d = 0; d < spin_dim; ++d) new_spin_buf[d] *= inv_norm;
-                } else {
-                    gen_random_spin_into(new_spin_buf, spin_length);
-                }
+                // Build the proposed spin in `new_spin_buf` with no allocation.
+                if (!propose_spin(old_spin, gaussian_move, sigma, new_spin_buf)) continue;
 
                 const double dE = site_energy_diff_flat(new_spin_buf, old_spin, site);
 
@@ -2534,19 +2559,7 @@ public:
                     const size_t site     = sites_by_color_csr[off];
                     double*      old_spin = spins[site].data();
 
-                    if (gaussian_move) {
-                        gen_random_spin_into(new_spin_buf, spin_length);
-                        double sum_sq = 0.0;
-                        for (size_t d = 0; d < spin_dim; ++d) {
-                            new_spin_buf[d] = old_spin[d] + sigma * new_spin_buf[d];
-                            sum_sq += new_spin_buf[d] * new_spin_buf[d];
-                        }
-                        if (sum_sq < 1e-20) continue;
-                        const double inv_norm = double(spin_length) / std::sqrt(sum_sq);
-                        for (size_t d = 0; d < spin_dim; ++d) new_spin_buf[d] *= inv_norm;
-                    } else {
-                        gen_random_spin_into(new_spin_buf, spin_length);
-                    }
+                    if (!propose_spin(old_spin, gaussian_move, sigma, new_spin_buf)) continue;
 
                     const double dE = site_energy_diff_flat(new_spin_buf, old_spin, site);
 
@@ -2599,6 +2612,18 @@ public:
     inline bool heat_bath_site(size_t site, double beta) {
         double g[MAX_SPIN_DIM];
         linear_field(site, spins_view(), g);
+        if (su3_cp2) {
+            // Exact draw from exp(-beta g.n) on CP^2 (classical_spin::su3::sample_linear_cp2).
+            double n_new[8];
+            classical_spin::su3::sample_linear_cp2(g, beta, n_new);
+            double* n = spins[site].data();
+            if (!onsite_scalar[site]) {
+                const double dE = onsite_energy(site, n_new) - onsite_energy(site, n);
+                if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE)) return false;
+            }
+            std::memcpy(n, n_new, sizeof(n_new));
+            return true;
+        }
         const double s = double(spin_length);
         const double gn = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
         double S_new[3];
@@ -2636,7 +2661,7 @@ public:
     /// (1 unless anisotropic on-site terms reject some draws).
     double heat_bath(double T) {
         if (T <= 0.0) return 0.0;
-        if (spin_dim != 3) return metropolis(T);
+        if (!heat_bath_available()) return metropolis(T);
         const double beta = 1.0 / T;
         size_t accepted = 0;
         for (size_t site = 0; site < lattice_size; ++site) accepted += heat_bath_site(site, beta);
@@ -2646,7 +2671,7 @@ public:
     /// Coloured, race-free OpenMP heat-bath sweep (see metropolis_parallel).
     double heat_bath_parallel(double T) {
         if (T <= 0.0) return 0.0;
-        if (spin_dim != 3) return metropolis_parallel(T);
+        if (!heat_bath_available()) return metropolis_parallel(T);
 #ifdef _OPENMP
         if (n_colors == 0 || omp_get_max_threads() <= 1) return heat_bath(T);
 #else
@@ -2686,6 +2711,40 @@ public:
     LocalUpdate local_update = LocalUpdate::Metropolis;
     size_t parallel_sweep_min_sites = 4096;
 
+    // State space of 8-component (SU(3), qutrit) spins in Monte Carlo. CP^2:
+    // pure states n = <psi|lambda|psi> (|n|^2 = 4/3) with the Fubini-Study
+    // measure — the default when the unit cell uses the Gell-Mann bracket
+    // (UnitCell::poisson_bracket = 2, the E = <psi|H|psi> convention whose
+    // dynamics stay on CP^2). Otherwise (legacy bracket, other spin_dim) the
+    // sphere |S| = spin_length. Set with set_su3_mc_manifold.
+    bool su3_cp2 = false;
+
+    /// "cp2", "sphere", or "" / "auto" (CP^2 iff spin_dim == 8 with the Gell-Mann bracket).
+    /// Switching to CP^2 projects the current spins onto it.
+    void set_su3_mc_manifold(const string& name) {
+        if (name.empty() || name == "auto") {
+            su3_cp2 = (spin_dim == 8 && unit_cell.poisson_bracket == 2.0);
+        } else if (name == "cp2" || name == "CP2") {
+            if (spin_dim != 8) throw std::invalid_argument("su3_mc_manifold = cp2 needs spin_dim 8");
+            su3_cp2 = true;
+        } else if (name == "sphere") {
+            su3_cp2 = false;
+        } else {
+            throw std::invalid_argument("unknown su3_mc_manifold '" + name + "' (valid: cp2, sphere)");
+        }
+        project_su3_states();
+    }
+
+    /// On CP^2, replace every spin by its closest pure qutrit state (exact for
+    /// any positive multiple of a pure state); no-op otherwise.
+    void project_su3_states() {
+        if (!su3_cp2) return;
+        for (auto& s : spins) classical_spin::su3::project_to_cp2(s.data());
+    }
+
+    /// Whether heat_bath() is exact for these spins (SO(3), or SU(3) on CP^2).
+    bool heat_bath_available() const { return spin_dim == 3 || su3_cp2; }
+
     static LocalUpdate parse_local_update(const string& name) {
         if (name == "metropolis" || name == "uniform") return LocalUpdate::Metropolis;
         if (name == "gaussian" || name == "adaptive") return LocalUpdate::Gaussian;
@@ -2709,7 +2768,7 @@ public:
      */
     double local_sweep(double T, bool gaussian_move, double sigma) {
         const bool par = use_parallel_sweeps();
-        if (local_update == LocalUpdate::HeatBath && spin_dim == 3)
+        if (local_update == LocalUpdate::HeatBath && heat_bath_available())
             return par ? heat_bath_parallel(T) : heat_bath(T);
         const bool gauss = gaussian_move || local_update == LocalUpdate::Gaussian;
         return par ? metropolis_parallel(T, gauss, sigma) : metropolis(T, gauss, sigma);
@@ -2755,6 +2814,20 @@ public:
         linear_field(site, spins_view(), g);
         double norm_sq = 0.0, S_dot_g = 0.0;
         double* S = spins[site].data();
+        if (su3_cp2) {
+            // The R^8 reflection leaves CP^2: randomise the relative phases in
+            // the eigenbasis of g.lambda instead (conserves g.n; symmetric,
+            // see classical_spin::su3::randomize_phases_cp2).
+            double n_new[8];
+            classical_spin::su3::randomize_phases_cp2(g, S, n_new);
+            if (!onsite_scalar[site]) {
+                if (T <= 0.0) return false;
+                const double dE = onsite_energy(site, n_new) - onsite_energy(site, S);
+                if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-dE / T)) return false;
+            }
+            std::memcpy(S, n_new, sizeof(n_new));
+            return true;
+        }
         for (size_t d = 0; d < spin_dim; ++d) {
             norm_sq += g[d] * g[d];
             S_dot_g += S[d] * g[d];
@@ -3246,7 +3319,22 @@ public:
             for (size_t i = 0; i < lattice_size; ++i) {
                 linear_field(i, spins_view(), g);
                 double* S = spins[i].data();
-                if (onsite_scalar[i]) {
+                if (su3_cp2) {
+                    if (onsite_scalar[i]) {
+                        classical_spin::su3::ground_state_cp2(g, S_new);
+                    } else {
+                        // Ground state of the on-site term linearised at S, kept
+                        // only if it lowers the local energy (monotone descent).
+                        double h[8];
+                        const Eigen::Map<const Eigen::VectorXd> Sv(S, 8);
+                        const Eigen::VectorXd AS = onsite_interaction[i] * Sv;
+                        for (int a = 0; a < 8; ++a) h[a] = g[a] + 2.0 * AS(a);
+                        classical_spin::su3::ground_state_cp2(h, S_new);
+                        double e_new = onsite_energy(i, S_new), e_old = onsite_energy(i, S);
+                        for (int a = 0; a < 8; ++a) { e_new += g[a] * S_new[a]; e_old += g[a] * S[a]; }
+                        if (!(e_new < e_old)) continue;
+                    }
+                } else if (onsite_scalar[i]) {
                     double norm = 0.0;
                     for (size_t d = 0; d < spin_dim; ++d) norm += g[d] * g[d];
                     norm = std::sqrt(norm);
@@ -4283,7 +4371,8 @@ public:
     /**
      * Load a spin configuration written by save_spin_config: exactly
      * lattice_size lines of spin_dim finite numbers ('#' comments allowed).
-     * Every spin is rescaled to spin_length. Throws std::runtime_error naming
+     * Every spin is rescaled to spin_length (SU(3) spins on CP^2: projected
+     * onto the closest pure state unless already pure to round-off). Throws std::runtime_error naming
      * the file and line on a missing file, a short file, a wrong number of
      * columns, a non-finite value, extra rows or a zero vector; the current
      * spins are left unchanged on error.
@@ -4297,12 +4386,23 @@ public:
             const double n = s.norm();
             if (!(n > 0.0))
                 throw std::runtime_error(filename + ":" + std::to_string(t.lines[i]) + ": zero spin vector");
+            if (su3_cp2) {
+                // Qutrit pure states: kept bitwise when |n|^2 = 4/3 and the cubic
+                // Casimir is 8/9 (together they force rho's spectrum to {1, 0, 0}),
+                // otherwise replaced by the closest pure state.
+                loaded[i] = s;
+                if (std::abs(classical_spin::su3::casimir2(s.data()) - 4.0 / 3.0) > 1e-12 ||
+                    std::abs(classical_spin::su3::casimir3(s.data()) - 8.0 / 9.0) > 1e-12)
+                    classical_spin::su3::project_to_cp2(loaded[i].data());
+                continue;
+            }
             max_dev = std::max(max_dev, std::abs(n - spin_length) / spin_length);
             // A spin already of length spin_length to round-off is kept bitwise.
             loaded[i] = (std::abs(n - spin_length) <= 4.0 * std::numeric_limits<double>::epsilon() * spin_length)
                             ? s : SpinVector(s * (spin_length / n));
         }
         spins = std::move(loaded);
+        if (su3_cp2) return;
         if (max_dev > 1e-3)
             std::cerr << "Warning: " << filename << ": spins rescaled to spin_length = " << spin_length
                       << " (largest relative change " << max_dev << ")" << std::endl;
@@ -4399,6 +4499,7 @@ public:
      */
     void init_ferromagnetic(const SpinVector& direction) {
         SpinVector spin_aligned = direction.normalized() * spin_length;
+        if (su3_cp2) classical_spin::su3::project_to_cp2(spin_aligned.data());   // closest pure state
         for (size_t i = 0; i < lattice_size; ++i) {
             spins[i] = spin_aligned;
         }
@@ -4424,9 +4525,7 @@ public:
      * Initialize with random spins
      */
     void init_random() {
-        for (size_t i = 0; i < lattice_size; ++i) {
-            spins[i] = gen_random_spin(spin_length);
-        }
+        for (size_t i = 0; i < lattice_size; ++i) random_state_into(spins[i].data());
     }
 
     /**

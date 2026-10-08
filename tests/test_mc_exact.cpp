@@ -20,6 +20,8 @@ namespace {
 
 constexpr double kSigma = 5.0;
 
+void ck_true(bool ok, const std::string& what) { check(ok, what); }
+
 void set_threads(int n) {
 #ifdef _OPENMP
     omp_set_num_threads(n);
@@ -68,6 +70,10 @@ void test_free_spins_s7() {
     f(7) = h;
     uc.set_field(f, 0);
     Lattice lat(uc, 8, 8, 1, 1.0f);
+    // 8-component spins of a Gell-Mann-bracket cell default to CP^2; this is
+    // the legacy uniform measure on S^7.
+    lat.set_su3_mc_manifold("sphere");
+    lat.init_random();
     const double K = h / T;
     const double exact = -h * std::cyl_bessel_i(n / 2.0, K) / std::cyl_bessel_i(n / 2.0 - 1.0, K);
     seed_lehman(808);
@@ -76,6 +82,145 @@ void test_free_spins_s7() {
     double sig = 0.5;
     r = sample_energy_density(lat, 500, 8000, [&] { lat.metropolis(T, true, sig); });
     check_stat(r.mean, r.err, exact, "S^7 metropolis(gaussian)", kSigma);
+}
+
+// ------------------------------------- SU(3) (qutrit) spins on CP^2 (spin_dim 8)
+// A pure state psi in C^3 stored as n = <psi|lambda|psi>. Under the
+// Fubini-Study measure the populations p_k = |<v_k|psi>|^2 in any orthonormal
+// basis are uniform on the simplex, so for E = -f.n = -sum_k p_k e_k (e_k the
+// eigenvalues of f.lambda) <E> is a 2D simplex integral; for two sites coupled
+// by J n_1.n_2 = J (2x - 2/3), x = |<psi_1|psi_2>|^2 has density 2(1 - x).
+namespace cp2 {
+
+double simplex_mean_energy(const Eigen::Vector3d& e, double beta) {
+    std::vector<double> x, w;
+    gauss_legendre(96, x, w);
+    double z = 0.0, ez = 0.0;
+    for (size_t i = 0; i < x.size(); ++i)
+        for (size_t j = 0; j < x.size(); ++j) {
+            const double u = 0.5 * (x[i] + 1.0), v = 0.5 * (x[j] + 1.0);
+            const double p0 = u, p1 = (1.0 - u) * v, p2 = (1.0 - u) * (1.0 - v);
+            const double E = -(p0 * e(0) + p1 * e(1) + p2 * e(2));
+            const double wt = 0.25 * w[i] * w[j] * (1.0 - u) * std::exp(-beta * E);
+            z += wt;
+            ez += wt * E;
+        }
+    return ez / z;
+}
+
+double dimer_mean_energy(double J, double beta) {
+    std::vector<double> x, w;
+    gauss_legendre(128, x, w);
+    double z = 0.0, ez = 0.0;
+    for (size_t i = 0; i < x.size(); ++i) {
+        const double q = 0.5 * (x[i] + 1.0);
+        const double E = J * (2.0 * q - 2.0 / 3.0);
+        const double wt = 0.5 * w[i] * 2.0 * (1.0 - q) * std::exp(-beta * E);
+        z += wt;
+        ez += wt * E;
+    }
+    return ez / z;
+}
+
+UnitCell qutrit_cell(size_t n_atoms) {
+    std::vector<Eigen::Vector3d> pos;
+    for (size_t a = 0; a < n_atoms; ++a) pos.push_back(Eigen::Vector3d(0.5 * double(a), 0, 0));
+    return UnitCell(8, n_atoms, pos, {Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(0, 1, 0), Eigen::Vector3d(0, 0, 1)});
+}
+
+/// Largest deviation of any spin from a pure qutrit state (|n|^2 = 4/3, rho eigenvalues 0, 0, 1).
+double max_impurity(const Lattice& lat) {
+    double dev = 0.0;
+    for (const auto& s : lat.spins) {
+        classical_spin::su3::Vector8r v;
+        for (int a = 0; a < 8; ++a) v(a) = s(a);
+        const Eigen::Vector3d ev = classical_spin::su3::density_eigenvalues(v);
+        dev = std::max({dev, std::abs(s.squaredNorm() - 4.0 / 3.0), std::abs(ev(2) - 1.0), std::abs(ev(0)),
+                        std::abs(ev(1))});
+    }
+    return dev;
+}
+
+}  // namespace cp2
+
+void test_qutrits_cp2() {
+    std::printf("\n== SU(3) (qutrit) spins on CP^2: free sites and dimers ==\n");
+    // Free sites in a generic field f (all eight components).
+    UnitCell uc = cp2::qutrit_cell(1);
+    SpinVector f(8);
+    f << 0.3, -0.2, 0.8, 0.1, 0.0, 0.25, -0.4, 0.5;
+    uc.set_field(f, 0);
+    Lattice lat(uc, 8, 8, 1, 1.0f);
+    ck_true(lat.su3_cp2, "Gell-Mann-bracket 8-component cell samples CP^2 by default");
+    Eigen::Vector3d e;
+    {
+        classical_spin::su3::Matrix3c F = classical_spin::su3::gell_mann_sum(f.data());
+        e = Eigen::SelfAdjointEigenSolver<classical_spin::su3::Matrix3c>(F).eigenvalues();
+    }
+    double impurity = cp2::max_impurity(lat);
+    for (double T : {0.4, 1.5}) {
+        const double exact = cp2::simplex_mean_energy(e, 1.0 / T);
+        const std::string tag = " T=" + std::to_string(T);
+        double sig = 0.5;
+        struct Kernel { const char* name; std::function<void()> fn; };
+        const std::vector<Kernel> kernels = {
+            {"metropolis(uniform)", [&] { lat.metropolis(T); }},
+            {"metropolis(gaussian)", [&] { lat.metropolis(T, true, sig); }},
+            {"heat_bath", [&] { lat.heat_bath(T); }},
+            {"overrelaxation+metropolis", [&] { lat.overrelaxation(T); lat.metropolis(T); }},
+            {"overrelaxation+heat_bath", [&] { lat.overrelaxation(T); lat.heat_bath(T); }},
+        };
+        for (const auto& k : kernels) {
+            seed_lehman(4242);
+            auto r = sample_energy_density(lat, 300, 4000, k.fn);
+            check_stat(r.mean, r.err, exact, std::string("CP^2 free qutrits ") + k.name + tag, kSigma);
+            impurity = std::max(impurity, cp2::max_impurity(lat));
+        }
+    }
+    // Overrelaxation conserves the energy of linear sites.
+    {
+        const double E0 = lat.total_energy();
+        lat.overrelaxation(0.0);
+        ck_true(std::abs(lat.total_energy() - E0) < 1e-12 * (1.0 + std::abs(E0)),
+                "CP^2 overrelaxation conserves the energy");
+    }
+    lat.greedy_quench();
+    check_close(lat.energy_density(), -e(2), 1e-10, "CP^2 quench: free qutrit ground state -e_max");
+    impurity = std::max(impurity, cp2::max_impurity(lat));
+
+    // Dimers J n_1.n_2 (16 independent pairs).
+    for (double J : {1.0, -1.0}) {
+        UnitCell dc = cp2::qutrit_cell(2);
+        dc.set_bilinear_interaction(J * Eigen::MatrixXd::Identity(8, 8), 0, 1, Eigen::Vector3i(0, 0, 0));
+        Lattice dimers(dc, 16, 1, 1, 1.0f);
+        for (double T : {0.3, 1.0}) {
+            const double exact = 0.5 * cp2::dimer_mean_energy(J, 1.0 / T);   // per site
+            const std::string tag = " J=" + std::to_string(J) + " T=" + std::to_string(T);
+            double sig = 0.5;
+            seed_lehman(99);
+            auto r = sample_energy_density(dimers, 300, 6000, [&] { dimers.metropolis(T, true, sig); });
+            check_stat(r.mean, r.err, exact, "CP^2 dimer metropolis(gaussian)" + tag, kSigma);
+            r = sample_energy_density(dimers, 300, 6000, [&] { dimers.heat_bath(T); });
+            check_stat(r.mean, r.err, exact, "CP^2 dimer heat_bath" + tag, kSigma);
+            r = sample_energy_density(dimers, 300, 6000, [&] { dimers.overrelaxation(T); dimers.metropolis(T); });
+            check_stat(r.mean, r.err, exact, "CP^2 dimer overrelaxation+metropolis" + tag, kSigma);
+            impurity = std::max(impurity, cp2::max_impurity(dimers));
+        }
+        // Ground state: orthogonal states (x = 0) for J > 0, equal states (x = 1) for J < 0.
+        dimers.init_random();
+        dimers.greedy_quench();
+        check_close(dimers.energy_density(), 0.5 * (J > 0 ? -2.0 * J / 3.0 : 4.0 * J / 3.0), 1e-9,
+                    "CP^2 dimer quench J=" + std::to_string(J));
+    }
+    check_close(impurity, 0.0, 1e-12, "every sampled state is a pure qutrit state");
+
+    // Legacy bracket -> legacy sphere; explicit switches.
+    UnitCell legacy = cp2::qutrit_cell(1);
+    legacy.poisson_bracket = 1.0;
+    Lattice ll(legacy, 2, 1, 1, 1.0f);
+    ck_true(!ll.su3_cp2, "legacy-bracket cell keeps the S^7 sampling");
+    ll.set_su3_mc_manifold("cp2");
+    ck_true(ll.su3_cp2 && cp2::max_impurity(ll) < 1e-12, "su3_mc_manifold = cp2 projects the spins onto CP^2");
 }
 
 // ------------------------------------------------------------ Heisenberg ring
@@ -497,6 +642,7 @@ int main(int argc, char** argv) {
     test_twisted_boundaries();
     test_free_spins();
     test_free_spins_s7();
+    test_qutrits_cp2();
     test_heisenberg_ring();
     test_cluster_ferromagnet();
     test_two_site();

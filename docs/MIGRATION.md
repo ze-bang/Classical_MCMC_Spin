@@ -906,3 +906,22 @@ distribution).
   `tmfeo3-trilinear` model now actually sets the K^- and W couplings.
 
 New config key: `su3_mc_manifold` (see above).
+
+## Lattice SU(3) spins (spin_dim 8): Monte Carlo on CP^2
+
+**What changed.** An 8-component `Lattice` whose unit cell uses the
+Gell-Mann bracket (`UnitCell::poisson_bracket = 2`, the default for
+`spin_dim = 8`, e.g. `system = tmfeo3_tm`) now samples qutrit pure states
+n = ⟨ψ|λ|ψ⟩ (|n|² = 4/3) with the Fubini–Study measure, the state space its
+E = ⟨ψ|H|ψ⟩ dynamics conserve. Initial states, Metropolis proposals (uniform
+and small moves), the heat bath (now available for these spins), the
+overrelaxation (random phases in the eigenbasis of the local field instead of
+the R⁸ reflection), the T = 0 quench (exact local ground state), loaded and
+ferromagnetic configurations are all on CP²; the kernels are shared with
+MixedLattice (`core/su3_mc.h`). Before, these spins were sampled on the sphere
+|S| = `spin_length` in R⁸, which contains unphysical (mixed and
+non-positive) states, so thermal averages and SA ground states differed from
+the model the dynamics integrate.
+
+**Old behaviour.** `su3_mc_manifold = sphere` (or `Lattice::set_su3_mc_manifold("sphere")`);
+a cell with the legacy bracket (`su3_legacy_convention = 1`) keeps the sphere.

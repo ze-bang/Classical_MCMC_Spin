@@ -64,10 +64,11 @@ struct SpinConfig {
     // gaussian_move = true), "gaussian" (adaptive-width Gaussian proposals)
     // or "heat_bath" (rejection-free, SO(3) spins).
     std::string local_update = "metropolis";
-    // State space of the SU(3) (qutrit) sites in MixedLattice Monte Carlo:
-    // "cp2" (pure states, Fubini-Study measure), "sphere" (legacy S^7 of
-    // radius spin_length_su3); empty = cp2, or sphere under
-    // su3_legacy_convention. See docs/MIGRATION.md.
+    // State space of the SU(3) (qutrit) sites in Monte Carlo (MixedLattice and
+    // 8-component Lattice systems such as tmfeo3_tm): "cp2" (pure states,
+    // Fubini-Study measure), "sphere" (legacy S^7 of radius spin_length_su3 /
+    // spin_length); empty = cp2, or sphere under su3_legacy_convention.
+    // See docs/MIGRATION.md.
     std::string su3_mc_manifold = "";
     string output_dir = "output";
     double initial_step_size = 0.5;
