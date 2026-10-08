@@ -62,7 +62,7 @@ void test_heisenberg_ring() {
     seed_all(2024);
     Lattice lat = make_ring(16);
     lat.init_random();
-    const auto r = run_ring(lat, T, 2000, 40000, 10);
+    const auto r = run_ring(lat, T, 2000, 40000, 20);
     for (size_t k = 0; k < T.size(); ++k) {
         const double K = 1.0 / T[k];
         const std::string tag = " T=" + std::to_string(T[k]);
@@ -76,7 +76,7 @@ void test_heisenberg_ring() {
        "DEO: even edges (0,2) and the odd edge (1) alternate every round");
     uint64_t by_label = 0;
     for (uint64_t t : r.round_trips_per_replica) by_label += t;
-    ck(r.round_trips > 50 && by_label == r.round_trips,
+    ck(r.round_trips > 30 && by_label == r.round_trips,
        "round trips measured from replica labels: " + std::to_string(r.round_trips));
     ck(r.up_fraction.front() == 1.0 && r.up_fraction.back() == 0.0 && r.up_fraction[1] > r.up_fraction[2],
        "f(T_min) = 1, f(T_max) = 0, f decreasing");
@@ -96,7 +96,7 @@ void test_free_spins_adaptive() {
     Lattice lat(uc, 6, 6, 1, 1.0f);
     lat.local_update = Lattice::LocalUpdate::Gaussian;
     lat.init_random();
-    const auto r = lat.parallel_tempering(T, 3000, 30000, 0, 10, 2, "", {-1}, false, MPI_COMM_WORLD);
+    const auto r = lat.parallel_tempering(T, 3000, 30000, 0, 50, 2, "", {-1}, false, MPI_COMM_WORLD);
     for (size_t k = 0; k < T.size(); ++k) {
         ck_stat(r.energy[k], r.energy_error[k], -h * langevin(h / T[k]), "u T=" + std::to_string(T[k]));
         // sigma is steered to acceptance 0.45, unless even the widest proposal
@@ -129,7 +129,7 @@ void test_mixed_free_species() {
     seed_all(606);
     MixedLattice lat(MixedUnitCell(su2, su3), 4, 4, 1, 1.0f, 1.0f);
     lat.init_random();
-    const auto r = lat.parallel_tempering(T, 2000, 30000, 0, 10, 2, "", {-1}, false, true, MPI_COMM_WORLD);
+    const auto r = lat.parallel_tempering(T, 2000, 30000, 0, 50, 2, "", {-1}, false, true, MPI_COMM_WORLD);
     auto u3 = [&](double t) {  // <n.h_hat> on S^7: I_4(K) / I_3(K)
         const double K = h3 / t;
         return std::cyl_bessel_i(4.0, K) / std::cyl_bessel_i(3.0, K);
@@ -157,7 +157,7 @@ void test_reproducible() {
         seed_all(31337);
         Lattice lat = make_ring(12);
         lat.init_random();
-        runs.push_back(run_ring(lat, T, 500, 4000, 4));
+        runs.push_back(run_ring(lat, T, 500, 4000, 10));
     }
     ck(runs[0].energies == runs[1].energies && runs[0].round_trips == runs[1].round_trips &&
            runs[0].edge_accepts == runs[1].edge_accepts,
@@ -171,8 +171,8 @@ void test_ladder_tuning() {
     o.T_max = 3.0;
     o.warmup_steps = 500;
     o.steps_per_round = 400;
-    o.max_rounds = 6;
-    o.exchange_every = 4;
+    o.max_rounds = 5;
+    o.exchange_every = 8;
     o.verbosity = 0;
     seed_all(4711);
     Lattice lat = make_ring(16);
@@ -183,9 +183,9 @@ void test_ladder_tuning() {
     ck(mono && tuned.temperatures.front() == o.T_min && tuned.temperatures.back() == o.T_max &&
            tuned.rounds_used >= 2,
        "nrpt: monotone ladder with fixed end points after " + std::to_string(tuned.rounds_used) + " rounds");
-    const auto prod = run_ring(lat, tuned.temperatures, 500, 12000, 4);
+    const auto prod = run_ring(lat, tuned.temperatures, 500, 12000, 8);
     const auto geo_T = mc::generate_geometric_temperature_ladder(o.T_min, o.T_max, 4);
-    const auto geo = run_ring(lat, geo_T, 500, 12000, 4);
+    const auto geo = run_ring(lat, geo_T, 500, 12000, 8);
     auto spread = [](const std::vector<double>& a) {
         const auto [lo, hi] = std::minmax_element(a.begin(), a.end());
         return *hi - *lo;

@@ -217,10 +217,14 @@ inline std::vector<double> autocovariance(const std::vector<double>& x, size_t m
     max_lag = std::min(max_lag, n - 1);
     const double m = detail::mean(x.data(), n);
     std::vector<double> gamma(max_lag + 1, 0.0);
-    if (n < 128 || max_lag <= 64) {  // direct sum is cheaper for few lags
+    if (n < 128 || max_lag <= 128) {  // direct (vectorisable) sums are cheaper for few lags
+        std::vector<double> d(n);
+        for (size_t i = 0; i < n; ++i) d[i] = x[i] - m;
         for (size_t t = 0; t <= max_lag; ++t) {
             double s = 0.0;
-            for (size_t i = 0; i + t < n; ++i) s += (x[i] - m) * (x[i + t] - m);
+            const double* a = d.data();
+            const double* b = d.data() + t;
+            for (size_t i = 0, len = n - t; i < len; ++i) s += a[i] * b[i];
             gamma[t] = s / double(n - t);
         }
         return gamma;
@@ -258,31 +262,38 @@ inline GammaResult gamma_method(const std::vector<double>& x, double S = 1.5,
     r.mean = detail::mean(x.data(), r.n);
     if (r.n < 2) return r;
     const size_t n = r.n;
-    const size_t w_max = n / 2;
-    std::vector<double> gamma = autocovariance(x, std::max<size_t>(w_max, 1));
+    const size_t w_max = std::max<size_t>(n / 2, 1);
+    const double nd = double(n);
+    // Short windows (tau_int of a few tens) are the common case: try the
+    // first lags by direct summation and only take the O(N log N) FFT route
+    // over all lags when the window (or the requested rho) needs more.
+    const size_t L0 = std::min<size_t>(w_max, 128);
+    std::vector<double> gamma = autocovariance(x, L0);
     if (!(gamma[0] > 0.0) || !std::isfinite(gamma[0])) {
         // Constant series: no fluctuations, exactly known mean.
         r.variance = 0.0;
         r.reliable = std::isfinite(gamma[0]);
         return r;
     }
-    const double nd = double(n);
-    size_t W = 0;
-    bool found = false;
-    double tau_w_sum = 0.5;
-    for (size_t w = 1; w <= w_max; ++w) {
-        tau_w_sum += gamma[w] / gamma[0];
-        double tau;
-        if (tau_w_sum <= 0.5) {
-            tau = std::numeric_limits<double>::min();
-        } else {
-            tau = S / std::log((2.0 * tau_w_sum + 1.0) / (2.0 * tau_w_sum - 1.0));
+    auto find_window = [&](size_t& W) {
+        double tau_w_sum = 0.5;
+        for (size_t w = 1; w < gamma.size(); ++w) {
+            tau_w_sum += gamma[w] / gamma[0];
+            const double tau = (tau_w_sum <= 0.5)
+                                   ? std::numeric_limits<double>::min()
+                                   : S / std::log((2.0 * tau_w_sum + 1.0) / (2.0 * tau_w_sum - 1.0));
+            const double g = std::exp(-double(w) / tau) - tau / std::sqrt(double(w) * nd);
+            if (g < 0.0) { W = w; return true; }
         }
-        const double g = std::exp(-double(w) / tau) - tau / std::sqrt(double(w) * nd);
-        if (g < 0.0) { W = w; found = true; break; }
+        W = gamma.size() - 1;
+        return false;
+    };
+    size_t W = 0;
+    bool found = find_window(W);
+    if (L0 < w_max && (!found || (rho && 4 * W > L0))) {
+        gamma = autocovariance(x, w_max);
+        found = find_window(W);
     }
-    if (!found) W = std::max<size_t>(w_max, 1);
-    if (W >= gamma.size()) W = gamma.size() - 1;
     if (rho) {  // normalised autocorrelation up to a few windows (before bias correction)
         const size_t L = std::min(gamma.size() - 1, std::max<size_t>(4 * W, 10));
         rho->assign(gamma.begin(), gamma.begin() + long(L) + 1);
