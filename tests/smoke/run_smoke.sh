@@ -77,6 +77,23 @@ annealing_steps = 40
 T_zero = true
 n_deterministics = 100"
 
+run_case pa_kitaev 2 "pa_summary.txt" "$KITAEV
+simulation_mode = population_annealing
+T_start = 2.0
+T_end = 0.1
+pa_population = 64
+pa_sweeps = 4
+pa_temperatures = 10
+gaussian_move = true"
+
+run_case pa_adaptive 1 "pa_best_spins.txt" "$KITAEV
+simulation_mode = population_annealing
+T_end = 0.2
+pa_population = 48
+pa_sweeps = 2
+pa_schedule = adaptive
+pa_target_ess = 0.5"
+
 run_case pt_kitaev 4 "*" "$KITAEV
 simulation_mode = parallel_tempering
 T_start = 2.0

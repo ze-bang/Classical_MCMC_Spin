@@ -196,6 +196,24 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "pt_measurement_steps") {
                 config.pt_measurement_steps = stoull(value);
             }
+            else if (key == "pa_population") {
+                config.pa_population = stoull(value);
+            }
+            else if (key == "pa_sweeps") {
+                config.pa_sweeps = stoull(value);
+            }
+            else if (key == "pa_temperatures") {
+                config.pa_temperatures = stoull(value);
+            }
+            else if (key == "pa_schedule") {
+                config.pa_schedule = value;
+            }
+            else if (key == "pa_target_ess") {
+                config.pa_target_ess = stod(value);
+            }
+            else if (key == "pa_max_temperatures") {
+                config.pa_max_temperatures = stoull(value);
+            }
             else if (key == "pt_optimization_tolerance") {
                 config.pt_optimization_tolerance = stod(value);
             }
@@ -563,6 +581,7 @@ void SpinConfig::to_file(const string& filename) const {
     file << "simulation = ";
     switch (simulation) {
         case SimulationType::SIMULATED_ANNEALING: file << "simulated_annealing"; break;
+        case SimulationType::POPULATION_ANNEALING: file << "population_annealing"; break;
         case SimulationType::PARALLEL_TEMPERING: file << "parallel_tempering"; break;
         case SimulationType::MOLECULAR_DYNAMICS: file << "molecular_dynamics"; break;
         case SimulationType::PUMP_PROBE: file << "pump_probe"; break;
@@ -595,6 +614,12 @@ void SpinConfig::to_file(const string& filename) const {
     file << "pt_exchange_frequency = " << pt_exchange_frequency << "\n";
     file << "pt_equilibration_steps = " << pt_equilibration_steps << "\n";
     file << "pt_measurement_steps = " << pt_measurement_steps << "\n";
+    file << "pa_population = " << pa_population << "\n";
+    file << "pa_sweeps = " << pa_sweeps << "\n";
+    file << "pa_temperatures = " << pa_temperatures << "\n";
+    file << "pa_schedule = " << pa_schedule << "\n";
+    file << "pa_target_ess = " << pa_target_ess << "\n";
+    file << "pa_max_temperatures = " << pa_max_temperatures << "\n";
     file << "overrelaxation_rate = " << overrelaxation_rate << "\n";
     file << "probe_rate = " << probe_rate << "\n";
     file << "# Temperature-ladder tuning (nrpt: Syed et al., JRSS-B 84, 321 (2022))\n";
@@ -667,6 +692,31 @@ bool SpinConfig::validate() const {
     if (lattice_size[0] == 0 || lattice_size[1] == 0 || lattice_size[2] == 0) {
         cerr << "Error: lattice_size dimensions must be > 0\n";
         valid = false;
+    }
+
+    if (simulation == SimulationType::POPULATION_ANNEALING) {
+        const bool adaptive = (pa_schedule == "adaptive");
+        if (!adaptive && pa_schedule != "linear_beta" && pa_schedule != "linear" &&
+            pa_schedule != "geometric" && pa_schedule != "geometric_T") {
+            cerr << "Error: pa_schedule must be linear_beta, geometric or adaptive\n";
+            valid = false;
+        }
+        if (!(T_end > 0.0) || (!adaptive && !(T_start >= T_end))) {
+            cerr << "Error: population annealing needs T_start >= T_end > 0\n";
+            valid = false;
+        }
+        if (pa_population < 1 || pa_sweeps < 1 || pa_temperatures < 1) {
+            cerr << "Error: pa_population, pa_sweeps and pa_temperatures must be >= 1\n";
+            valid = false;
+        }
+        if (adaptive && !(pa_target_ess > 0.0 && pa_target_ess < 1.0)) {
+            cerr << "Error: pa_target_ess must lie in (0, 1)\n";
+            valid = false;
+        }
+        if (system == SystemType::TMFEO3 || system == SystemType::NCTO) {
+            cerr << "Error: population_annealing is implemented for the Lattice systems only\n";
+            valid = false;
+        }
     }
 
     // Spin dynamics of the Lattice family (every system except the mixed
@@ -771,6 +821,7 @@ void SpinConfig::print() const {
     cout << "Simulation: ";
     switch (simulation) {
         case SimulationType::SIMULATED_ANNEALING: cout << "Simulated Annealing"; break;
+        case SimulationType::POPULATION_ANNEALING: cout << "Population Annealing"; break;
         case SimulationType::PARALLEL_TEMPERING: cout << "Parallel Tempering"; break;
         case SimulationType::MOLECULAR_DYNAMICS: cout << "Molecular Dynamics"; break;
         case SimulationType::PUMP_PROBE: cout << "Pump-Probe"; break;
