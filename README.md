@@ -53,11 +53,17 @@ ctest --test-dir build -j4          # physics validation + MPI + end-to-end smok
 | CMake option | Default | Meaning |
 |---|---|---|
 | `CMAKE_BUILD_TYPE` | `Release` | `Release` for production; `RelWithDebInfo` / `Debug` for development |
+| `CLASSICAL_SPIN_NATIVE` | `ON` | tune Release builds for the build host (`-march=native`); `OFF` for portable binaries (clusters with mixed nodes, CI) |
+| `CLASSICAL_SPIN_SANITIZE` | `OFF` | AddressSanitizer + UndefinedBehaviorSanitizer (checked builds) |
+| `CLASSICAL_SPIN_WARNINGS` | `ON` | `-Wall -Wextra` on the project's own code |
+| `CLASSICAL_SPIN_WARNINGS_AS_ERRORS` | `OFF` | treat warnings as errors |
 | `ENABLE_CUDA` | `OFF` | CUDA spin-dynamics kernels (models the GPU path does not implement fall back to the CPU with a warning) |
 | `CMAKE_CUDA_ARCHITECTURES` | detected | GPU architectures to compile for |
-| `CLASSICAL_SPIN_ENABLE_WARNINGS` | `ON` | recommended warning flags |
-| `CLASSICAL_SPIN_WARNINGS_AS_ERRORS` | `OFF` | treat warnings as errors |
 | `BUILD_TESTING` | `ON` | build the test suite (`ctest`) |
+
+Continuous integration (`.github/workflows/ci.yml`) builds a portable
+Release with the full test suite and a Debug ASan/UBSan build running the
+physics tests.
 
 ## Running
 
