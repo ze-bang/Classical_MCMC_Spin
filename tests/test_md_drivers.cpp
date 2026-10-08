@@ -22,9 +22,12 @@
 //  8. SU(3) Gilbert damping dissipates: dE/dt = -(α/|S|) Σ |H × S|² and
 //     |S| is conserved (the damping used to be ignored for spin_dim = 8);
 //     unsupported spin dimensions are rejected.
+//  9. Dynamical structure factor: the FFT, the exact frequency sum rule and
+//     the magnon peaks of a ferromagnetic chain vs linear spin-wave theory.
 #include "physics_test_util.h"
 #include "classical_spin/core/spin_config.h"
 #include "classical_spin/dynamics/ode_method.h"
+#include "classical_spin/dynamics/structure_factor.h"
 
 #include <filesystem>
 #include <fstream>
@@ -532,6 +535,70 @@ void test_su3_damping_and_dims() {
           "spin_dim = 4 rejected with invalid_argument (was a stack overflow / odeint throw)");
 }
 
+// --------------------------------------------- 9. dynamical structure factor
+void test_dssf() {
+    std::printf("\n== Dynamical structure factor: FFT, sum rule, magnon dispersion ==\n");
+    using cplx = std::complex<double>;
+    {   // radix-2 FFT against the naive DFT
+        std::mt19937 gen(4);
+        std::normal_distribution<double> G;
+        std::vector<cplx> x(64), y;
+        for (auto& v : x) v = cplx(G(gen), G(gen));
+        y = x;
+        classical_spin::dynamics::fft_radix2(y, +1);
+        double err = 0.0;
+        for (size_t m = 0; m < x.size(); ++m) {
+            cplx ref = 0.0;
+            for (size_t k = 0; k < x.size(); ++k) ref += x[k] * std::polar(1.0, 2.0 * M_PI * double(k * m) / 64.0);
+            err = std::max(err, std::abs(ref - y[m]));
+        }
+        check(err < 1e-12, "radix-2 FFT == naive DFT (" + sci(err) + ")");
+    }
+    // FM chain in a field: magnons omega(k) = h + 2|J|S(1 - cos k) (linear spin waves).
+    const double J = -1.0, h = 0.5, S = 1.0;
+    const size_t N = 32;
+    Lattice lat(chain_cell(J * Eigen::Matrix3d::Identity(), Eigen::Vector3d(0, 0, h)), N, 1, 1, float(S));
+    const std::vector<int> modes = {1, 2, 4, 8};
+    Lattice::DSSFSettings set;
+    for (int m : modes) set.q_points.push_back(Eigen::Vector3d(2.0 * M_PI * m / double(N), 0, 0));
+    seed_lehman(606);
+    {   // frequency sum rule, exact by construction (no window, finite T)
+        for (auto& sp : lat.spins) sp = Eigen::Vector3d(0, 0, 1);
+        set.temperature = 0.3; set.n_samples = 3; set.t_equilibrate = 10; set.t_decorrelate = 5;
+        set.t_max = 20; set.dt = 0.05; set.save_every = 2; set.hann_window = false;
+        const auto r = lat.dynamical_structure_factor(set);
+        const double dw = r.omega[1] - r.omega[0];
+        double worst = 0.0;
+        for (size_t q = 0; q < modes.size(); ++q)
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b) {
+                    cplx sum = 0.0;
+                    for (size_t j = 0; j < r.omega.size(); ++j) sum += dw * r.at(q, j, a, b);
+                    const cplx ref = r.S_static[(q * 3 + a) * 3 + b];
+                    worst = std::max(worst, std::abs(sum - ref) / (std::abs(r.S_static[q * 9]) + 1e-12));
+                }
+        check(r.n_samples == 3 && worst < 1e-10, "sum_w S(q, w) dw = S(q) for every component (" + sci(worst) + ")");
+    }
+    {   // magnon peaks at low temperature
+        for (auto& sp : lat.spins) sp = Eigen::Vector3d(0, 0, 1);
+        set.temperature = 0.005; set.n_samples = 2; set.alpha_sampling = 0.5; set.t_equilibrate = 30;
+        set.t_max = 150; set.dt = 0.05; set.save_every = 2; set.hann_window = true;
+        const auto r = lat.dynamical_structure_factor(set);
+        for (size_t q = 0; q < modes.size(); ++q) {
+            const double k = 2.0 * M_PI * modes[q] / double(N);
+            const double w_lswt = h + 2.0 * std::abs(J) * S * (1.0 - std::cos(k));
+            double best = -1.0, w_peak = 0.0;
+            for (size_t j = 0; j < r.omega.size(); ++j) {
+                if (r.omega[j] <= 0.0) continue;
+                const double v = (r.at(q, j, 0, 0) + r.at(q, j, 1, 1)).real();
+                if (v > best) { best = v; w_peak = r.omega[j]; }
+            }
+            check(std::abs(w_peak - w_lswt) < 0.03 + 0.01 * w_lswt,
+                  "S_perp(k=2pi*" + std::to_string(modes[q]) + "/32) peaks at " + sci(w_peak) + ", LSWT " + sci(w_lswt));
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -548,6 +615,7 @@ int main(int argc, char** argv) {
     test_damping_forms();
     test_w1_synthesis();
     test_su3_damping_and_dims();
+    test_dssf();
     const int rc = finish("test_md_drivers");
     MPI_Finalize();
     return rc;

@@ -194,6 +194,14 @@ use_gpu = true
 - Output `sample_<trial>/trajectory.h5`: `/trajectory/{times, magnetization_*, spins,
   energy_density, max_norm_error}`, `/metadata/dt_save`; `final_spins.txt`
 - `initial_spin_config`: used as-is in every trial (no annealing)
+- Dynamical structure factor: `dssf_samples` (> 0 enables it), `dssf_q_points`
+  (`h,k,l` triples in reciprocal-lattice units), `dssf_temperature` (default `T_end`),
+  `dssf_t_equilibrate`, `dssf_t_decorrelate`, `dssf_alpha` (sampling thermostat),
+  `dssf_hann_window`. Each sample is a Langevin-equilibrated state evolved without
+  damping by `md_integrator` over `md_time_end - md_time_start`; output
+  `sample_<trial>/dssf.h5`: `/dssf/{q, omega, S_re, S_im, S_err, S_static_re,
+  S_static_im, classical_to_quantum}` (S^{ab}(q, ω) in the global frame, the
+  frequency sum rule ∫ S dω = S(q) holds exactly)
 - `use_gpu`: Enable CUDA acceleration
 
 **Pump-Probe/2DCS:**

@@ -16,6 +16,7 @@
 
 #include "classical_spin/lattice/lattice.h"
 #include "classical_spin/dynamics/ode_method.h"
+#include "classical_spin/dynamics/structure_factor.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1295,4 +1296,158 @@ void Lattice::pump_probe_spectroscopy_mpi(const vector<SpinVector>& field_in,
 #endif
     }
     run_pump_probe_scan(spec, comm, 1);
+}
+
+// ============================================================
+// Dynamical structure factor
+// ============================================================
+
+array<Eigen::Vector3d, 3> Lattice::reciprocal_vectors() const {
+    Eigen::Matrix3d A;
+    for (int i = 0; i < 3; ++i) A.col(i) = unit_cell.lattice_vectors[size_t(i)];
+    if (std::abs(A.determinant()) < 1e-12)
+        throw std::invalid_argument("reciprocal_vectors: the lattice vectors are linearly dependent");
+    const Eigen::Matrix3d B = 2.0 * M_PI * A.inverse().transpose();   // a_i . b_j = 2π δ_ij
+    return {Eigen::Vector3d(B.col(0)), Eigen::Vector3d(B.col(1)), Eigen::Vector3d(B.col(2))};
+}
+
+Lattice::DSSFResult Lattice::dynamical_structure_factor(const DSSFSettings& s) {
+    namespace dyn = classical_spin::dynamics;
+    using cplx = std::complex<double>;
+    if (spin_dim != 3) throw std::invalid_argument("dynamical_structure_factor: spin_dim must be 3");
+    if (s.q_points.empty()) throw std::invalid_argument("dynamical_structure_factor: no q points");
+    if (s.n_samples == 0 || s.save_every == 0 || !(s.dt > 0.0) || !(s.t_max > 0.0) ||
+        !(s.temperature >= 0.0) || !(s.alpha_sampling > 0.0) || s.t_equilibrate < 0.0 || s.t_decorrelate < 0.0)
+        throw std::invalid_argument("dynamical_structure_factor: need n_samples, save_every >= 1, dt, t_max, "
+                                    "alpha_sampling > 0 and non-negative temperature and times");
+    dyn::parse_ode_method(s.method);
+
+    const size_t N = lattice_size, n_q = s.q_points.size();
+    const TimeGrid grid = TimeGrid::covering(0.0, s.t_max, double(s.save_every) * s.dt, "DSSF time grid");
+    dyn::DSSFAccumulator acc(n_q, grid.n, grid.dt, s.hann_window);
+    // Phase table e^{-i q.r_i} / sqrt(N) and the global frames per site.
+    vector<cplx> phase(n_q * N);
+    const double inv_sqrt_n = 1.0 / std::sqrt(double(N));
+    for (size_t q = 0; q < n_q; ++q)
+        for (size_t i = 0; i < N; ++i) phase[q * N + i] = std::polar(inv_sqrt_n, -s.q_points[q].dot(site_positions[i]));
+
+    // Damping/bath are switched per stage and restored on every exit path.
+    struct Restore {
+        Lattice& l; double a, T; dyn::DampingForm f;
+        ~Restore() { l.alpha_gilbert = a; l.langevin_temperature = T; l.damping_form = f; }
+    } restore{*this, alpha_gilbert, langevin_temperature, damping_form};
+    const DriveSchedule no_drive = make_drive();
+    auto thermalise = [&](double t) {
+        if (s.temperature <= 0.0 || t <= 0.0) return;
+        alpha_gilbert = s.alpha_sampling;
+        langevin_temperature = s.temperature;
+        damping_form = dyn::DampingForm::LandauLifshitz;
+        ODEState x = spins_to_state(spins);
+        integrate_on_grid(x, TimeGrid{0.0, t, 2}, no_drive, DynamicsSettings{"spherical_midpoint", s.dt},
+                          [](const double*, size_t, double) {});
+        spins = state_to_spins(x);
+    };
+
+    thermalise(s.t_equilibrate);
+    vector<cplx> A(n_q * grid.n * 3);
+    vector<double> g(3 * N);
+    for (size_t sample = 0; sample < s.n_samples; ++sample) {
+        if (sample > 0) thermalise(s.t_decorrelate);
+        alpha_gilbert = 0.0;
+        langevin_temperature = 0.0;
+        ODEState x = spins_to_state(spins);
+        integrate_on_grid(x, grid, no_drive, DynamicsSettings{s.method, s.dt, 1e-10, 1e-10, 0.0},
+                          [&](const double* xs, size_t k, double) {
+            for (size_t i = 0; i < N; ++i) {   // global-frame spins
+                const SpinMatrix& F = sublattice_frames[i % N_atoms];
+                for (int a = 0; a < 3; ++a)
+                    g[3 * i + a] = F(a, 0) * xs[3 * i] + F(a, 1) * xs[3 * i + 1] + F(a, 2) * xs[3 * i + 2];
+            }
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if(n_q * N >= 65536)
+#endif
+            for (size_t q = 0; q < n_q; ++q) {
+                cplx Aq[3] = {0.0, 0.0, 0.0};
+                const cplx* ph = phase.data() + q * N;
+                for (size_t i = 0; i < N; ++i)
+                    for (int a = 0; a < 3; ++a) Aq[a] += ph[i] * g[3 * i + a];
+                for (int a = 0; a < 3; ++a) A[(q * grid.n + k) * 3 + a] = Aq[a];
+            }
+        });
+        acc.add_sample(A);
+    }
+
+    DSSFResult r;
+    r.q = s.q_points;
+    r.n_samples = acc.samples();
+    r.temperature = s.temperature;
+    r.dt_sample = grid.dt;
+    r.t_max = grid.t_end();
+    const size_t M = acc.n_omega();
+    r.omega.resize(M);
+    for (size_t j = 0; j < M; ++j) r.omega[j] = acc.omega(j);
+    r.S.resize(n_q * M * 9);
+    r.S_err.resize(n_q * M * 9);
+    r.S_static.resize(n_q * 9);
+    for (size_t q = 0; q < n_q; ++q) {
+        for (size_t j = 0; j < M; ++j)
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b) {
+                    const size_t idx = ((q * M + j) * 3 + a) * 3 + b;
+                    r.S[idx] = acc.S(q, j, a, b);
+                    r.S_err[idx] = acc.S_err(q, j, a, b);
+                }
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b) r.S_static[(q * 3 + a) * 3 + b] = acc.S_static(q, a, b);
+    }
+    return r;
+}
+
+void Lattice::write_dssf(const DSSFResult& r, const string& file) {
+#ifdef HDF5_ENABLED
+    hdf5_io("write_dssf", [&] {
+        H5::H5File f(file, H5F_ACC_TRUNC);
+        H5::Group g = f.createGroup("/dssf");
+        const hsize_t nq = r.q.size(), nw = r.omega.size();
+        auto dataset = [&](const char* name, const vector<double>& v, std::initializer_list<hsize_t> dims) {
+            vector<hsize_t> d(dims);
+            g.createDataSet(name, H5::PredType::NATIVE_DOUBLE, H5::DataSpace(int(d.size()), d.data()))
+                .write(v.data(), H5::PredType::NATIVE_DOUBLE);
+        };
+        vector<double> q(nq * 3);
+        for (size_t i = 0; i < nq; ++i)
+            for (int a = 0; a < 3; ++a) q[i * 3 + a] = r.q[i](a);
+        dataset("q", q, {nq, 3});
+        dataset("omega", r.omega, {nw});
+        vector<double> re(r.S.size()), im(r.S.size());
+        for (size_t i = 0; i < r.S.size(); ++i) { re[i] = r.S[i].real(); im[i] = r.S[i].imag(); }
+        dataset("S_re", re, {nq, nw, 3, 3});
+        dataset("S_im", im, {nq, nw, 3, 3});
+        dataset("S_err", r.S_err, {nq, nw, 3, 3});
+        vector<double> sre(r.S_static.size()), sim(r.S_static.size());
+        for (size_t i = 0; i < r.S_static.size(); ++i) { sre[i] = r.S_static[i].real(); sim[i] = r.S_static[i].imag(); }
+        dataset("S_static_re", sre, {nq, 3, 3});
+        dataset("S_static_im", sim, {nq, 3, 3});
+        if (r.temperature > 0.0) {
+            // Classical-to-quantum intensity factor βω / (1 - e^{-βω}) (detailed balance).
+            vector<double> c2q(nw);
+            for (size_t j = 0; j < nw; ++j) {
+                const double x = r.omega[j] / r.temperature;
+                c2q[j] = (std::abs(x) < 1e-12) ? 1.0 : x / (1.0 - std::exp(-x));
+            }
+            dataset("classical_to_quantum", c2q, {nw});
+        }
+        H5::DataSpace scalar(H5S_SCALAR);
+        auto attr = [&](const char* name, double v) {
+            g.createAttribute(name, H5::PredType::NATIVE_DOUBLE, scalar).write(H5::PredType::NATIVE_DOUBLE, &v);
+        };
+        attr("temperature", r.temperature);
+        attr("n_samples", double(r.n_samples));
+        attr("dt_sample", r.dt_sample);
+        attr("t_max", r.t_max);
+    });
+#else
+    (void) r;
+    throw std::runtime_error("write_dssf: HDF5 support is required (" + file + ")");
+#endif
 }

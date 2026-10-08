@@ -106,3 +106,13 @@ unchanged behaviour: `dS/dt = S x B - (α/s) S x (S x B)`) or `gilbert` (the sam
 divided by `1 + α²`, i.e. the Gilbert equation solved for `dS/dt`). The Langevin
 noise strength follows the form, `D = αT/(s(1 + α²))` resp. `D = αT/s`, so both
 sample the Gibbs distribution.
+
+## Lattice MD: dynamical structure factor mode (new keys)
+
+**What changed.** With `dssf_samples > 0`, `simulation_mode = molecular_dynamics`
+computes the classical dynamical structure factor S^{ab}(q, ω) (thermal
+sampling by stochastic LLG, energy-conserving trajectories, windowed and
+zero-padded FFT, sample averages with errors) and writes `sample_<trial>/dssf.h5`
+instead of a trajectory file. Without the new keys nothing changes. This replaces
+the offline Python estimate, which summed exp(iωt) over non-uniform samples
+without weights or window.

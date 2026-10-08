@@ -145,6 +145,27 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "damping_form") {
                 config.damping_form = value;
             }
+            else if (key == "dssf_samples") {
+                config.dssf_samples = stoull(value);
+            }
+            else if (key == "dssf_q_points") {
+                config.dssf_q_points = parse_vectorN_list(value, 3);
+            }
+            else if (key == "dssf_temperature") {
+                config.dssf_temperature = stod(value);
+            }
+            else if (key == "dssf_t_equilibrate") {
+                config.dssf_t_equilibrate = stod(value);
+            }
+            else if (key == "dssf_t_decorrelate") {
+                config.dssf_t_decorrelate = stod(value);
+            }
+            else if (key == "dssf_alpha") {
+                config.dssf_alpha = stod(value);
+            }
+            else if (key == "dssf_hann_window") {
+                config.dssf_hann_window = parse_bool(value);
+            }
             else if (key == "md_abs_tol") {
                 config.md_abs_tol = stod(value);
             }
@@ -686,6 +707,16 @@ bool SpinConfig::validate() const {
         if (T_bath > 0.0 && !stochastic_ok) {
             cerr << "Error: langevin_temperature > 0 needs md_integrator = spherical_midpoint or depondt\n";
             valid = false;
+        }
+        if (run == SimulationType::MOLECULAR_DYNAMICS && dssf_samples > 0) {
+            if (dssf_q_points.empty()) {
+                cerr << "Error: dssf_samples > 0 needs dssf_q_points\n";
+                valid = false;
+            }
+            if (!(dssf_alpha > 0.0) || dssf_t_equilibrate < 0.0 || dssf_t_decorrelate < 0.0) {
+                cerr << "Error: dssf_alpha must be > 0 and the dssf times >= 0\n";
+                valid = false;
+            }
         }
         if (run == SimulationType::TWOD_COHERENT_SPECTROSCOPY) {
             try {

@@ -4107,6 +4107,57 @@ public:
                            string method = "dopri5", bool use_gpu = false,
                            double abs_tol = -1.0, double rel_tol = -1.0);
 
+    // ------------------------------------------------------------
+    // Dynamical structure factor S^{ab}(q, ω) (dynamics/structure_factor.h)
+    // ------------------------------------------------------------
+
+    /** Settings of dynamical_structure_factor(). */
+    struct DSSFSettings {
+        vector<Eigen::Vector3d> q_points;   ///< wave vectors (Cartesian, 1 / length of site_positions)
+        double temperature = 0.0;           ///< sampling temperature (k_B = 1); 0: the current state only
+        size_t n_samples = 1;               ///< independent thermal samples
+        double t_equilibrate = 50.0;        ///< Langevin time before the first sample
+        double t_decorrelate = 10.0;        ///< Langevin time between samples
+        double alpha_sampling = 0.1;        ///< damping of the sampling thermostat
+        double t_max = 100.0;               ///< length of each energy-conserving trajectory
+        double dt = 0.05;                   ///< integration step
+        size_t save_every = 1;              ///< sample spacing = save_every * dt
+        string method = "spherical_midpoint";  ///< integrator of the measured trajectories
+        bool hann_window = true;            ///< Hann window (else none)
+    };
+
+    /** S^{ab}(q, ω) on the frequencies omega (increasing), global frame. */
+    struct DSSFResult {
+        vector<Eigen::Vector3d> q;
+        vector<double> omega;
+        size_t n_samples = 0;
+        double temperature = 0.0, dt_sample = 0.0, t_max = 0.0;
+        vector<std::complex<double>> S;         ///< [q][omega][a][b], sample mean
+        vector<double> S_err;                   ///< standard error of Re S, same layout
+        vector<std::complex<double>> S_static;  ///< [q][a][b], equal-time <A^a_q A^b_q*>
+        std::complex<double> at(size_t iq, size_t iw, int a, int b) const {
+            return S[((iq * omega.size() + iw) * 3 + a) * 3 + b];
+        }
+    };
+
+    /**
+     * Classical dynamical structure factor by thermal sampling and
+     * energy-conserving dynamics: the current spins are equilibrated with
+     * stochastic LLG at `temperature` (spherical_midpoint, alpha_sampling),
+     * then for each sample a deterministic trajectory (alpha = T = 0, the
+     * chosen method) of length t_max is recorded as A_q(t) =
+     * N^{-1/2} Σ_i e^{-i q·r_i} F_a S_i(t) and transformed (estimator and sum
+     * rule in dynamics/structure_factor.h). Lattice::spins ends in the last
+     * sampled state; damping settings are restored. spin_dim must be 3.
+     */
+    DSSFResult dynamical_structure_factor(const DSSFSettings& settings);
+
+    /** Reciprocal vectors b_i (a_i · b_j = 2π δ_ij) of the unit cell. */
+    array<Eigen::Vector3d, 3> reciprocal_vectors() const;
+
+    /** Write a DSSFResult to /dssf in an HDF5 file (overwrites the file). */
+    static void write_dssf(const DSSFResult& result, const string& file);
+
 private:
     /// Flat magnetisation series (grid.n x 3 x spin_dim) of a trajectory from x0.
     vector<double> record_magnetizations(ODEState x0, const TimeGrid& grid, const DriveSchedule& drive,

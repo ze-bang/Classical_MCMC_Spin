@@ -110,6 +110,19 @@ struct SpinConfig {
     // (dS/dt = S x B - (alpha/s) S x (S x B), default) or "gilbert" (the same
     // divided by 1 + alpha^2).
     string damping_form = "landau_lifshitz";
+    // Dynamical structure factor (Lattice, simulation_mode = molecular_dynamics):
+    // dssf_samples > 0 replaces the single trajectory per trial by S^{ab}(q, w)
+    // from dssf_samples thermal states at dssf_temperature (Langevin sampling with
+    // damping dssf_alpha), each evolved by md_integrator for md_time_end -
+    // md_time_start, sampled every md_save_interval * md_timestep; output
+    // sample_<trial>/dssf.h5 (see Lattice::dynamical_structure_factor).
+    size_t dssf_samples = 0;
+    vector<vector<double>> dssf_q_points;  // (h, k, l) in units of the reciprocal lattice vectors
+    double dssf_temperature = -1.0;        // < 0: use T_end
+    double dssf_t_equilibrate = 50.0;
+    double dssf_t_decorrelate = 10.0;
+    double dssf_alpha = 0.1;
+    bool dssf_hann_window = true;
     bool use_gpu = false;
 
     // ----------------------------------------------------------------

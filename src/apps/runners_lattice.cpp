@@ -392,11 +392,37 @@ void run_molecular_dynamics(Lattice& lattice, const SpinConfig& config, int rank
     }
     const bool gpu = select_gpu(config, rank);
     const Lattice::SpinConfig start = lattice.spins;
+    // Dynamical structure factor mode: S(q, w) from thermal samples instead of one trajectory.
+    Lattice::DSSFSettings dssf;
+    if (config.dssf_samples > 0) {
+        const auto b = lattice.reciprocal_vectors();
+        for (const auto& hkl : config.dssf_q_points)
+            dssf.q_points.push_back(hkl[0] * b[0] + hkl[1] * b[1] + hkl[2] * b[2]);
+        dssf.temperature = (config.dssf_temperature >= 0.0) ? config.dssf_temperature : config.T_end;
+        dssf.n_samples = config.dssf_samples;
+        dssf.t_equilibrate = config.dssf_t_equilibrate;
+        dssf.t_decorrelate = config.dssf_t_decorrelate;
+        dssf.alpha_sampling = config.dssf_alpha;
+        dssf.t_max = config.md_time_end - config.md_time_start;
+        dssf.dt = config.md_timestep;
+        dssf.save_every = config.md_save_interval;
+        dssf.method = config.md_integrator;
+        dssf.hann_window = config.dssf_hann_window;
+        if (rank == 0)
+            cout << "DSSF: " << dssf.q_points.size() << " q points, " << dssf.n_samples << " samples at T = "
+                 << dssf.temperature << ", t_max = " << dssf.t_max << endl;
+    }
     for_each_trial(config, rank, size, [&](int trial) {
         const string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
         prepare_trial_state(lattice, config, start, trial, rank, /*polish_seed=*/false);
         lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+        if (config.dssf_samples > 0) {
+            const Lattice::DSSFResult r = lattice.dynamical_structure_factor(dssf);
+            Lattice::write_dssf(r, trial_dir + "/dssf.h5");
+            cout << "[Rank " << rank << "] trial " << trial << " -> " << trial_dir << "/dssf.h5" << endl;
+            return;
+        }
         lattice.molecular_dynamics(config.md_time_start, config.md_time_end, config.md_timestep,
                                    trial_dir, config.md_save_interval, config.md_integrator,
                                    gpu, config.md_abs_tol, config.md_rel_tol);
