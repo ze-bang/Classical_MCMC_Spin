@@ -5,6 +5,7 @@
 #include <array>
 #include <vector>
 #include <map>
+#include <set>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -322,6 +323,13 @@ struct SpinConfig {
 
     bool has_param(const string& key) const {
         return hamiltonian_params.find(key) != hamiltonian_params.end();
+    }
+
+    // Keys given explicitly in the parsed file (typed fields included), so a caller can
+    // tell "absent, use the model default" from "set to the generic SpinConfig default".
+    std::set<string> explicit_keys;
+    bool was_set(const string& key) const {
+        return explicit_keys.count(key) > 0 || has_param(key);
     }
     
     // Set Hamiltonian parameter

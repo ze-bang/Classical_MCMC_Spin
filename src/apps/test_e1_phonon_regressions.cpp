@@ -57,6 +57,9 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <fstream>
+#include <cstdio>
+#include <vector>
 #include <set>
 #include <string>
 
@@ -125,8 +128,9 @@ double bond_energy_reference_local(
 //  Lattice setup helpers.
 // -------------------------------------------------------------------------
 
-PhononLattice make_lattice(size_t L) {
+PhononLattice make_lattice(size_t L, bool legacy_frame = false) {
     SpinConfig config;
+    if (legacy_frame) config.set_param("legacy_kitaev_frame", 1.0);
     config.set_param("J",      -0.10);
     config.set_param("K",      -9.00);
     config.set_param("Gamma",   1.80);
@@ -143,6 +147,7 @@ PhononLattice make_lattice(size_t L) {
     SpinPhononCouplingParams sp;
     sp.J = -0.10;  sp.K = -9.00;  sp.Gamma = 1.80;  sp.Gammap = 0.30;
     sp.J2_A = 0.30; sp.J2_B = 0.30; sp.J3 = 0.90; sp.J7 = 0.00;
+    sp.frame = legacy_frame ? classical_spin::kitaev::Frame::Legacy : classical_spin::kitaev::Frame::Crystal;
     sp.lambda_E1_J7_0 = 0.0;   // tests 2-5, 8 probe the quadratic bilinear channels only
     sp.lambda_E1_J_1 = sp.lambda_E1_K_1 = sp.lambda_E1_Gamma_1 = sp.lambda_E1_Gammap_1 = 0.0;
     sp.lambda_E1_J_0      = 0.13;   sp.lambda_E1_J_2      = -0.21;
@@ -192,8 +197,11 @@ bool test_form_factor_sum_rule(std::ostream& out) {
 }
 
 bool test_bond_energy_matches_reference(std::ostream& out) {
-    out << "[2] Per-bond magnetoelastic energy matches notes' channel expansion\n";
-    PhononLattice L = make_lattice(2);
+  // Both spin storage frames: the crystal frame (default) and the legacy R·cubic frame.
+  for (const bool legacy : {false, true}) {
+    out << "[2] Per-bond magnetoelastic energy matches notes' channel expansion ("
+        << (legacy ? "legacy" : "crystal") << " storage frame)\n";
+    PhononLattice L = make_lattice(2, legacy);
     deterministic_spins(L, 0.41);
 
     // Sweep a couple of nontrivial ε values
@@ -201,7 +209,11 @@ bool test_bond_energy_matches_reference(std::ostream& out) {
         {0.0, 0.0}, {0.13, 0.0}, {0.0, 0.21}, {0.17, -0.09}, {-0.22, 0.31}
     }};
 
-    const Eigen::Matrix3d R = SpinPhononCouplingParams::get_kitaev_rotation();
+    // S_storage = U S_local (U = Rᵀ crystal, R legacy) → S_local = Uᵀ S_storage
+    const Eigen::Matrix3d U = L.spin_phonon_params.storage_from_local();
+    const Eigen::Matrix3d U_expect = legacy ? Eigen::Matrix3d(SpinPhononCouplingParams::get_kitaev_rotation())
+                                            : Eigen::Matrix3d(SpinPhononCouplingParams::get_kitaev_rotation().transpose());
+    if ((U - U_expect).cwiseAbs().maxCoeff() > 1e-15) { out << "[FAIL] storage frame rotation\n"; return false; }
     double max_diff = 0.0;
 
     for (const auto& [qx, qy] : eps_list) {
@@ -213,11 +225,11 @@ bool test_bond_energy_matches_reference(std::ostream& out) {
         // Direct sum of per-bond reference energies (in local frame).
         double E_ref = 0.0;
         for (size_t i = 0; i < L.lattice_size; ++i) {
-            const Eigen::Vector3d Si_local = R.transpose() * L.spins[i];
+            const Eigen::Vector3d Si_local = U.transpose() * Eigen::Vector3d(L.spins[i]);
             for (size_t n = 0; n < L.nn_partners[i].size(); ++n) {
                 const size_t j = L.nn_partners[i][n];
                 if (j > i) {
-                    const Eigen::Vector3d Sj_local = R.transpose() * L.spins[j];
+                    const Eigen::Vector3d Sj_local = U.transpose() * Eigen::Vector3d(L.spins[j]);
                     const int g = L.nn_bond_types[i][n];
                     E_ref += bond_energy_reference_local(
                         Si_local, Sj_local, L.spin_phonon_params, qx, qy, g);
@@ -237,6 +249,7 @@ bool test_bond_energy_matches_reference(std::ostream& out) {
     }
     out << "    max |code − reference| = " << max_diff << "\n";
     out << "[PASS] per-bond energy formula\n\n";
+  }
     return true;
 }
 
@@ -1220,6 +1233,337 @@ bool test_projection_handedness(std::ostream& out) {
     return true;
 }
 
+
+// -------------------------------------------------------------------------
+//  [19]-[27] Audit 2026-10: spin frame, MC/energy consistency, robustness.
+// -------------------------------------------------------------------------
+
+/// Pure exchange lattice (no couplings to the lattice sector) for frame tests.
+PhononLattice make_exchange_lattice(size_t L, double J, double K, double G, double Gp, bool legacy,
+                                    double h = 0.0) {
+    SpinConfig config;
+    if (legacy) config.set_param("legacy_kitaev_frame", 1.0);
+    config.set_param("J", J); config.set_param("K", K);
+    config.set_param("Gamma", G); config.set_param("Gammap", Gp);
+    config.set_param("J2_A", 0.0); config.set_param("J2_B", 0.0); config.set_param("J3", 0.0);
+    config.field_strength = h;
+    config.field_direction = {0.0, 0.0, 1.0};          // c* in the crystal frame
+    UnitCell uc = build_phonon_honeycomb(config);
+    PhononLattice lattice(uc, L, L, 1, 1.0f);
+    SpinPhononCouplingParams sp;
+    sp.J = J; sp.K = K; sp.Gamma = G; sp.Gammap = Gp;
+    sp.J2_A = sp.J2_B = sp.J3 = 0.0; sp.J7 = 0.0;
+    sp.frame = legacy ? classical_spin::kitaev::Frame::Legacy : classical_spin::kitaev::Frame::Crystal;
+    PhononParams ph; ph.gamma_E1 = 0.0;
+    DriveParams dr;
+    lattice.set_parameters(sp, ph, dr);
+    lattice.set_field(Eigen::Vector3d(0.0, 0.0, h));
+    return lattice;
+}
+
+bool test_kitaev_frame_geometry(std::ostream& out) {
+    out << "[19] Spin frame: crystal storage frame has c* along z and Kitaev axes ⊥ their bonds;\n"
+        << "     legacy switch reproduces the old R J Rᵀ frame exactly\n";
+    namespace kb = classical_spin::kitaev;
+    const Eigen::Matrix3d R = kb::crystal_axes_in_cubic();
+    // (a) pure Γ: Σ_γ J_γ in the storage frame = diag(−1, −1, 2) (uniaxial about c* = z)
+    Eigen::Matrix3d sum = Eigen::Matrix3d::Zero(), sum_legacy = Eigen::Matrix3d::Zero();
+    for (int g = 0; g < 3; ++g) {
+        sum += kb::to_storage_frame(kb::make_J_local(g, 0, 0, 1.0, 0), kb::Frame::Crystal);
+        sum_legacy += kb::to_storage_frame(kb::make_J_local(g, 0, 0, 1.0, 0), kb::Frame::Legacy);
+    }
+    const Eigen::Matrix3d expect = Eigen::Vector3d(-1, -1, 2).asDiagonal();
+    out << "    pure-Γ bond sum (crystal) =\n" << sum << "\n";
+    if ((sum - expect).cwiseAbs().maxCoeff() > 1e-12) { out << "[FAIL] bond sum is not diag(-1,-1,2)\n"; return false; }
+    if ((sum_legacy - expect).cwiseAbs().maxCoeff() < 1e-3) { out << "[FAIL] legacy frame unexpectedly crystal\n"; return false; }
+    // (b) every lattice NN matrix equals the explicit old formula in legacy mode and Rᵀ J R by default
+    for (const bool legacy : {false, true}) {
+        PhononLattice L = make_exchange_lattice(3, 0.68, -7.89, 3.07, -2.94, legacy);
+        double worst = 0.0;
+        for (size_t i = 0; i < L.lattice_size; i += 2)        // A sites: A→B orientation
+            for (size_t n = 0; n < 3; ++n) {
+                const Eigen::Matrix3d Jl = kb::make_J_local(L.nn_bond_types[i][n], 0.68, -7.89, 3.07, -2.94);
+                const Eigen::Matrix3d ref = legacy ? Eigen::Matrix3d(R * Jl * R.transpose())
+                                                   : Eigen::Matrix3d(R.transpose() * Jl * R);
+                worst = std::max(worst, (L.nn_interaction[i][n] - ref).cwiseAbs().maxCoeff());
+            }
+        out << "    " << (legacy ? "legacy" : "crystal") << " NN matrices vs explicit formula: max |Δ| = " << worst << "\n";
+        if (worst > 1e-12) { out << "[FAIL] NN exchange frame\n"; return false; }
+        // (c) geometry: the Kitaev axis of a γ bond (cubic axis γ in storage coordinates) is
+        //     perpendicular to the bond, whose direction comes from the site positions.
+        if (!legacy) {
+            const Eigen::Matrix3d U = kb::storage_from_cubic(kb::Frame::Crystal);
+            double worst_dot = 0.0;
+            for (size_t n = 0; n < 3; ++n) {
+                const int g = L.nn_bond_types[0][n];
+                worst_dot = std::max(worst_dot, std::abs(U.col(g).dot(L.nn_bond_vec[0][n])));
+            }
+            out << "    max |(Kitaev axis γ)·(γ-bond direction)| = " << worst_dot << "\n";
+            if (worst_dot > 1e-12) { out << "[FAIL] Kitaev axes are not perpendicular to their bonds\n"; return false; }
+        }
+    }
+    out << "[PASS] crystal/legacy spin frames\n\n";
+    return true;
+}
+
+bool test_field_along_cstar(std::ostream& out) {
+    out << "[20] Field along a crystal axis: c* = storage z is the uniaxial axis of the NN model,\n"
+        << "     E_FM(n) = (N/2) nᵀ(Σ_γ J_γ)n − N h n_z with Σ J_γ = a·1 + 3(Γ+2Γ') ẑẑᵀ\n";
+    const double J = 0.68, K = -7.89, G = 3.07, Gp = -2.94, h = 0.37;
+    PhononLattice L = make_exchange_lattice(4, J, K, G, Gp, false, h);
+    const double N = double(L.lattice_size);
+    const double a = 3 * J + K - G - 2 * Gp;
+    auto E_fm = [&](const Eigen::Vector3d& n) { L.init_ferromagnetic(n); return L.total_energy(); };
+    double worst = 0.0;
+    for (const Eigen::Vector3d& n : {Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(0, 1, 0),
+                                    Eigen::Vector3d(0.6, -0.8, 0), Eigen::Vector3d(0.3, 0.4, 0.866),
+                                    Eigen::Vector3d(0, 0, 1)}) {
+        const Eigen::Vector3d u = n.normalized();
+        const double ref = 0.5 * N * (a + 3.0 * (G + 2.0 * Gp) * u(2) * u(2)) - N * h * u(2);
+        worst = std::max(worst, std::abs(E_fm(u) - ref) / N);
+    }
+    out << "    max |E_FM − analytic| / N = " << worst << "\n";
+    if (worst > 1e-10) { out << "[FAIL] FM energy is not uniaxial about c* (storage z)\n"; return false; }
+    // The legacy frame does not have c* along z: the same field couples to a different axis.
+    PhononLattice Lg = make_exchange_lattice(4, J, K, G, Gp, true, 0.0);
+    Lg.init_ferromagnetic(Eigen::Vector3d(1, 0, 0)); const double ex = Lg.total_energy();
+    Lg.init_ferromagnetic(Eigen::Vector3d(0, 1, 0)); const double ey = Lg.total_energy();
+    out << "    legacy frame: E_FM(x) − E_FM(y) = " << (ex - ey) / N << " per site (non-zero: not uniaxial about z)\n";
+    if (std::abs(ex - ey) / N < 1e-3) { out << "[FAIL] legacy frame unexpectedly uniaxial about z\n"; return false; }
+    // 'global' output = crystal components in both frames
+    Lg.init_ferromagnetic(classical_spin::kitaev::storage_from_cubic(classical_spin::kitaev::Frame::Legacy) *
+                          classical_spin::kitaev::crystal_axes_in_cubic().col(2));   // c* stored in the legacy frame
+    const Eigen::Vector3d Mg = Lg.magnetization_global();
+    out << "    legacy frame, spins along c*: M_global = " << Mg.transpose() << " (expected (0, 0, 1))\n";
+    if ((Mg - Eigen::Vector3d(0, 0, 1)).norm() > 1e-12) { out << "[FAIL] global output is not crystal-frame\n"; return false; }
+    out << "[PASS] field along c* and crystal-frame global outputs\n\n";
+    return true;
+}
+
+bool test_mc_increment_with_striction(std::ostream& out) {
+    out << "[21] MC increment with the spin–lattice striction on: site_energy_diff == ΔE_total,\n"
+        << "     overrelaxation conserves E, heat bath / Metropolis use the same local field\n";
+    PhononLattice L = make_lattice_full(4);
+    L.sld_g = 3.0; L.sld_v3 = 1.0e3; L.sld_relax = 0;
+    L.enable_sld(true);
+    deterministic_spins(L, 0.17);
+    L.phonons.Q_x_E1 = 0.02; L.phonons.Q_y_E1 = -0.01;
+    for (size_t i = 0; i < L.lattice_size; ++i)
+        L.u_site[i] = Eigen::Vector3d(1e-2 * std::sin(0.7 * i), 1e-2 * std::cos(0.3 * i), 0.0);
+    double worst = 0.0;
+    for (size_t s : {size_t(0), size_t(5), size_t(13), size_t(22)}) {
+        const Eigen::Vector3d old_spin = L.spins[s];
+        const Eigen::Vector3d new_spin = Eigen::Vector3d(std::cos(s + 0.1), std::sin(2.0 * s), 0.4).normalized();
+        const double E0 = L.total_energy();
+        const double dE = L.site_energy_diff(new_spin, old_spin, s);
+        L.spins[s] = new_spin; const double E1 = L.total_energy(); L.spins[s] = old_spin;
+        worst = std::max(worst, std::abs(dE - (E1 - E0)) / std::max(1.0, std::abs(E1 - E0)));
+    }
+    out << "    max rel |site_energy_diff − ΔE_total| = " << worst << "\n";
+    if (worst > 1e-10) { out << "[FAIL] MC increment misses a Hamiltonian term\n"; return false; }
+    const double E_before = L.total_energy();
+    L.overrelaxation();
+    const double E_after = L.total_energy();
+    out << "    overrelaxation: E/N " << E_before / L.lattice_size << " → " << E_after / L.lattice_size << "\n";
+    if (std::abs(E_after - E_before) > 1e-9 * std::abs(E_before)) { out << "[FAIL] overrelaxation changes E\n"; return false; }
+    out << "[PASS] MC increment / overrelaxation with striction\n\n";
+    return true;
+}
+
+bool test_set_parameters_rebuilds_exchange(std::ostream& out) {
+    out << "[22] set_parameters rebuilds the exchange from the coupling parameters and keeps the\n"
+        << "     extra modes and the quenched disorder; J2/J3 bonds exist with J2 = J3 = 0\n";
+    PhononLattice L = make_exchange_lattice(3, 0.0, -1.0, 0.0, 0.0, false);
+    if (L.j2_partners[0].size() != 6 || L.j3_partners[0].size() != 3) {
+        out << "[FAIL] J2/J3 bond lists missing when J2 = J3 = 0\n"; return false;
+    }
+    // extra mode + disorder survive a second set_parameters
+    LatticeMode a; a.irrep = LatticeMode::Irrep::A1; a.name = "A1"; a.omega = 2.0; a.aA1 = {0.1, 0, 0, 0, 0};
+    L.set_modes({a}, {});
+    L.plaquette_j7_offsets[2] = 0.3;
+    deterministic_spins(L, 0.9);
+    SpinPhononCouplingParams sp = L.spin_phonon_params;
+    sp.K = -2.0; sp.J7 = -0.1;
+    L.set_parameters(sp, L.phonon_params, L.drive_params);
+    if (L.modes.size() != 2 || std::abs(L.plaquette_j7_offsets[2] - 0.3) > 0) {
+        out << "[FAIL] set_parameters wiped modes or plaquette disorder\n"; return false;
+    }
+    // reference: build a fresh lattice with K = -2 and compare the exchange energy
+    PhononLattice R = make_exchange_lattice(3, 0.0, -2.0, 0.0, 0.0, false);
+    R.spins = L.spins;
+    double Ex_L = 0, Ex_R = 0;
+    for (size_t i = 0; i < L.lattice_size; ++i)
+        for (size_t n = 0; n < 3; ++n) {
+            Ex_L += Eigen::Vector3d(L.spins[i]).dot(L.nn_interaction[i][n] * Eigen::Vector3d(L.spins[L.nn_partners[i][n]]));
+            Ex_R += Eigen::Vector3d(R.spins[i]).dot(R.nn_interaction[i][n] * Eigen::Vector3d(R.spins[R.nn_partners[i][n]]));
+        }
+    out << "    NN exchange energy after set_parameters(K=-2): " << Ex_L << "  fresh K=-2 lattice: " << Ex_R << "\n";
+    if (std::abs(Ex_L - Ex_R) > 1e-10) { out << "[FAIL] set_parameters ignored the new exchange\n"; return false; }
+    out << "[PASS] set_parameters semantics\n\n";
+    return true;
+}
+
+bool test_file_validation(std::ostream& out) {
+    out << "[23] Spin-file loading rejects short / non-numeric / oversized files\n";
+    PhononLattice L = make_exchange_lattice(2, 0.0, -1.0, 0.0, 0.0, false);
+    const std::string f = "phonon_test_spins.txt";
+    auto expect_throw = [&](const std::string& content, const char* what) {
+        { std::ofstream o(f); o << content; }
+        try { L.load_spin_config(f); } catch (const std::runtime_error&) { return true; }
+        out << "[FAIL] accepted " << what << "\n";
+        return false;
+    };
+    std::string good;
+    for (size_t i = 0; i < L.lattice_size; ++i) good += "0 0 1\n";
+    bool ok = expect_throw("0 0 1\n0 1 0\n", "a short file")
+           && expect_throw(good + "1 0 0\n", "an oversized file")
+           && expect_throw("0 0 x\n" + good.substr(6), "a non-numeric entry")
+           && expect_throw("0 0 0\n" + good.substr(6), "a zero spin");
+    { std::ofstream o(f); o << "# comment\n" << good; }
+    try { L.load_spin_config(f); } catch (const std::exception& e) { out << "[FAIL] valid file rejected: " << e.what() << "\n"; ok = false; }
+    std::remove(f.c_str());
+    if (!ok) return false;
+    out << "[PASS] file validation\n\n";
+    return true;
+}
+
+bool test_w1_guard_and_extra_dof(std::ostream& out) {
+    out << "[24] W1 stationarity guard sees the lattice; replica-exchange hooks carry the lattice sector\n";
+    // FM state of a pure Heisenberg model is stationary for the spins, but a linear E1
+    // coupling at Q = 0 accelerates the lattice: the guard must not report 'stationary'.
+    PhononLattice L = make_exchange_lattice(3, -1.0, 0.0, 0.0, 0.0, false);
+    L.init_ferromagnetic(Eigen::Vector3d(0.3, 0.2, 0.9));
+    const double g0 = L.max_dSdt_norm_no_drive();
+    L.modes[0].cE[1] = 0.4;                         // linear K channel
+    L.modes[0].cE[2] = 0.3;                         // linear Γ channel
+    L.update_modulation_flags();
+    const double g1 = L.max_dSdt_norm_no_drive();
+    out << "    max |RHS| without coupling = " << g0 << ", with linear coupling at Q = 0 = " << g1 << "\n";
+    if (g0 > 1e-12 || g1 < 1e-3) { out << "[FAIL] W1 guard\n"; return false; }
+    // extra_dof round trip
+    L.phonons.Q_x_E1 = 0.1; L.phonons.V_y_E1 = -0.2;
+    std::vector<double> buf(L.extra_dof_size());
+    L.pack_extra_dof(buf.data());
+    PhononLattice M(L);
+    M.reset_lattice_sector();
+    M.unpack_extra_dof(buf.data());
+    if (M.phonons.Q_x_E1 != 0.1 || M.phonons.V_y_E1 != -0.2) { out << "[FAIL] extra dof round trip\n"; return false; }
+    out << "[PASS] W1 guard and extra dof\n\n";
+    return true;
+}
+
+bool test_time_dependent_scale(std::ostream& out) {
+    out << "[25] Time-dependent magnetoelastic scale: force, field and total_energy(t) use one s(t)\n";
+    PhononLattice L = make_lattice_full(4);
+    TimeDependentSpinPhononParams td;
+    td.mode = "window"; td.t_start_E1 = 1.0; td.t_end_E1 = 2.0; td.e1_coupling_scale_target = 0.37;
+    L.set_time_dependent_spin_phonon(td);
+    deterministic_spins(L, 0.61);
+    L.phonons.Q_x_E1 = 0.4; L.phonons.Q_y_E1 = -0.3;
+    const double t = 1.5, N = double(L.lattice_size);
+    PhononLattice::ODEState x = L.spins_to_state(), dx(x.size());
+    L.ode_system(x, dx, t);
+    const size_t off = 3 * L.lattice_size;
+    const double w2 = L.phonon_params.omega_E1 * L.phonon_params.omega_E1, l4 = L.phonon_params.lambda_E1_quartic;
+    const double Q2 = 0.4 * 0.4 + 0.3 * 0.3;
+    double worst = 0.0;
+    for (int comp = 0; comp < 2; ++comp) {
+        const double q0 = comp == 0 ? 0.4 : -0.3;
+        double& Q = comp == 0 ? L.phonons.Q_x_E1 : L.phonons.Q_y_E1;
+        const double F_ode = -(dx[off + 2 + comp] + w2 * q0 + l4 * Q2 * q0) * N;   // = ∂H_ME(t)/∂q
+        auto Eme = [&]() { return L.total_energy(t) - L.phonon_energy(); };
+        Q = q0 + kFDStep; const double Ep = Eme();
+        Q = q0 - kFDStep; const double Em = Eme();
+        Q = q0;
+        const double F_fd = (Ep - Em) / (2 * kFDStep);
+        out << "    comp " << comp << ": force from ode_system = " << F_ode << "  ∂E(t)/∂q (FD) = " << F_fd << "\n";
+        worst = std::max(worst, std::abs(F_ode - F_fd) / std::max(1.0, std::abs(F_fd)));
+    }
+    // spin field at t vs FD of total_energy(t)
+    const Eigen::Vector3d S0 = L.spins[5];
+    Eigen::Vector3d H_fd;
+    for (int a = 0; a < 3; ++a) {
+        Eigen::Vector3d d = Eigen::Vector3d::Zero(); d(a) = kFDStep;
+        L.spins[5] = S0 + d; const double Ep = L.total_energy(t);
+        L.spins[5] = S0 - d; const double Em = L.total_energy(t);
+        H_fd(a) = -(Ep - Em) / (2 * kFDStep);
+    }
+    L.spins[5] = S0;
+    const Eigen::Vector3d dS = Eigen::Vector3d(dx[15], dx[16], dx[17]);
+    const Eigen::Vector3d dS_fd = S0.cross(H_fd);                  // α = 0
+    out << "    spin 5: dS/dt ode = " << dS.transpose() << "   S × (−∂E(t)/∂S) = " << dS_fd.transpose() << "\n";
+    worst = std::max(worst, (dS - dS_fd).cwiseAbs().maxCoeff());
+    if (worst > 1e-6) { out << "[FAIL] time-dependent scale inconsistent (" << worst << ")\n"; return false; }
+    out << "[PASS] time-dependent scale\n\n";
+    return true;
+}
+
+bool test_integrator_validation(std::ostream& out) {
+    out << "[26] Unknown integration methods throw instead of silently switching to dopri5\n";
+    PhononLattice L = make_exchange_lattice(2, 0.0, -1.0, 0.0, 0.0, false);
+    try {
+        L.single_pulse_drive(0.0, 1.0, 0.1, 0.3, 1.0, 0.0, 0.1, 0.01, "dopri55");
+    } catch (const std::invalid_argument& e) {
+        out << "    threw: " << e.what() << "\n[PASS] integrator validation\n\n";
+        return true;
+    }
+    out << "[FAIL] unknown method accepted\n";
+    return false;
+}
+
+bool test_relax_phonons_soft_mode(std::ostream& out) {
+    out << "[27] Lattice relaxation near a soft mode (ω_eff² = 5 % of ω²): exact-Hessian Newton\n"
+        << "     converges in a few steps (the diagonal ω² iteration contracts only by 0.95 per step)\n";
+    PhononLattice L = make_lattice_full(4, true);
+    set_zigzag(L, Eigen::Vector3d(0.2, -0.6, 0.75));
+    const double w2 = L.phonon_params.omega_E1 * L.phonon_params.omega_E1, N = double(L.lattice_size);
+    // (1/N) ∂²H_ME/∂q_x² at Q = 0, from the analytic force
+    auto curvature = [&]() {
+        auto F = [&](double qx) { L.phonons.Q_x_E1 = qx; L.phonons.Q_y_E1 = 0; return L.dH_dQx_E1() / N; };
+        const double c = (F(1e-4) - F(-1e-4)) / 2e-4;
+        L.phonons = PhononState();
+        return c;
+    };
+    // An isotropic |Q|² coupling in the J channel (TA1_0 = identity on every bond) shifts the
+    // curvature linearly: choose it so that ω_eff² = ω² + c = 0.05 ω² along x.
+    const double c0 = curvature();
+    L.modes[0].aA1_sq[0] += 1.0; L.update_modulation_flags();
+    const double slope = curvature() - c0;
+    L.modes[0].aA1_sq[0] += (-0.95 * w2 - c0) / slope - 1.0; L.update_modulation_flags();
+    const double c = curvature();
+    out << "    ω² = " << w2 << ", (1/N)∂²H_ME/∂q_x² = " << c << " → ω_eff²/ω² = " << (w2 + c) / w2 << "\n";
+    if (std::abs((w2 + c) / w2 - 0.05) > 1e-3) { out << "[FAIL] soft-mode setup\n"; return false; }
+    const bool ok = L.relax_phonons(1e-10, 30, 1.0);
+    const std::vector<double> Fr = L.lattice_forces_raw();
+    const double qx = L.phonons.Q_x_E1, qy = L.phonons.Q_y_E1, l4 = L.phonon_params.lambda_E1_quartic;
+    const double rx = w2 * qx + l4 * (qx * qx + qy * qy) * qx + Fr[0] / N;
+    const double ry = w2 * qy + l4 * (qx * qx + qy * qy) * qy + Fr[1] / N;
+    out << "    converged within 30 Newton steps = " << ok << ", residual = (" << rx << ", " << ry << "), Q = ("
+        << qx << ", " << qy << ")\n";
+    if (!ok || std::hypot(rx, ry) > 1e-9) { out << "[FAIL] lattice relaxation near a soft mode\n"; return false; }
+    out << "[PASS] lattice relaxation\n\n";
+    return true;
+}
+
+
+bool test_exact_output_grid(std::ostream& out) {
+    out << "[28] Pulse-drive trajectories lie on the exact grid T_start + k·step (no stale chunk restarts)\n";
+    PhononLattice L = make_lattice_full(3);
+    deterministic_spins(L, 0.3);
+    const double T0 = 0.0, T1 = 1.0, step = 0.1;      // 0.1 is not representable: odeint's integrate_const
+    bool ok = true;                                 // end test used to drop or misplace samples
+    for (const char* method : {"rk4", "dopri5"}) {
+        PhononLattice M(L);
+        const auto traj = M.single_pulse_drive(0.2, 0.5, 1.0, 0.1, 12.41, T0, T1, step, method, true, 1e-10, 1e-10);
+        double worst = 0.0;
+        for (size_t k = 0; k < traj.size(); ++k) worst = std::max(worst, std::abs(traj[k].first - (T0 + double(k + 1) * step)));
+        out << "    " << method << ": " << traj.size() << " samples (expected 10), max |t_k − k·step| = " << worst << "\n";
+        if (traj.size() != 10 || worst > 1e-12) ok = false;
+    }
+    if (!ok) { out << "[FAIL] output grid\n"; return false; }
+    out << "[PASS] exact output grid\n\n";
+    return true;
+}
 }  // namespace
 
 int main() {
@@ -1244,6 +1588,16 @@ int main() {
     ok = test_multimode_lattice_sector(std::cout)        && ok;
     ok = test_sld_acoustic_sector(std::cout)             && ok;
     ok = test_projection_handedness(std::cout)           && ok;
+    ok = test_kitaev_frame_geometry(std::cout)           && ok;
+    ok = test_field_along_cstar(std::cout)               && ok;
+    ok = test_mc_increment_with_striction(std::cout)     && ok;
+    ok = test_set_parameters_rebuilds_exchange(std::cout) && ok;
+    ok = test_file_validation(std::cout)                 && ok;
+    ok = test_w1_guard_and_extra_dof(std::cout)          && ok;
+    ok = test_time_dependent_scale(std::cout)            && ok;
+    ok = test_integrator_validation(std::cout)           && ok;
+    ok = test_relax_phonons_soft_mode(std::cout)         && ok;
+    ok = test_exact_output_grid(std::cout)               && ok;
 
     if (!ok) {
         std::cout << "E1 phonon Hamiltonian regression FAILURES detected.\n";

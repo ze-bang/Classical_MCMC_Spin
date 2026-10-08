@@ -53,21 +53,18 @@ void run_2dcs_spectroscopy     (Lattice& lattice, const SpinConfig& config,
 
 // --- PhononLattice (spin + discrete phonon modes) -------------------------
 
-void build_lattice_modes(const SpinConfig& config, PhononLattice& lattice);
-void build_phonon_params(const SpinConfig& config,
-                         SpinPhononCouplingParams& sp_params,
-                         PhononParams& ph_params,
-                         DriveParams& dr_params,
-                         TimeDependentSpinPhononParams& td_sp_params);
+// Model construction (make_ncto_lattice, build_phonon_params, build_lattice_modes):
+// classical_spin/lattice/phonon_config.h.
 
+// Collective over `comm` (pass MPI_COMM_SELF for one sweep point per rank).
 void run_simulated_annealing_phonon (PhononLattice& lattice, const SpinConfig& config,
-                                     int rank, int size);
+                                     int rank, int size, MPI_Comm comm = MPI_COMM_WORLD);
 void run_molecular_dynamics_phonon  (PhononLattice& lattice, const SpinConfig& config,
-                                     int rank, int size);
+                                     int rank, int size, MPI_Comm comm = MPI_COMM_WORLD);
 void run_pump_probe_phonon          (PhononLattice& lattice, const SpinConfig& config,
-                                     int rank, int size);
+                                     int rank, int size, MPI_Comm comm = MPI_COMM_WORLD);
 void run_2dcs_phonon                (PhononLattice& lattice, const SpinConfig& config,
-                                     int rank, int size);
+                                     int rank, int size, MPI_Comm comm = MPI_COMM_WORLD);
 
 // --- MixedLattice (SU(2) + SU(3), TmFeO3) ---------------------------------
 

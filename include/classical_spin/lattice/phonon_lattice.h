@@ -41,15 +41,16 @@
  *
  * COORDINATE FRAMES
  * -----------------
- * The exchange matrix J^{(γ)} is defined in the LOCAL Kitaev frame and the
- * δX_γ(ε) modulation rides on those local-frame coefficients. Spins are stored
- * and evolved in the GLOBAL Cartesian frame; the spin–phonon coupling is
- * computed by first rotating the spins back to the local Kitaev frame, applying
- * the modulated J^{(γ)}, and rotating the resulting effective field back to the
- * global frame.
+ * The exchange matrices J^{(γ)} and the magnetoelastic tensor tables are defined
+ * in the cubic Kitaev frame and rotated once into the spin STORAGE frame, which by
+ * default is the crystal frame (a, b, c*) — the frame of the site positions, with
+ * c* along z (see kitaev_bonds.h; `legacy_kitaev_frame = 1` restores the pre-2026-10
+ * R·cubic frame exactly). Fields (field_direction), stored spins and M_local are in
+ * the storage frame; the "global" outputs (M_global, M_antiferro) are always crystal
+ * components.
  *
  * Equations of motion (Euler–Lagrange):
- *   - Spins:  dS/dt = S × H_eff  (LLG, optional Gilbert damping)
+ *   - Spins:  dS/dt = S × H_eff − (α/|S|) S × (S × H_eff)  (Landau–Lifshitz–Gilbert)
  *   - E1:     d²ε_a/dt² = -ω_E1² ε_a - λ_E1_quartic (ε_x²+ε_y²) ε_a
  *                          - γ_E1 dε_a/dt - ∂H_sp-ph/∂ε_a + Z* E_a(t)
  *             (a = x, y; uniform zone-center field).
@@ -83,16 +84,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <memory>
+#include <cstdlib>
 #include <mpi.h>
-#include <boost/numeric/odeint.hpp>
-
-// Include Boost uBLAS for implicit solvers (rosenbrock4, implicit_euler)
-#include <boost/numeric/ublas/vector.hpp>
-#include <boost/numeric/ublas/matrix.hpp>
-#include <boost/numeric/odeint/stepper/rosenbrock4.hpp>
-#include <boost/numeric/odeint/stepper/rosenbrock4_controller.hpp>
-#include <boost/numeric/odeint/stepper/rosenbrock4_dense_output.hpp>
-#include <boost/numeric/odeint/stepper/implicit_euler.hpp>
 
 #ifdef HDF5_ENABLED
 #include "classical_spin/io/hdf5_io.h"
@@ -240,8 +233,10 @@ struct PhononParams {
  *
  * Spin Hamiltonian: bond-dependent J–K–Γ–Γ' on the honeycomb nearest neighbours,
  * plus optional sublattice-dependent J2, J3, ring-exchange J7, and Zeeman field.
- * The exchange matrices are defined in the LOCAL Kitaev frame and rotated to the
- * GLOBAL Cartesian frame for spin storage:  J_global = R · J_local · Rᵀ.
+ * The exchange matrices are defined in the LOCAL (cubic) Kitaev frame and rotated
+ * into the spin storage frame `frame` (default: crystal a, b, c*):
+ * J_storage = U J_local Uᵀ with U = kitaev::storage_from_cubic(frame) — Rᵀ for the
+ * crystal frame, R for the legacy frame (see kitaev_bonds.h).
  *
  * E1 magnetoelastic coupling (in the LOCAL Kitaev frame):
  *   H_sp-ph = Σ_<ij>_γ Σ_X δX_γ(ε) O_{ij,γ}^{(X)},  X ∈ {J, K, Γ, Γ'}
@@ -307,23 +302,39 @@ struct SpinPhononCouplingParams {
     // it is odd in ε (no static rectification at first order) but it is FIRST order in the
     // phonon amplitude: the leading magnetoelastic term of a polar E1 mode of one D3 layer.
     // Forbidden only by the layer-exchanging C6 of the bilayer (layer-summed response).
-    // Defaults = the experimental operating point with a stipulated Grüneisen-type scale:
-    // δX/X common to all channels, λ_{X,1} = (X/K) λ_{K,1}, λ_{K,1} = 40 meV per unit Q, i.e.
-    // a 5 % modulation of every exchange at the physical amplitude |Q| ≈ 0.01 (γ_G ≈ 10 with a
-    // Co1–Co2 relative displacement of ~1 pm at 300 kV/cm).  Replace by DFT/Raman-anomaly values.
-    double lambda_E1_J_1      = -3.447;
-    double lambda_E1_K_1      = 40.0;
-    double lambda_E1_Gamma_1  = -15.56;
-    double lambda_E1_Gammap_1 = 14.91;
+    // OFF by default (as are all phonon couplings: the struct, the config defaults of
+    // build_phonon_params and the regression tests agree).  Operating-point estimate with a
+    // stipulated Grüneisen-type scale: δX/X common to all channels, λ_{X,1} = (X/K) λ_{K,1},
+    // λ_{K,1} = 40 meV per unit Q (a 5 % modulation of every exchange at |Q| ≈ 0.01, γ_G ≈ 10
+    // for a Co1–Co2 relative displacement of ~1 pm at 300 kV/cm), i.e.
+    //   lambda_E1_J_1 = -3.447, lambda_E1_K_1 = 40, lambda_E1_Gamma_1 = -15.56, lambda_E1_Gammap_1 = 14.91.
+    // Replace by DFT/Raman-anomaly values.
+    double lambda_E1_J_1      = 0.0;
+    double lambda_E1_K_1      = 0.0;
+    double lambda_E1_Gamma_1  = 0.0;
+    double lambda_E1_Gammap_1 = 0.0;
 
-    /// Kitaev local-to-global rotation matrix R.
+    /// Spin storage frame (crystal by default; Legacy reproduces the pre-2026-10 R·cubic frame).
+    classical_spin::kitaev::Frame frame = classical_spin::kitaev::Frame::Crystal;
+
+    /// R: crystal axes (a, b, c*) in cubic Kitaev coordinates (S_cubic = R S_crystal).
     static SpinMatrix get_kitaev_rotation() {
         return classical_spin::kitaev::kitaev_rotation();
     }
 
-    /// Transform local-frame exchange matrix to the global frame.
+    /// U with S_storage = U S_local for this parameter set's frame.
+    Eigen::Matrix3d storage_from_local() const {
+        return classical_spin::kitaev::storage_from_cubic(frame);
+    }
+
+    /// Local (cubic Kitaev) exchange matrix → crystal frame, Rᵀ J R.
     static SpinMatrix to_global_frame(const SpinMatrix& J_local) {
         return classical_spin::kitaev::to_global_frame(J_local);
+    }
+
+    /// Local (cubic Kitaev) exchange matrix → this parameter set's storage frame.
+    Eigen::Matrix3d to_storage_frame(const Eigen::Matrix3d& J_local) const {
+        return classical_spin::kitaev::to_storage_frame(J_local, frame);
     }
 
     // Bond-dependent exchange matrices in the LOCAL Kitaev frame.
@@ -337,10 +348,14 @@ struct SpinPhononCouplingParams {
         return classical_spin::kitaev::make_Jz_local(J, K, Gamma, Gammap);
     }
 
-    // Bond-dependent exchange matrices in the GLOBAL Cartesian frame.
-    SpinMatrix get_Jx() const { return to_global_frame(get_Jx_local()); }
-    SpinMatrix get_Jy() const { return to_global_frame(get_Jy_local()); }
-    SpinMatrix get_Jz() const { return to_global_frame(get_Jz_local()); }
+    // Bond-dependent exchange matrices in the spin storage frame.
+    SpinMatrix get_Jx() const { return to_storage_frame(get_Jx_local()); }
+    SpinMatrix get_Jy() const { return to_storage_frame(get_Jy_local()); }
+    SpinMatrix get_Jz() const { return to_storage_frame(get_Jz_local()); }
+    /// Storage-frame exchange of NN bond type γ ∈ {0, 1, 2}.
+    Eigen::Matrix3d nn_exchange(int bond_type) const {
+        return to_storage_frame(classical_spin::kitaev::make_J_local(bond_type, J, K, Gamma, Gammap));
+    }
 
     // J2 / J3 are isotropic Heisenberg → invariant under rotation.
     SpinMatrix get_J3_matrix()   const { return classical_spin::kitaev::heisenberg_matrix(J3);   }
@@ -349,18 +364,18 @@ struct SpinPhononCouplingParams {
 };
 
 /**
- * Time-dependent multiplicative scale on the E1 magnetoelastic coupling.
+ * Time-dependent multiplicative scale s(t) on the magnetoelastic coupling.
  *
- * Multiplies all eight quadratic E1 coupling coefficients (λ_{X,0}, λ_{X,2})
- * by a time-dependent factor s(t):
+ * s(t) multiplies the WHOLE magnetoelastic Hamiltonian H_ME(S, Q) of every lattice
+ * mode — all bond increments δM_γ(Q) (linear and quadratic, E/A1/A2), the ring
+ * modulation J7_eff(Q) − J7 and the J2/J3 modulations — consistently in the energy,
+ * the spin field and the lattice force (so the coupled dynamics conserves
+ * E(t) + ∫ ∂_t H dt):
  *   - mode == "constant" (default):  s(t) = 1
  *   - mode == "window"            :  s(t) = e1_coupling_scale_target for
  *                                    t_start_E1 ≤ t ≤ t_end_E1, else 1.
- *
- * The model in the LaTeX notes uses a constant coupling, so the default leaves
- * the physics unchanged. The window option is provided for protocol-style
- * pump–probe experiments where the magnetoelastic coupling is briefly
- * suppressed or enhanced by an external knob.
+ * Before 2026-10 the scale acted on the bilinear increments only and was ignored by
+ * every energy function.
  */
 struct TimeDependentSpinPhononParams {
     std::string mode = "constant";
@@ -369,12 +384,17 @@ struct TimeDependentSpinPhononParams {
     double t_end_E1   = 1e30;
     double e1_coupling_scale_target = 1.0;
 
-    /// Multiplicative scale applied to all 8 quadratic E1 coefficients at time t.
+    /// Multiplicative magnetoelastic scale at time t.
     double get_e1_coupling_scale(double t) const {
         if (mode == "window" && t >= t_start_E1 && t <= t_end_E1) {
             return e1_coupling_scale_target;
         }
         return 1.0;
+    }
+
+    /// True when s(t) ≡ 1 (time-translation invariant Hamiltonian).
+    bool is_constant() const {
+        return mode == "constant" || e1_coupling_scale_target == 1.0;
     }
 };
 
@@ -441,36 +461,53 @@ using PL_OptimizedTempGridResult   = mc::OptimizedTempGridResult;
  * PhononLattice: honeycomb lattice with E1 zone-center magnetoelastic coupling.
  *
  * Degrees of freedom:
- *   - N_spin = N_atoms · dim1 · dim2 · dim3 classical spins (spin_dim = 3)
- *   - 4 zone-center E1 phonon DOF: (Q_x, Q_y, V_x, V_y)
+ *   - N_spin = 2 · dim1 · dim2 · dim3 classical spins (spin_dim = 3)
+ *   - the zone-centre lattice sector: the primary E1 doublet (Q_x, Q_y, V_x, V_y),
+ *     optional extra modes (set_modes) and, with spin–lattice dynamics, the
+ *     in-plane site displacements and momenta.
  *
- * Total ODE state size: spin_dim · N_spin + 4.
+ * ODE state: [S_0 .. S_{N-1} (3 each), lattice sector (pack_lattice layout)].
+ *
+ * Kernel structure. Every term of H is linear in each individual spin (bond
+ * bilinears, the six-spin ring term — each product contains every hexagon spin
+ * once —, Zeeman, the magnetoelastic increments and the exchange striction; there
+ * is no single-ion term and self-bonds are rejected at construction), so
+ *     E(S_i') − E(S_i) = −(S_i' − S_i) · H_i,   H_i = −∂E/∂S_i
+ * exactly. One field kernel (exchange + magnetoelastic + further-neighbour + striction)
+ * and one hexagon kernel (ring energy, all six gradients and R_hex in one pass) serve
+ * the energy, the Monte Carlo increments, the heat bath, overrelaxation and the
+ * equations of motion, so these can no longer disagree. The coordinate-dependent
+ * couplings δM_γ(Q), the J2/J3 modulations and J7_eff(Q) are computed once per lattice
+ * configuration (Couplings) instead of once per site.
  */
 class PhononLattice {
 public:
     using SpinConfig = vector<SpinVector>;
     using ODEState = vector<double>;
-    
+    using Frame = classical_spin::kitaev::Frame;
+
     // Lattice properties
     static constexpr size_t spin_dim = 3;    // 3D classical spins
     size_t N_atoms;                          // Atoms per unit cell (from UnitCell)
     size_t dim1, dim2, dim3;                 // Lattice dimensions
     size_t lattice_size;                     // Total spin sites
     float spin_length = 1.0;                 // Spin magnitude
-    
+
     // Unit cell (stored for reference)
     UnitCell unit_cell;
-    
+
     // Spin configuration
     SpinConfig spins;
     vector<Eigen::Vector3d> site_positions;
-    
+
     // Phonon state (primary E1 mode)
     PhononState phonons;
 
     // Complete lattice sector: modes[0] mirrors the primary E1 mode (its
     // coordinates live in `phonons`), modes[1..] are extra E/A1/A2 modes or
     // frozen strains; anharmonic = cubic transfer terms between them.
+    // After changing a mode's couplings directly, call update_modulation_flags()
+    // (it also refreshes the cached couplings).
     vector<LatticeMode> modes;
     vector<AnharmonicTerm> anharmonic;
     bool has_further_modulation = false;
@@ -484,45 +521,54 @@ public:
     int n_j2_cls = 0, n_j3_cls = 0;
     struct Coords { std::vector<double> q1, q2; };
 
-    // NN interactions (stored per site to avoid double counting)
-    vector<vector<SpinMatrix>> nn_interaction;      // J1 matrices
-    vector<vector<size_t>> nn_partners;             // NN partner indices
-    vector<vector<int>> nn_bond_types;              // Bond type (0,1,2 for x,y,z bonds)
-    
-    // 2nd NN interactions (sublattice-dependent)
-    vector<vector<SpinMatrix>> j2_interaction;      // J2 matrices (J2_A or J2_B depending on sublattice)
-    vector<vector<size_t>> j2_partners;             // 2nd NN partner indices
-    
-    // 3rd NN interactions
-    vector<vector<SpinMatrix>> j3_interaction;      // J3 matrices  
-    vector<vector<size_t>> j3_partners;             // 3rd NN partner indices
-    
-    // Hexagonal plaquettes for ring exchange
-    // Each hexagon stores 6 site indices in order (i,j,k,l,m,n) going around the ring
+    // NN interactions (stored per site to avoid double counting). nn_interaction is
+    // the effective storage-frame exchange = (NN disorder scale) × clean + (channel
+    // disorder increment); it is rebuilt from the coupling parameters by
+    // set_parameters() and keeps the quenched disorder across rebuilds.
+    vector<vector<Eigen::Matrix3d>> nn_interaction;  // J1 matrices
+    vector<vector<size_t>> nn_partners;              // NN partner indices
+    vector<vector<int>> nn_bond_types;               // Bond type (0,1,2 for x,y,z bonds)
+
+    // 2nd / 3rd NN (isotropic Heisenberg) couplings. The geometric bond lists are
+    // always present — independent of the build-time J2/J3 values — so the SLD
+    // second-neighbour springs and the J2/J3 phonon modulations never silently vanish.
+    vector<vector<double>> j2_coupling;              // J2_A (sublattice 0) or J2_B (sublattice 1)
+    vector<vector<size_t>> j2_partners;              // 2nd NN partner indices
+    vector<vector<double>> j3_coupling;              // J3
+    vector<vector<size_t>> j3_partners;              // 3rd NN partner indices
+
+    // Hexagonal plaquettes for ring exchange (built once, in the constructor).
+    // Each hexagon stores 6 site indices in order going around the ring.
     vector<std::array<size_t, 6>> hexagons;
     // Optional static per-plaquette J7 offsets, used to model Na/stacking-induced
     // ring-exchange landscapes without adding direct spin pinning.
     vector<double> plaquette_j7_offsets;
     // For each site, list of hexagons it belongs to and its position (0-5) within each hexagon
     vector<vector<std::pair<size_t, size_t>>> site_hexagons;
-    
-    // External field
+
+    // External field (storage frame = crystal frame by default)
     vector<SpinVector> field;
-    
+
     // Parameters
     PhononParams phonon_params;
     SpinPhononCouplingParams spin_phonon_params;
     TimeDependentSpinPhononParams time_dep_spin_phonon_params;
     DriveParams drive_params;
-    
-    // LLG damping
+
+    // LLG damping (Landau–Lifshitz form, see spin_derivative)
     double alpha_gilbert = 0.0;
 
-    // Langevin thermostat (spins). When > 0 and integrate_langevin() is
-    // invoked, a per-step Gaussian noise field with σ = sqrt(2 α k_B T / (|S| dt))
-    // is added to H_eff at each spin during integration. Phonons are evolved
-    // deterministically (E1 phonon thermal noise neglected at this stage).
+    // Langevin thermostat. integrate_langevin() samples the Gibbs state at
+    // T = langevin_temperature: the spin noise ξ enters the precession AND the
+    // damping term (Stratonovich) with <ξ_a(t) ξ_b(t')> = 2D δ_ab δ(t−t'),
+    //     D = α T / (|S| (1 + α²))
+    // (García-Palacios & Lázaro, PRB 58, 14937 (1998); the variance 2αT/|S| used
+    // before 2026-10 heated the spins to T(1+α²)), and every damped lattice
+    // coordinate (E1 and extra modes, SLD momenta) receives the matching
+    // fluctuation–dissipation noise, so the coupled system is thermostatted.
     double langevin_temperature = 0.0;
+    /// Temperature of the noise on the zone-centre modes (< 0: follow the bath).
+    double phonon_langevin_T = -1.0;
 
     // Two-reservoir ("scenario 1") bath profile for integrate_langevin(): the spin bath
     // temperature is  T_b(t) = T0 + dT * Θ(t - t_step) (1 - e^{-(t-t_step)/tau_on}) e^{-(t-t_step)/tau_off}
@@ -533,9 +579,11 @@ public:
     //     P(ω) = P_classical(T) · F(ω,T),   F = x/(e^x − 1),  x = ħω/k_B T,
     // (no zero-point term), while the Gilbert damping stays Markovian.  For every harmonic mode the
     // steady state is then E_k = ħω_k n_B(ω_k): quantum thermal occupation without a quantum solver.
-    // The noise is generated in FFT blocks of langevin_block steps, overlap-added with sine windows
-    // (Σ w² = 1) so that the process is stationary; the block temperature is the bath temperature at
-    // the block centre.  langevin_quantum = false reproduces the classical white-noise thermostat.
+    // P_classical is the white level of the classical thermostat above (same D), so F → 1 recovers
+    // it exactly. The noise is generated in FFT blocks of langevin_block steps, overlap-added with
+    // sine windows (Σ w² = 1) so that the process is stationary; the block temperature is the bath
+    // temperature at the block centre.  langevin_quantum = false reproduces the classical white-noise
+    // thermostat.
     bool langevin_quantum = false;
     int langevin_block = 4096;
     // Finite-capacity, energy-conserving bath (two-temperature model built from the dynamics):
@@ -543,7 +591,8 @@ public:
     // dynamical variable, T_b(t+dt) = T_b(t) - [E_sys(t+dt) - E_sys(t) - W_drive]/(N C_l), i.e. every
     // unit of energy the system loses (phonon damping γ, Gilbert damping) heats the bath and every
     // unit the noise injects cools it; the E1 ring-down is then the deposit itself and no
-    // langevin_dT step is needed.  0 = infinite bath with the prescribed profile.
+    // langevin_dT step is needed.  W_drive is the work of the THz field on every polar mode.
+    // 0 = infinite bath with the prescribed profile.
     double langevin_bath_C = 0.0;
     double langevin_dT = 0.0;
     double langevin_t_step = 0.0;
@@ -556,12 +605,6 @@ public:
         if (langevin_tau_off > 0.0) f *= std::exp(-s / langevin_tau_off);
         return langevin_temperature + langevin_dT * f;
     }
-
-    // External "noise field" used by integrate_langevin(): one 3-vector per
-    // site, regenerated at every Langevin time step and added to H_eff in
-    // ode_system() when use_langevin_noise == true.
-    vector<Eigen::Vector3d> langevin_noise;
-    bool use_langevin_noise = false;
 
     // ---- Spin–lattice dynamics (SLD): in-plane site displacements u_i and momenta p_i ----
     // Harmonic NN (k) and 2nd-NN (k2) central springs; exchange striction δM_ij = g δr_ij M_ij with
@@ -579,6 +622,8 @@ public:
     vector<Eigen::Vector3d> u_site, p_site;
     vector<vector<Eigen::Vector3d>> nn_bond_vec, j2_bond_vec;   // unit vectors i→j per site per neighbour
     vector<vector<Eigen::Vector2d>> nn_bond_cq;                  // A→B direction of the bond in the doublet frame (cx, cy)
+    /// Switch spin–lattice dynamics on/off. Resets u and p, and (when on) schedules one static
+    /// relaxation of the displacements (sld_relax iterations) for the next integrate_langevin().
     void enable_sld(bool on);
     /// Static relaxation of the site displacements to the magnetostrictive equilibrium of the current
     /// spins (Jacobi iteration on the lattice forces; p = 0).  Returns the final max |F|.  Without this
@@ -598,49 +643,59 @@ public:
 
     // ODE state size
     size_t state_size;
-    
-    // Sublattice local frames for global-to-local spin transformations
-    // For Kitaev honeycomb, transforms from local Kitaev basis to global cubic frame
-    // sublattice_frames[atom] is a 3x3 rotation matrix: S_global = R * S_local
+
+    // Sublattice frames: sublattice_frames[atom] maps a stored spin to crystal (a, b, c*)
+    // components, S_crystal = F · S_storage ("global" outputs). Identity in the default
+    // crystal frame; set by set_parameters() from the coupling-parameter frame.
     vector<SpinMatrix> sublattice_frames;
-    vector<double> afm_sublattice_signs;   // AFM sublattice signs for Bertaut modes
-    
+    vector<double> afm_sublattice_signs;   // Néel signs (+1, −1) for the staggered magnetisation
+
     // Custom ordering vector (set from initial spin configuration)
     // Used to compute order parameter along the ground state ordering direction
     SpinConfig ordering_pattern;
     bool has_ordering_pattern = false;
-    
+
+    /// Local Monte Carlo kernel used by local_sweep() (and so by simulated_annealing).
+    enum class LocalUpdate { Metropolis, HeatBath };
+    LocalUpdate local_update = LocalUpdate::Metropolis;
+
+    /// Lattices with at least this many sites evaluate the RHS with OpenMP.
+    size_t parallel_min_sites = 1024;
+
     /**
      * Constructor: Build from a UnitCell (consistent with Lattice interface)
-     * 
+     *
+     * Validates the topology (two-site honeycomb basis, NN bond types 0..2,
+     * isotropic J2/J3, no bond that wraps onto its own site) and builds the
+     * hexagonal plaquettes. Throws std::invalid_argument otherwise.
+     *
      * @param uc        Unit cell defining lattice structure (positions, interactions, bond types)
-     * @param d1        Lattice size in first dimension
-     * @param d2        Lattice size in second dimension
+     * @param d1        Lattice size in first dimension (≥ 2)
+     * @param d2        Lattice size in second dimension (≥ 2)
      * @param d3        Lattice size in third dimension
      * @param spin_l    Magnitude of spin vectors
      */
     PhononLattice(const UnitCell& uc, size_t d1, size_t d2, size_t d3 = 1, float spin_l = 1.0);
-    
+
     // ============================================================
     // LATTICE CONSTRUCTION
     // ============================================================
-    
+
     /**
      * Flatten multi-index to linear site index
      */
     size_t flatten_index(size_t i, size_t j, size_t k, size_t atom) const {
         return ((i * dim2 + j) * dim3 + k) * N_atoms + atom;
     }
-    
+
     /**
-     * Periodic boundary condition
+     * Periodic boundary condition (Euclidean modulo: any offset, not only |offset| ≤ L)
      */
     int periodic_boundary(int coord, size_t dim_size) const {
-        if (coord < 0) return coord + dim_size;
-        if (coord >= (int)dim_size) return coord - dim_size;
-        return coord;
+        const int L = static_cast<int>(dim_size);
+        return ((coord % L) + L) % L;
     }
-    
+
     /**
      * Flatten with periodic boundaries
      */
@@ -652,41 +707,55 @@ public:
             atom
         );
     }
-    
+
     // ============================================================
     // PARAMETER SETTING
     // ============================================================
-    
+
     /**
-     * Set all parameters and rebuild interaction matrices
+     * Set the coupling, phonon and drive parameters.
+     *
+     * Rebuilds the NN exchange (J, K, Γ, Γ' rotated into sp_params.frame) and the
+     * isotropic J2_A/J2_B/J3 couplings from sp_params — the UnitCell supplies only the
+     * topology and bond types — and mirrors the legacy E1 parameters into modes[0].
+     * Quenched disorder (NN scales / channel increments, plaquette J7 offsets) and the
+     * extra lattice modes set by set_modes() are preserved, so this may be called
+     * repeatedly (e.g. in a J7 scan).
      */
     void set_parameters(const SpinPhononCouplingParams& sp_params,
                        const PhononParams& ph_params,
                        const DriveParams& dr_params);
-    
+
+    /// Spin storage frame of the exchange and magnetoelastic tensors.
+    Frame frame() const { return spin_phonon_params.frame; }
+
     /**
-     * Set time-dependent E1 magnetoelastic scale parameters.
+     * Set time-dependent magnetoelastic scale parameters.
      */
     void set_time_dependent_spin_phonon(const TimeDependentSpinPhononParams& td_params) {
+        if (td_params.mode != "constant" && td_params.mode != "window")
+            throw std::invalid_argument("TimeDependentSpinPhononParams.mode must be 'constant' or 'window', got '" +
+                                        td_params.mode + "'");
         time_dep_spin_phonon_params = td_params;
+        invalidate_couplings();
         if (td_params.mode != "constant") {
-            std::cout << "Time-dependent E1 magnetoelastic scaling enabled (mode: "
+            std::cout << "Time-dependent magnetoelastic scaling enabled (mode: "
                       << td_params.mode << ")" << std::endl;
             if (td_params.mode == "window") {
-                std::cout << "  E1 scale = " << td_params.e1_coupling_scale_target
+                std::cout << "  H_ME scale = " << td_params.e1_coupling_scale_target
                           << " for t∈[" << td_params.t_start_E1
                           << ", " << td_params.t_end_E1 << "]" << std::endl;
             }
         }
     }
 
-    /// Multiplicative scale on the 8 quadratic E1 coefficients at time t.
+    /// Multiplicative magnetoelastic scale s(t) (see TimeDependentSpinPhononParams).
     double get_e1_coupling_scale(double t) const {
         return time_dep_spin_phonon_params.get_e1_coupling_scale(t);
     }
-    
+
     /**
-     * Set external magnetic field (uniform)
+     * Set external magnetic field (uniform, storage frame = crystal frame by default)
      */
     void set_field(const Eigen::Vector3d& B) {
         for (size_t i = 0; i < lattice_size; ++i) {
@@ -700,40 +769,7 @@ public:
      * Format: plaquette_index dJ7, with optional '#' comments. The offsets are
      * static in time and added to the uniform/pump-dependent J7 on each hexagon.
      */
-    void apply_plaquette_j7_disorder_from_file(const string& filename) {
-        if (filename.empty()) return;
-        ifstream in(filename);
-        if (!in) {
-            throw std::runtime_error("Cannot open plaquette J7 disorder file: " + filename);
-        }
-        if (plaquette_j7_offsets.size() != hexagons.size()) {
-            plaquette_j7_offsets.assign(hexagons.size(), 0.0);
-        }
-
-        string line;
-        size_t line_no = 0;
-        size_t n_loaded = 0;
-        while (std::getline(in, line)) {
-            ++line_no;
-            const size_t hash = line.find('#');
-            if (hash != string::npos) line = line.substr(0, hash);
-            std::istringstream iss(line);
-            size_t plaquette;
-            double dJ7;
-            if (!(iss >> plaquette >> dJ7)) {
-                continue;
-            }
-            if (plaquette >= plaquette_j7_offsets.size()) {
-                throw std::runtime_error(
-                    "Plaquette J7 disorder index out of range at line " +
-                    std::to_string(line_no) + " in " + filename);
-            }
-            plaquette_j7_offsets[plaquette] += dJ7;
-            ++n_loaded;
-        }
-        std::cout << "Applied " << n_loaded << " plaquette J7 disorder offsets from "
-                  << filename << std::endl;
-    }
+    void apply_plaquette_j7_disorder_from_file(const string& filename);
 
     /**
      * Add site-resolved pinning fields from a text file.
@@ -741,273 +777,123 @@ public:
      * Format: site Bx By Bz, with optional '#' comments.  The fields are added
      * on top of the current uniform field, so call set_field() first.
      */
-    void add_pinning_fields_from_file(const string& filename) {
-        if (filename.empty()) return;
-        ifstream in(filename);
-        if (!in) {
-            throw std::runtime_error("Cannot open pinning field file: " + filename);
-        }
-
-        string line;
-        size_t line_no = 0;
-        size_t n_loaded = 0;
-        while (std::getline(in, line)) {
-            ++line_no;
-            const size_t hash = line.find('#');
-            if (hash != string::npos) line = line.substr(0, hash);
-            std::istringstream iss(line);
-            size_t site;
-            double bx, by, bz;
-            if (!(iss >> site >> bx >> by >> bz)) {
-                continue;
-            }
-            if (site >= lattice_size) {
-                throw std::runtime_error(
-                    "Pinning field site index out of range at line " +
-                    std::to_string(line_no) + " in " + filename);
-            }
-            field[site](0) += bx;
-            field[site](1) += by;
-            field[site](2) += bz;
-            ++n_loaded;
-        }
-        cout << "Loaded " << n_loaded << " site-resolved pinning fields from "
-             << filename << endl;
-    }
+    void add_pinning_fields_from_file(const string& filename);
 
     /**
      * Apply quenched nearest-neighbour exchange disorder from a text file.
      *
      * Format: site partner scale, with optional '#' comments.  Each row should
-     * refer to one unique NN bond.  The full 3x3 exchange matrix on that bond is
-     * multiplied by scale and the reverse directed entry is updated by the same
-     * transpose convention.  This perturbs the Hamiltonian without templating a
-     * spin direction.
+     * refer to one unique NN bond.  The clean 3x3 exchange matrix on that bond is
+     * multiplied by scale (both directed entries, transpose convention).  This
+     * perturbs the Hamiltonian without templating a spin direction. Scales are
+     * stored and survive set_parameters().
      */
-    void apply_nn_exchange_disorder_from_file(const string& filename) {
-        if (filename.empty()) return;
-        ifstream in(filename);
-        if (!in) {
-            throw std::runtime_error("Cannot open NN exchange disorder file: " + filename);
-        }
-
-        auto find_neighbor_index = [&](size_t site, size_t partner) -> size_t {
-            for (size_t n = 0; n < nn_partners[site].size(); ++n) {
-                if (nn_partners[site][n] == partner) {
-                    return n;
-                }
-            }
-            throw std::runtime_error(
-                "NN exchange disorder references non-NN bond " +
-                std::to_string(site) + " " + std::to_string(partner) +
-                " in " + filename);
-        };
-
-        string line;
-        size_t line_no = 0;
-        size_t n_loaded = 0;
-        while (std::getline(in, line)) {
-            ++line_no;
-            const size_t hash = line.find('#');
-            if (hash != string::npos) line = line.substr(0, hash);
-            std::istringstream iss(line);
-            size_t site, partner;
-            double scale;
-            if (!(iss >> site >> partner >> scale)) {
-                continue;
-            }
-            if (site >= lattice_size || partner >= lattice_size) {
-                throw std::runtime_error(
-                    "NN exchange disorder site index out of range at line " +
-                    std::to_string(line_no) + " in " + filename);
-            }
-            if (!(scale > 0.0)) {
-                throw std::runtime_error(
-                    "NN exchange disorder scale must be positive at line " +
-                    std::to_string(line_no) + " in " + filename);
-            }
-
-            const size_t n_forward = find_neighbor_index(site, partner);
-            const size_t n_reverse = find_neighbor_index(partner, site);
-            nn_interaction[site][n_forward] *= scale;
-            nn_interaction[partner][n_reverse] *= scale;
-            ++n_loaded;
-        }
-        cout << "Applied " << n_loaded << " NN exchange disorder bond scalings from "
-             << filename << endl;
-    }
+    void apply_nn_exchange_disorder_from_file(const string& filename);
 
     /**
      * Apply additive, channel-resolved quenched NN exchange disorder.
      *
      * Format: site partner dJ dK dGamma dGammap, with optional '#' comments.
      * The increments are interpreted in the local Kitaev channel basis for the
-     * corresponding NN bond type, transformed to the global frame used by
-     * PhononLattice, and added to the stored exchange matrix.  This allows
-     * physically sharper tests such as K-only or Γ-only bond disorder without
-     * applying a spin-direction pinning field.
+     * corresponding NN bond type, transformed to the spin storage frame, and added
+     * to the stored exchange matrix (after the NN scale, independent of the order in
+     * which the two disorder files are applied).  This allows physically sharper tests
+     * such as K-only or Γ-only bond disorder without applying a spin-direction pinning
+     * field. Increments are stored and survive set_parameters().
      */
-    void apply_nn_exchange_channel_disorder_from_file(const string& filename) {
-        if (filename.empty()) return;
-        ifstream in(filename);
-        if (!in) {
-            throw std::runtime_error("Cannot open NN exchange channel disorder file: " + filename);
-        }
+    void apply_nn_exchange_channel_disorder_from_file(const string& filename);
 
-        auto find_neighbor_index = [&](size_t site, size_t partner) -> size_t {
-            for (size_t n = 0; n < nn_partners[site].size(); ++n) {
-                if (nn_partners[site][n] == partner) {
-                    return n;
-                }
-            }
-            throw std::runtime_error(
-                "NN exchange channel disorder references non-NN bond " +
-                std::to_string(site) + " " + std::to_string(partner) +
-                " in " + filename);
-        };
-
-        auto channel_matrix = [](int bond_type, double dJ, double dK,
-                                 double dGamma, double dGammap) -> SpinMatrix {
-            SpinPhononCouplingParams delta_params;
-            delta_params.J = dJ;
-            delta_params.K = dK;
-            delta_params.Gamma = dGamma;
-            delta_params.Gammap = dGammap;
-
-            SpinMatrix local = SpinMatrix::Zero(3, 3);
-            if (bond_type == 0) {
-                local = delta_params.get_Jx_local();
-            } else if (bond_type == 1) {
-                local = delta_params.get_Jy_local();
-            } else if (bond_type == 2) {
-                local = delta_params.get_Jz_local();
-            } else {
-                throw std::runtime_error("Invalid NN bond type in channel disorder");
-            }
-            return SpinPhononCouplingParams::to_global_frame(local);
-        };
-
-        string line;
-        size_t line_no = 0;
-        size_t n_loaded = 0;
-        while (std::getline(in, line)) {
-            ++line_no;
-            const size_t hash = line.find('#');
-            if (hash != string::npos) line = line.substr(0, hash);
-            std::istringstream iss(line);
-            size_t site, partner;
-            double dJ, dK, dGamma, dGammap;
-            if (!(iss >> site >> partner >> dJ >> dK >> dGamma >> dGammap)) {
-                continue;
-            }
-            if (site >= lattice_size || partner >= lattice_size) {
-                throw std::runtime_error(
-                    "NN exchange channel disorder site index out of range at line " +
-                    std::to_string(line_no) + " in " + filename);
-            }
-
-            const size_t n_forward = find_neighbor_index(site, partner);
-            const size_t n_reverse = find_neighbor_index(partner, site);
-            const int bond_type = nn_bond_types[site][n_forward];
-            const SpinMatrix dM = channel_matrix(bond_type, dJ, dK, dGamma, dGammap);
-            nn_interaction[site][n_forward] += dM;
-            nn_interaction[partner][n_reverse] += dM.transpose();
-            ++n_loaded;
-        }
-        cout << "Applied " << n_loaded << " NN exchange channel disorder increments from "
-             << filename << endl;
-    }
-    
     /**
      * Set external field for a specific site (consistent with Lattice)
      */
     void set_uniform_field(const Eigen::Vector3d& B) {
         set_field(B);
     }
-    
+
     // ============================================================
     // INITIALIZATION
     // ============================================================
-    
+
     /**
-     * Generate random spin on 2-sphere
+     * Generate random spin uniformly on the 2-sphere
      */
     SpinVector gen_random_spin() {
         return gen_random_spin(spin_length);
     }
-    
+
     /**
-     * Generate random spin on 2-sphere with specified magnitude
+     * Generate random spin uniformly on the 2-sphere with specified magnitude
      */
     SpinVector gen_random_spin(float spin_l) {
-        SpinVector spin(3);
-        double z = uniform_dist(rng) * 2.0 - 1.0;
-        double phi = uniform_dist(rng) * 2.0 * M_PI;
-        double r = std::sqrt(1.0 - z*z);
-        spin(0) = r * std::cos(phi);
-        spin(1) = r * std::sin(phi);
-        spin(2) = z;
-        return spin * spin_l;
+        return SpinVector(random_unit_vector() * double(spin_l));
     }
-    
+
     /**
-     * Gaussian move around current spin (small-angle perturbation)
+     * Symmetric small-angle move around the current spin: S + σ û (û uniform on S²),
+     * renormalised. The proposal density depends only on the angle to S, so it is
+     * symmetric and needs no Hastings factor.
      */
     SpinVector gaussian_spin_move(const SpinVector& current_spin, double sigma) {
-        SpinVector perturbation = gen_random_spin(1.0) * sigma;
-        SpinVector new_spin = current_spin + perturbation;
-        double norm = new_spin.norm();
-        if (norm < 1e-10) return current_spin;
-        return new_spin * (spin_length / norm);
+        return SpinVector(gaussian_move3(Eigen::Vector3d(current_spin), sigma));
     }
-    
+
     /**
-     * Initialize random spins
+     * Initialize random spins (and reset the lattice sector, see reset_lattice_sector)
      */
     void init_random() {
         for (size_t i = 0; i < lattice_size; ++i) {
-            spins[i] = gen_random_spin();
+            spins[i] = random_unit_vector() * double(spin_length);
         }
-        phonons = PhononState();
+        reset_lattice_sector();
     }
-    
+
     /**
      * Initialize ferromagnetic state
      */
     void init_ferromagnetic(const Eigen::Vector3d& direction) {
+        if (!(direction.norm() > 0.0))
+            throw std::invalid_argument("init_ferromagnetic: direction must be non-zero");
         Eigen::Vector3d dir = direction.normalized() * spin_length;
         for (size_t i = 0; i < lattice_size; ++i) {
             spins[i] = dir;
         }
-        phonons = PhononState();
+        reset_lattice_sector();
     }
-    
+
     /**
      * Initialize Néel state (antiferromagnetic on sublattices)
      */
     void init_neel(const Eigen::Vector3d& direction) {
+        if (!(direction.norm() > 0.0))
+            throw std::invalid_argument("init_neel: direction must be non-zero");
         Eigen::Vector3d dir = direction.normalized() * spin_length;
         for (size_t i = 0; i < lattice_size; ++i) {
-            double sign = (i % N_atoms == 0) ? 1.0 : -1.0;
-            spins[i] = sign * dir;
+            spins[i] = afm_sublattice_signs[i % N_atoms] * dir;
         }
-        phonons = PhononState();
+        reset_lattice_sector();
     }
-    
+
+    /**
+     * Zero every non-frozen lattice coordinate and velocity (primary E1 doublet, extra
+     * modes) and the SLD displacements/momenta, so that successive trials start from
+     * the same undisplaced lattice. Frozen strains keep their prescribed values.
+     */
+    void reset_lattice_sector();
+
     /**
      * Set a specific spin (consistent with Lattice)
      */
     void set_spin(size_t site_index, const SpinVector& spin_in) {
         spins[site_index] = spin_in;
     }
-    
+
     /**
      * Get a specific spin (consistent with Lattice)
      */
     const SpinVector& get_spin(size_t site_index) const {
         return spins[site_index];
     }
-    
+
     /**
      * Print lattice info (consistent with Lattice)
      */
@@ -1016,46 +902,49 @@ public:
              << ", N_atoms=" << N_atoms << ", lattice_size=" << lattice_size
              << ", spin_dim=" << spin_dim << ", spin_length=" << spin_length << endl;
     }
-    
+
+    /**
+     * Reseed the private Monte Carlo / noise engine from (master, stream) through
+     * splitmix64, e.g. set_seed(config.seed, rank) for independent per-rank chains.
+     */
+    void set_seed(uint64_t master, uint64_t stream) {
+        rng.seed(static_cast<std::mt19937::result_type>(
+            splitmix64(master ^ splitmix64(stream + 0x50484F4E4C415454ULL))));
+    }
+
     // ============================================================
     // ENERGY CALCULATIONS
     // ============================================================
-    
+
     /**
-     * Compute local energy contribution for a hypothetical spin at @a site.
-     *
-     * Includes Zeeman, full nearest-neighbour bond energies (with the E1
-     * quadratic exchange modulation δX_γ(ε) folded into the local-frame
-     * exchange matrix), and 2nd / 3rd NN couplings. Ring exchange is NOT
-     * included here; for the correctly counted total energy use
-     * total_energy().
-     *
-     * Implemented out-of-line so we can reuse the namespaced E1 helpers.
+     * Energy of every term that involves the spin at @a site, evaluated with
+     * @a spin_here in place of the stored spin: Zeeman, NN exchange with the
+     * magnetoelastic increments, J2/J3 with their modulations, the exchange
+     * striction and the six-spin ring term of the site's three hexagons
+     * (−spin_here · H_site, exact because H is linear in each spin).
      */
     double site_energy(const Eigen::Vector3d& spin_here, size_t site) const;
-    
+
     /**
-     * Compute energy difference for a proposed spin flip (optimized for Metropolis)
-     * dE = E(new_spin) - E(old_spin)
-     * 
-     * Includes:
-     * - Zeeman energy change
-     * - NN, 2nd NN, 3rd NN spin-spin interaction changes
-     * - Spin-phonon coupling energy change (if phonons are non-zero)
-     * - Ring exchange energy change
+     * Exact energy difference for replacing the spin at @a site:
+     *   dE = E(new_spin) − E(old_spin) = −(new_spin − old_spin) · H_site,
+     * with H_site = −∂E/∂S_site the full local field (every term of H is linear in
+     * each individual spin). Includes every Hamiltonian term — Zeeman, exchange,
+     * magnetoelastic increments, further-neighbour modulations, ring exchange and the
+     * SLD exchange striction.
      */
-    double site_energy_diff(const Eigen::Vector3d& new_spin, 
-                           const Eigen::Vector3d& old_spin, 
+    double site_energy_diff(const Eigen::Vector3d& new_spin,
+                           const Eigen::Vector3d& old_spin,
                            size_t site) const;
-    
+
     /**
      * Pure spin energy (NN + 2nd NN + 3rd NN + Zeeman + ring exchange)
      */
     double spin_energy() const;
-    
+
     /**
      * Six-spin ring exchange energy on hexagonal plaquettes
-     * 
+     *
      * H_7 = (J_7/6) Σ_{hex} [2(S_i·S_j)(S_k·S_l)(S_m·S_n)
      *                       -6(S_i·S_k)(S_j·S_l)(S_m·S_n)
      *                       +3(S_i·S_l)(S_j·S_k)(S_m·S_n)
@@ -1064,47 +953,52 @@ public:
      *                       + cyclic permutations of (i,j,k,l,m,n)]
      */
     double ring_exchange_energy() const;
-    /// Ring-exchange operator R_7, defined by H_7 = J7_eff * R_7.
+    /// Ring-exchange operator R_7 = Σ_hex R_hex, defined by H_7 = J7_eff * R_7 (no plaquette offsets).
     double ring_exchange_normalized() const;
-    
+
     /**
-     * E1 phonon energy (kinetic + harmonic potential + optional quartic):
-     *   E_ph = (1/2)(V_x² + V_y²)
-     *        + (1/2) ω_E1² (ε_x² + ε_y²)
-     *        + (λ_E1_quartic / 4) (ε_x² + ε_y²)².
+     * Lattice-sector energy of every mode (kinetic + harmonic + quartic), extensive:
+     *   E_ph = N Σ_m [ (1/2)|V_m|² + (1/2) ω_m² |Q_m|² + (λ4_m / 4) |Q_m|⁴ ].
      */
     double phonon_energy() const;
 
     /**
-     * E1 magnetoelastic coupling energy (quadratic in ε):
-     *   H_sp-ph = Σ_<ij>γ Σ_X δX_γ(ε) O_{ij,γ}^{(X)}, X ∈ {J, K, Γ, Γ'}.
+     * Magnetoelastic coupling energy Σ_γ ⟨δM_γ(Q), C_γ⟩ + further-neighbour modulations
+     * (the ring modulation J7_eff(Q) − J7 is part of ring_exchange_energy()).
      */
     double spin_phonon_energy() const;
-    
+
     /**
-     * Total energy
+     * Total energy at coupling scale s = 1 (the Hamiltonian for a constant schedule)
      */
     double total_energy() const {
         return spin_energy() + phonon_energy() + spin_phonon_energy() + anharmonic_energy() + sld_energy();
     }
+
+    /**
+     * Total energy of the Hamiltonian at time t, i.e. with the magnetoelastic scale
+     * s(t) of time_dep_spin_phonon_params (identical to total_energy() for a constant
+     * schedule). The drive term −N Z* E(t)·Q is not included (it is external work).
+     */
+    double total_energy(double t) const;
 
     /// Extensivity factor of the zone-centre phonon sector: N_sites when the
     /// back-action is normalised per site (physical), 1 in the legacy mode.
     double phonon_norm() const {
         return phonon_params.per_site_backaction ? double(lattice_size) : 1.0;
     }
-    
+
     /**
      * Energy per site
      */
     double energy_density() const {
         return total_energy() / lattice_size;
     }
-    
+
     // ============================================================
     // DERIVATIVES FOR EQUATIONS OF MOTION
     // ============================================================
-    
+
     /// ∂H_sp-ph/∂ε_x for the zone-center E1 coordinate.
     double dH_dQx_E1() const;
     /// ∂H_sp-ph/∂ε_y for the zone-center E1 coordinate.
@@ -1125,7 +1019,7 @@ public:
     double further_bond_modulation(const Coords& c, double c2, double s2, int which, int sub) const;
     double further_bond_modulation_deriv(const Coords& c, double c2, double s2, int which, int sub, size_t m, int comp) const;
     double further_neighbour_modulation_energy(const Coords& c) const;
-    /// Effective ring exchange J7 + Σ_E λ_J7|Q|² + Σ_A1 λ_J7 Q (+ frozen strains).
+    /// Effective ring exchange J7 + Σ_E λ_J7|Q|² + Σ_A1 λ_J7 Q (+ frozen strains), at scale 1.
     double effective_J7(const Coords& c) const;
     double effective_J7() const;
     double effective_J7_for_hexagon(size_t hex_idx, double J7eff) const {
@@ -1146,29 +1040,46 @@ public:
     void rebuild_primary_mode();
     void update_modulation_flags();
     void set_modes(const std::vector<LatticeMode>& extra, const std::vector<AnharmonicTerm>& anh);
-    
+
+    /**
+     * Every magnetoelastic quantity that depends only on the lattice coordinates and the
+     * coupling scale s: the storage-frame bond increments δM_γ (and transposes, for the
+     * B end of a bond), the J2/J3 modulations per (sublattice, bond class) and J7_eff.
+     */
+    struct Couplings {
+        Eigen::Matrix3d dM[3], dMT[3];
+        double dJ2[2][3] = {{0, 0, 0}, {0, 0, 0}};
+        double dJ3[3] = {0, 0, 0};
+        double J7eff = 0.0;
+        bool ring_active = false;     ///< any hexagon has a non-zero J7
+    };
+    void compute_couplings(const Coords& c, double scale, Couplings& out) const;
+    /// Couplings of the committed lattice coordinates at s = 1 (cached; refreshed when the
+    /// coordinates change or after set_parameters / set_modes / update_modulation_flags).
+    const Couplings& couplings() const;
+    void invalidate_couplings() const { ++coupling_epoch_; }
+
     /**
      * Compute ring exchange contribution to effective field on spin at given site
-     * 
+     *
      * H_eff_ring = -∂H_7/∂S_site
-     * 
-     * For each hexagon containing the site, computes the derivative of the
-     * ring exchange term with respect to that spin.
      */
     SpinVector get_ring_exchange_field(size_t site) const;
     SpinVector get_ring_exchange_field(size_t site, double J7eff) const;
-    
+
     /**
      * Compute effective field on spin i (for spin EOM)
-     * 
+     *
      * H_eff = -∂H/∂Si = B + Σ_j [NN contributions] + [spin-phonon contributions] + [ring exchange]
      */
     SpinVector get_local_field(size_t site) const;
-    
+    /// Same as get_local_field(), fixed-size result (hot paths).
+    Eigen::Vector3d local_field(size_t site) const;
+
     // ============================================================
     // EQUATIONS OF MOTION
     // ============================================================
-    
+
     /**
      * E1 phonon EOM derivatives (zone-center, IR-driven):
      *   dε_x/dt = V_x
@@ -1185,24 +1096,26 @@ public:
     void phonon_derivatives(const PhononState& ph, double t,
                            double dHsp_dQx, double dHsp_dQy,
                            PhononState& dph_dt) const;
-    
+
     /**
-     * Full ODE system for coupled spin-phonon dynamics
-     * State: [S0_x, S0_y, S0_z, ..., SN_z, Qx, Qy, Q_R, Vx, Vy, V_R]
+     * Full ODE system for the coupled spin–lattice dynamics, a pure function of the
+     * flat state x (the committed spins/phonons are not touched, so rejected trial
+     * stages of adaptive steppers leave no trace). OpenMP-parallel over sites and
+     * hexagons for lattices with ≥ parallel_min_sites sites.
+     * State: [S_0 .. S_{N-1}, lattice sector (pack_lattice layout)].
      */
-    void ode_system(const ODEState& x, ODEState& dxdt, double t);
-    
+    void ode_system(const ODEState& x, ODEState& dxdt, double t) const;
+    /// ode_system with optional noise: spin_noise (3N) is added to the effective fields,
+    /// lattice_noise (phonon_dof() entries, pack_lattice layout) to the lattice derivatives.
+    void rhs(const ODEState& x, ODEState& dxdt, double t,
+             const double* spin_noise, const double* lattice_noise) const;
+
     /**
      * Spin derivative (LLG equation, Landau-Lifshitz form).
      *   dS/dt = S × H_eff − α/|S| · S × (S × H_eff)
-     * The damping term has a MINUS sign so that energy decreases under
-     * α > 0 (the term −α S × (S × H) drives S towards H).
-     * NOTE: prior to this fix the sign was +, which made damping pump energy
-     * INTO the spin sector instead of dissipating it — a latent bug that
-     * was masked by all production runs using α = 0. Sign now matches
-     * StrainPhononLattice::spin_derivative.
+     * The damping term has a MINUS sign so that energy decreases under α > 0.
      */
-    Eigen::Vector3d spin_derivative(const Eigen::Vector3d& S, 
+    Eigen::Vector3d spin_derivative(const Eigen::Vector3d& S,
                                     const Eigen::Vector3d& H_eff) const {
         Eigen::Vector3d dSdt = S.cross(H_eff);
         if (alpha_gilbert > 0) {
@@ -1210,11 +1123,11 @@ public:
         }
         return dSdt;
     }
-    
+
     // ============================================================
     // STATE CONVERSION (consistent with Lattice: spins_to_state / state_to_spins)
     // ============================================================
-    
+
     /**
      * Pack current state to flat ODE state vector
      */
@@ -1229,11 +1142,14 @@ public:
         pack_lattice(&state[idx]);
         return state;
     }
-    
+
     /**
      * Unpack flat ODE state to internal variables
      */
     void state_to_spins(const ODEState& state) {
+        if (state.size() != state_size)
+            throw std::invalid_argument("state_to_spins: state has " + std::to_string(state.size()) +
+                                        " entries, expected state_size = " + std::to_string(state_size));
         size_t idx = 0;
         for (size_t i = 0; i < lattice_size; ++i) {
             for (size_t d = 0; d < spin_dim; ++d) {
@@ -1244,17 +1160,23 @@ public:
         }
         unpack_lattice(&state[idx]);
     }
-    
+
     // Legacy aliases for backward compatibility
     ODEState to_state() const { return spins_to_state(); }
     void from_state(const ODEState& state) { state_to_spins(state); }
-    
+
+    // Replica exchange: the whole lattice sector travels with the spins, so the
+    // exchanged total energies are those of the exchanged states (mc::has_extra_dof).
+    size_t extra_dof_size() const { return phonon_dof(); }
+    void pack_extra_dof(double* buf) const { pack_lattice(buf); }
+    void unpack_extra_dof(const double* buf) { unpack_lattice(buf); }
+
     // ============================================================
     // OBSERVABLES
     // ============================================================
-    
+
     /**
-     * Total magnetization per spin (consistent with Lattice: magnetization_local)
+     * Total magnetization per spin in the storage frame (consistent with Lattice: magnetization_local)
      */
     Eigen::Vector3d magnetization_local() const {
         Eigen::Vector3d M = Eigen::Vector3d::Zero();
@@ -1263,38 +1185,43 @@ public:
         }
         return M / lattice_size;
     }
-    
+
     /**
-     * Staggered magnetization (consistent with Lattice: magnetization_local_antiferro)
+     * Staggered (Néel) magnetization in the storage frame, Σ σ_i S_i / N with
+     * σ = afm_sublattice_signs (consistent with Lattice: magnetization_local_antiferro)
      */
     Eigen::Vector3d magnetization_local_antiferro() const {
         Eigen::Vector3d M = Eigen::Vector3d::Zero();
         for (size_t i = 0; i < lattice_size; ++i) {
-            double sign = (i % N_atoms == 0) ? 1.0 : -1.0;
-            M += sign * spins[i];
+            M += afm_sublattice_signs[i % N_atoms] * spins[i];
         }
         return M / lattice_size;
     }
-    
+
     // Legacy aliases
     Eigen::Vector3d magnetization() const { return magnetization_local(); }
     Eigen::Vector3d staggered_magnetization() const { return magnetization_local_antiferro(); }
-    
+
     /**
-     * Global magnetization (transformed from local Kitaev frame to global cubic frame)
-     * M_global = Σ R * S_local / N
-     * where R is the sublattice frame transformation matrix
+     * Magnetization in crystal (a, b, c*) components, M = Σ F_atom S_i / N with
+     * F = sublattice_frames (identity in the default crystal storage frame).
      */
     Eigen::Vector3d magnetization_global() const {
         Eigen::Vector3d M = Eigen::Vector3d::Zero();
         for (size_t i = 0; i < lattice_size; ++i) {
-            size_t atom = i % N_atoms;
-            // Transform spin from local to global frame
-            M += sublattice_frames[atom] * spins[i];
+            M += sublattice_frames[i % N_atoms] * spins[i];
         }
         return M / lattice_size;
     }
-    
+
+    /**
+     * The four magnetisation observables of the dynamics drivers from a flat spin
+     * array x (3N doubles): {M_antiferro (crystal frame, Néel signs), M_local (storage
+     * frame), M_global (crystal frame), (O_custom, 0, 0)}. Shared by MD, the pulse
+     * drives and pump-probe so every output uses one definition.
+     */
+    std::array<Eigen::Vector3d, 4> magnetization_observables(const double* x) const;
+
     /**
      * Set the ordering pattern from current spin configuration
      * This should be called after simulated annealing/equilibration to capture
@@ -1304,7 +1231,7 @@ public:
         ordering_pattern = spins;
         has_ordering_pattern = true;
     }
-    
+
     /**
      * Set ordering pattern from provided spin configuration
      */
@@ -1315,7 +1242,7 @@ public:
         ordering_pattern = pattern;
         has_ordering_pattern = true;
     }
-    
+
     /**
      * Compute custom order parameter based on the ordering pattern
      * Projects current spin configuration onto the initial ordering pattern
@@ -1332,7 +1259,7 @@ public:
         }
         return O / lattice_size;
     }
-    
+
     /**
      * Compute custom magnetization projected onto ordering pattern (per sublattice)
      * Returns vector of order parameters: [O_total, O_A, O_B]
@@ -1346,7 +1273,7 @@ public:
         double O_A = 0.0;
         double O_B = 0.0;
         size_t N_A = 0, N_B = 0;
-        
+
         for (size_t i = 0; i < lattice_size; ++i) {
             double proj = spins[i].dot(ordering_pattern[i]);
             O_total += proj;
@@ -1358,14 +1285,14 @@ public:
                 N_B++;
             }
         }
-        
+
         Eigen::Vector3d result;
         result << O_total / lattice_size,
                   (N_A > 0) ? O_A / N_A : 0.0,
                   (N_B > 0) ? O_B / N_B : 0.0;
         return result;
     }
-    
+
     /// |ε| for the E1 zone-center coordinate.
     double E1_amplitude() const {
         return phonons.E1_amplitude();
@@ -1374,13 +1301,13 @@ public:
     // ============================================================
     // SIMULATION
     // ============================================================
-    
+
 private:
     /**
      * Generic ODE integrator with support for multiple methods
-     * 
+     *
      * Available methods:
-     * 
+     *
      * EXPLICIT METHODS (recommended for non-stiff problems):
      * - "euler": Explicit Euler (1st order)
      * - "rk2" or "midpoint": Runge-Kutta 2nd order
@@ -1392,13 +1319,13 @@ private:
      * - "bulirsch_stoer" or "bs": Bulirsch-Stoer (very high accuracy)
      * - "adams_bashforth" or "ab": Adams-Bashforth 5-step multistep
      * - "adams_moulton" or "am": Adams-Bashforth-Moulton predictor-corrector
-     * 
-     * IMPLICIT METHODS (recommended for stiff problems):
-     * - "rosenbrock4" or "rb4": Rosenbrock 4th order (stiff systems, uses numerical Jacobian)
-     * - "implicit_euler" or "ie": Implicit Euler (1st order, very stable for stiff systems)
-     * 
-     * Note: Implicit methods use numerical Jacobian approximation via finite differences.
-     * They are more stable for stiff problems but computationally more expensive.
+     *
+     * IMPLICIT METHODS (stiff problems; dense finite-difference Jacobian, so limited to
+     * small systems — the call throws above 1200 state entries):
+     * - "rosenbrock4" or "rb4": Rosenbrock 4th order
+     * - "implicit_euler" or "ie": Implicit Euler (1st order)
+     *
+     * Unknown method names throw std::invalid_argument.
      */
     template<typename System, typename Observer>
     void integrate_ode_system(System system_func, ODEState& state,
@@ -1410,10 +1337,13 @@ private:
 public:
     /**
      * Run molecular dynamics simulation
-     * 
+     *
+     * Observables are written on the uniform grid T_start + k · save_interval · dt_initial
+     * (adaptive methods subdivide internally between grid points).
+     *
      * @param T_start        Start time
      * @param T_end          End time
-     * @param dt_initial     Initial/fixed time step
+     * @param dt_initial     Output grid step (and initial step of adaptive methods)
      * @param out_dir        Output directory for trajectories
      * @param save_interval  Steps between saves
      * @param method         Integration method: euler, rk2, rk4, rk5, dopri5 (default),
@@ -1427,67 +1357,98 @@ public:
                            double abs_tol = -1.0, double rel_tol = -1.0);
 
     /**
-     * Stochastic spin-Langevin dynamics (qualitative thermal-decay mode).
+     * Stochastic (Langevin) spin–lattice dynamics at the bath temperature.
      *
-     * Iterates fixed-step RK4 (with the Boost.Odeint adaptive error control
-     * disabled) while injecting a per-step Gaussian noise field on every
-     * spin so the effective field becomes
-     *     H_eff_total = H_eff + ξ_i,
-     *     ξ_i ~ N(0, σ_spin² I_3),  σ_spin = sqrt(2 α k_B T / (|S| dt)).
+     * Each step dt draws the noise and integrates the full system with it held constant
+     * over the step (Wong–Zakai / frozen-noise RK4, consistent with the Stratonovich SDE):
+     *   - spins: h ~ N(0, 2D/dt) per component is added to every effective field, so it
+     *     enters precession and damping, D = αT/(|S|(1+α²)) (García-Palacios & Lázaro 1998);
+     *   - every damped zone-centre mode velocity gets a force η ~ N(0, 2γ_m T_ph/(N dt)) and
+     *     every SLD momentum N(0, 2γ_l m T_l/dt) — the fluctuation–dissipation partners of the
+     *     friction terms −γV, −γ_l p, so the Gibbs state of the COUPLED system is stationary.
+     * Spin norms are restored after each step. Integrating noise and drift together removes
+     * the O(α|H| dt) bias of the former "deterministic step, then noise kick" splitting
+     * (verified against Monte Carlo in tests/test_phonon_dynamics.cpp).
+     * With langevin_quantum the white noise is replaced by Bose-coloured noise of the same
+     * classical level (see langevin_quantum).
      *
-     * The noise is held constant across the four RK4 sub-stages of a single
-     * macro step (Euler-Maruyama-on-a-step approximation). This is exact
-     * only in the dt → 0 limit but produces qualitatively correct thermal
-     * decay statistics for moderate dt and is sufficient for observing
-     * spin-state hopping (3Q ↔ ZZ) at finite T. Phonons evolve
-     * deterministically; their thermal noise is neglected (justified by the
-     * symmetry-protected ε_BO = 0).
+     * Invalid arguments throw std::invalid_argument; neither alpha_gilbert nor any other
+     * member is modified (beyond the evolved state). The SLD static relaxation scheduled by
+     * enable_sld() runs once, on the first call.
      *
      * @param t_start          start time
      * @param t_end            end time
      * @param dt               fixed time step
-     * @param output_dir       directory for trajectory output (HDF5 + text)
+     * @param output_dir       directory for trajectory output (text + HDF5); empty = none
      * @param save_every       save observables every N steps
-     * @param seed             RNG seed; if 0, uses random_device
+     * @param seed             RNG seed; 0 = derived from the process master seed (config `seed`)
+     * @param on_save          optional observer invoked every save_every steps, after the
+     *                         state has been synced back into spins[]/phonons, so that a
+     *                         caller can emit arbitrary observables WITHOUT chopping the run
+     *                         into separate integrate_langevin() calls. Chopping restarts the
+     *                         noise stream, which truncates its correlations at the chunk
+     *                         length — fatal for the Bose-coloured thermostat, whose
+     *                         correlation time is hbar/k_B T (1.9 code units at 6 K).
      */
-    /// @param on_save  optional observer invoked every save_every steps, after the
-    ///                 state has been synced back into spins[]/phonons, so that a
-    ///                 caller can emit arbitrary observables WITHOUT chopping the run
-    ///                 into separate integrate_langevin() calls. Chopping restarts the
-    ///                 noise stream, which truncates its correlations at the chunk
-    ///                 length — fatal for the Bose-coloured thermostat, whose
-    ///                 correlation time is hbar/k_B T (1.9 code units at 6 K).
     void integrate_langevin(double t_start, double t_end, double dt,
                             const string& output_dir = "",
                             size_t save_every = 100,
                             uint64_t seed = 0,
                             const std::function<void(double)>& on_save = {});
-    
+
     // ============================================================
-    // MONTE CARLO METHODS (consistent with Lattice / StrainPhononLattice)
+    // MONTE CARLO METHODS (consistent with Lattice)
     // ============================================================
-    
+
     /**
-     * Single Metropolis sweep over all spins
+     * Single Metropolis sweep over all spins (random site order). The lattice
+     * coordinates are held fixed (they are sampled by relax_phonons / dynamics only).
      * @param T             Temperature
-     * @param gaussian_move If true, use Gaussian perturbation; if false, propose random spin
-     * @param sigma         Width of Gaussian perturbation (only used if gaussian_move=true)
+     * @param gaussian_move If true, use a symmetric small-angle move of width sigma;
+     *                      if false, propose a uniform random spin
+     * @param sigma         Width of the small-angle move (only used if gaussian_move=true)
      * @return Acceptance rate (0.0 to 1.0)
      */
     double metropolis(double T, bool gaussian_move = false, double sigma = 60.0);
-    
+
+    /**
+     * Single heat-bath sweep (rejection-free): each spin is drawn from its exact
+     * conditional distribution ∝ exp(β S·H) about its local field H (Miyatake et al.,
+     * J. Phys. C 19, 2539 (1986)); exact because the local energy is −S·H.
+     * @return 1 (every proposal is accepted)
+     */
+    double heat_bath(double T);
+
+    /**
+     * Monte Carlo sweep of the zone-centre lattice coordinates at fixed spins (Metropolis
+     * moves of thermal width, exact Maxwell velocities). With mc_sample_lattice = true it is
+     * appended to every metropolis()/heat_bath() sweep, so SA and parallel tempering sample
+     * the joint spin–lattice Gibbs state instead of P(S | Q fixed). SLD displacements are not
+     * sampled. @return acceptance of the coordinate moves
+     */
+    double lattice_mc_sweep(double T);
+    /// Sample the lattice coordinates in Monte Carlo (config key mc_sample_lattice); default off.
+    bool mc_sample_lattice = false;
+
+    /// One local sweep with the kernel selected by `local_update`.
+    double local_sweep(double T, bool gaussian_move = false, double sigma = 60.0) {
+        return local_update == LocalUpdate::HeatBath ? heat_bath(T)
+                                                     : metropolis(T, gaussian_move, sigma);
+    }
+
     // Legacy alias
     size_t metropolis_sweep(double T) {
         double rate = metropolis(T);
         return static_cast<size_t>(rate * lattice_size);
     }
-    
+
     /**
      * Single overrelaxation sweep over all spins (consistent with Lattice: overrelaxation)
-     * Reflects each spin about its local field (energy-conserving)
+     * Reflects each spin about its local field — exactly energy-conserving, since the
+     * local energy is −S·H.
      */
     void overrelaxation();
-    
+
     /**
      * Greedy quench: T=0 deterministic alignment with convergence check
      * Delegates to mc::greedy_quench template.
@@ -1495,10 +1456,17 @@ public:
     void greedy_quench(double rel_tol = 1e-12, size_t max_sweeps = 10000) {
         mc::greedy_quench(*this, rel_tol, max_sweeps);
     }
-    
+
     /**
      * Simulated annealing for spin subsystem
-     * 
+     *
+     * Temperatures follow mc::annealing_schedule(T_start, T_end, cooling_rate) (validated:
+     * 0 < T_end ≤ T_start, 0 < cooling_rate < 1). Each of the n_steps sweeps per temperature
+     * is one local sweep (kernel: `local_update`); with overrelax_rate = k > 0 every sweep
+     * is preceded by one overrelaxation sweep and the local sweep runs every k-th sweep —
+     * the same meaning as in mc::parallel_tempering. Gaussian moves adapt their width to
+     * 45 % acceptance during the first half of each temperature (mc::StepSizeController).
+     *
      * @param T_start              Starting temperature
      * @param T_end                Final temperature
      * @param n_steps              Number of MC sweeps per temperature
@@ -1507,10 +1475,12 @@ public:
      * @param out_dir              Output directory for saving configs
      * @param save_observables     Whether to save observables to HDF5
      * @param T_zero               Whether to perform deterministic sweeps at T=0
-     * @param n_deterministics     Number of deterministic sweeps at T=0
+     * @param n_deterministics     Maximum number of deterministic sweeps at T=0
      * @param adiabatic_phonons    If true, relax phonons to equilibrium at each temperature step
      *                             (Born-Oppenheimer approximation for phonons)
      * @param gaussian_move        If true, use Gaussian moves instead of uniform random
+     * @param preserve_initial_phonons  Keep the prescribed lattice coordinates instead of
+     *                             resetting the lattice sector at the start
      */
     void simulated_annealing(double T_start, double T_end, size_t n_steps,
                             size_t overrelax_rate = 0,
@@ -1522,61 +1492,66 @@ public:
                             bool adiabatic_phonons = false,
                             bool gaussian_move = false,
                             bool preserve_initial_phonons = false);
-    
+
     /**
-     * Deterministic T=0 sweep: align each spin with its local field
-     * 
-     * @param num_sweeps  Number of sweeps to perform
+     * Deterministic T=0 sweeps: align each spin with its local field (sequential
+     * Gauss–Seidel order; every step lowers the energy). Stops early when the largest
+     * spin change of a sweep falls below 1e-12 |S|.
+     *
+     * @param num_sweeps  Maximum number of sweeps to perform
+     * @return largest |ΔS| of the last sweep
      */
-    void deterministic_sweep(size_t num_sweeps);
-    
+    double deterministic_sweep(size_t num_sweeps);
+
     /**
-     * Relax the zone-center E1 coordinate to its static equilibrium for the
-     * current spin configuration. The equilibrium satisfies
+     * Relax the zone-centre lattice coordinates (all non-frozen modes) to their
+     * static equilibrium for the current spin configuration:
      *
-     *   ω_E1² ε_a + λ_E1_quartic (ε_x²+ε_y²) ε_a + ∂H_sp-ph/∂ε_a = 0,
-     *   a = x, y.
+     *   ω² q + λ4 |q|² q + (1/N) ∂H/∂q = 0
      *
-     * @param tol      convergence tolerance for the residual
+     * by Newton iteration with the exact Hessian of the lattice energy (harmonic +
+     * quartic + magnetoelastic + anharmonic, by central differences of the analytic
+     * forces) and a backtracking line search on the energy, so it converges near soft
+     * modes where the diagonal fixed-point iteration diverged.
+     *
+     * @param tol      convergence tolerance for the residual (per-site force norm)
      * @param max_iter maximum Newton iterations
-     * @param damping  damped Newton step size (1.0 = full Newton)
+     * @param damping  initial Newton step fraction (1.0 = full Newton)
      * @return true on convergence, false if @c max_iter is exhausted.
      */
     bool relax_phonons(double tol = 1e-8, size_t max_iter = 10000, double damping = 1.0);
-    
+
     /**
      * Joint spin-phonon relaxation to find true steady state.
-     * 
-     * Iterates between:
-     * 1. Relaxing phonons to equilibrium for current spin configuration
-     * 2. Relaxing spins (deterministic sweeps) for current phonon configuration
-     * 
-     * This finds the self-consistent equilibrium where both spins and phonons
-     * are stationary. Required for proper energy conservation in dynamics.
-     * 
-     * @param tol                   Convergence tolerance for energy and Q changes
+     *
+     * Iterates between relaxing the lattice coordinates for the current spins and
+     * deterministic spin sweeps for the current coordinates, until the energy change
+     * per site and the change of |Q| fall below tol.
+     *
+     * @param tol                   Convergence tolerance (energy per site and |Q|)
      * @param max_iter              Maximum joint relaxation iterations
      * @param spin_sweeps_per_iter  Number of deterministic spin sweeps per iteration
      * @param phonon_only           If true, only relax phonons (keep spins fixed)
      * @return true if converged, false if max_iter reached
      */
     bool relax_joint(double tol = 1e-6, size_t max_iter = 100, size_t spin_sweeps_per_iter = 10, bool phonon_only = false);
-    
+
     // ============================================================
     // SINGLE/DOUBLE PULSE DRIVE (for 2DCS)
     // ============================================================
-    
+
     /**
      * Magnetization trajectory data type
      * Returns: (time, [M_antiferro, M_local, M_global, (O_custom, 0, 0)])
-     * The 4th element stores the custom order parameter in the x-component
+     * (see magnetization_observables for the frames)
      */
     using MagTrajectory = vector<std::pair<double, std::array<Eigen::Vector3d, 4>>>;
-    
+
     /**
      * Single pulse THz drive on phonon E1 mode
-     * Matches lattice.h::single_pulse_drive signature (adapted for phonon drive)
-     * 
+     * Matches lattice.h::single_pulse_drive signature (adapted for phonon drive).
+     * The final state is committed to spins/phonons/modes.
+     *
      * @param polarization  THz field polarization angle (0=x, π/2=y)
      * @param t_B           Center time of pulse
      * @param pulse_amp     Pulse amplitude (E-field strength)
@@ -1586,23 +1561,25 @@ public:
      * @param T_end         Integration end time
      * @param step_size     Integration timestep
      * @param method        ODE integration method
-     * @return Trajectory of (time, [M_antiferro, M_local, M_global])
+     * @return Trajectory of (time, [M_antiferro, M_local, M_global, O_custom])
      */
     MagTrajectory single_pulse_drive(double polarization, double t_B,
                                      double pulse_amp, double pulse_width, double pulse_freq,
                                      double T_start, double T_end, double step_size,
                                      const string& method = "dopri5",
-                                     // W3: pulse-window-aware chunked integration.
+                                     // ignored: one integration on the exact grid
+                                     // T_start + k step_size (kept for API compatibility)
                                      bool pulse_window_chunking = true,
                                      // Ingredient XVIII: pump-probe ODE tolerances.
                                      double abs_tol = classical_spin_pulse_chunking::kDefaultPumpProbeAbsTol,
                                      double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol);
-    
+
     /**
      * Double pulse THz drive (pump + probe)
      * Matches lattice.h::double_pulse_drive signature (adapted for phonon drive)
-     * Both pulses share the same amplitude, width, and frequency
-     * 
+     * Both pulses share the same amplitude, width, and frequency.
+     * The final state is committed to spins/phonons/modes.
+     *
      * @param polarization_1  Pump pulse polarization angle
      * @param t_B_1           Pump pulse center time
      * @param polarization_2  Probe pulse polarization angle
@@ -1614,7 +1591,7 @@ public:
      * @param T_end           Integration end time
      * @param step_size       Integration timestep
      * @param method          ODE integration method
-     * @return Trajectory of (time, [M_antiferro, M_local, M_global])
+     * @return Trajectory of (time, [M_antiferro, M_local, M_global, O_custom])
      */
     MagTrajectory double_pulse_drive(double polarization_1, double t_B_1,
                                      double polarization_2, double t_B_2,
@@ -1624,26 +1601,30 @@ public:
                                      bool pulse_window_chunking = true,
                                      double abs_tol = classical_spin_pulse_chunking::kDefaultPumpProbeAbsTol,
                                      double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol);
-    
+
     /**
      * Complete 2D coherent spectroscopy (2DCS) workflow
      * Matches lattice.h::pump_probe_spectroscopy signature (adapted for phonon drive)
-     * 
+     *
      * Performs pump-probe spectroscopy with THz pulses driving the E1 phonon mode:
      * 1. Uses current spin configuration as ground state
      * 2. Runs reference single-pulse dynamics M0 (pump at t=0)
      * 3. Scans delay times (tau) to measure:
      *    - M1(t, tau): Response to probe pulse at time tau only
      *    - M01(t, tau): Response to pump (t=0) + probe (t=tau)
-     * 
+     *
      * Nonlinear signal extraction: M_NL = M01 - M0 - M1
-     * 
+     *
+     * Output: dir_name/pump_probe_spectroscopy.h5 with /reference and /delay_scan/tau_i/{M1,M01},
+     * each holding time, M_antiferro, M_local, M_global, O_custom (identical layout for the
+     * MPI driver).
+     *
      * @param polarization  THz field polarization angle
      * @param pulse_amp     THz pulse amplitude
      * @param pulse_width   Gaussian pulse width
      * @param pulse_freq    Pulse carrier frequency
      * @param tau_start     Initial delay time
-     * @param tau_end       Final delay time  
+     * @param tau_end       Final delay time
      * @param tau_step      Delay time step
      * @param T_start       Integration start time
      * @param T_end         Integration end time
@@ -1667,8 +1648,11 @@ public:
                                 double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol);
 
     /**
-     * MPI-parallelized 2DCS spectroscopy
-     * Distributes tau values across MPI ranks
+     * MPI-parallel 2DCS spectroscopy: the delay points are distributed over the ranks
+     * of @p comm. COLLECTIVE over comm — every rank must call it with the same
+     * arguments and the same ground state (spins, lattice sector); rank 0 of comm
+     * writes the output file. The full trajectory records are gathered, so the file is
+     * identical to the one of pump_probe_spectroscopy().
      */
     void pump_probe_spectroscopy_mpi(double polarization,
                                     double pulse_amp, double pulse_width, double pulse_freq,
@@ -1680,7 +1664,11 @@ public:
                                     double stationarity_tol = 1e-6,
                                     bool pulse_window_chunking = true,
                                     double abs_tol = classical_spin_pulse_chunking::kDefaultPumpProbeAbsTol,
-                                    double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol);
+                                    double rel_tol = classical_spin_pulse_chunking::kDefaultPumpProbeRelTol,
+                                    MPI_Comm comm = MPI_COMM_WORLD);
+
+    /// Broadcast the spin configuration and the lattice sector from root to every rank of comm.
+    void broadcast_state(int root, MPI_Comm comm);
 
     // ------------------------------------------------------------------
     // W1 (time-translation) helpers — see lattice.h doc.
@@ -1688,18 +1676,12 @@ public:
     using PumpProbeTrajectory = MagTrajectory;
 
     /**
-     * Maximum |dS/dt|_∞ across the spin sector with the THz drive
-     * disabled. Returns a runtime stationarity bound for W1.
-     *
-     * Note: we deliberately ignore the phonon-sector RHS here, because
-     * a non-zero phonon velocity at t = T_start does NOT block the W1
-     * synthesis as long as the *spin* sector returns to the same
-     * trajectory shape after the pulse. Phonons couple to spins only
-     * through `spin_phonon_params`, so a quiet spin sector with a noisy
-     * phonon initial condition would still violate the synthesis. To
-     * keep it simple and conservative, we report only the spin part —
-     * users with non-stationary phonons should pass
-     * `reuse_m0_for_m1 = false` explicitly.
+     * Stationarity measure for W1: the max-norm of the FULL right-hand side
+     * (spins, every lattice coordinate and velocity, SLD) with the THz drive
+     * disabled. M1(τ) may be synthesised from M0 by a time shift only if the
+     * unperturbed state does not evolve at all; a non-relaxed lattice (e.g. a linear
+     * λ1 coupling at Q = 0) evolves even when dS/dt vanishes. Returns +∞ when the
+     * magnetoelastic schedule is time dependent.
      */
     double max_dSdt_norm_no_drive() const;
 
@@ -1711,23 +1693,36 @@ public:
         const PumpProbeTrajectory& M_pulse_trajectory,
         const std::array<Eigen::Vector3d, 4>& M_ground,
         double tau, double T_step) const;
-    
+
     // ============================================================
     // I/O
     // ============================================================
-    
+
 #ifdef HDF5_ENABLED
     void save_spin_config_hdf5(const string& filename) const;
     void load_spin_config_hdf5(const string& filename);
     void save_state_hdf5(const string& filename) const;
     void load_state_hdf5(const string& filename);
 #endif
-    
+
+    /// Write N lines "Sx Sy Sz" (storage frame); throws if the file cannot be written.
     void save_spin_config(const string& filename) const;
+    /**
+     * Read exactly lattice_size finite triplets (storage frame) and normalise them to
+     * spin_length. Throws std::runtime_error on a missing file, a short or non-numeric
+     * file, extra data, or a (near-)zero vector; the stored spins are untouched on error.
+     */
     void load_spin_config(const string& filename);
     void read_spins_from_file(const string& filename) { load_spin_config(filename); }
     void save_positions(const string& filename) const;
-    
+
+    /**
+     * Read exactly n finite 3-vectors from a whitespace-separated text file (lines
+     * starting with '#' are comments). Throws std::runtime_error naming the file on any
+     * malformed, short or overlong input.
+     */
+    static vector<Eigen::Vector3d> read_vec3_file(const string& filename, size_t n);
+
     void print_state() const {
         cout << "=== PhononLattice State ===" << endl;
         cout << "E1: Qx=" << phonons.Q_x_E1 << ", Qy=" << phonons.Q_y_E1
@@ -1738,13 +1733,13 @@ public:
         cout << "Energy: " << energy_density() << " per site" << endl;
         cout << "===========================" << endl;
     }
-    
+
     // ============================================================
     // OBSERVABLES — SUBLATTICE & STRUCTURE FACTOR
     // ============================================================
-    
+
     /**
-     * Compute magnetization for each sublattice separately (consistent with Lattice)
+     * Magnetization of each sublattice in crystal components (consistent with Lattice)
      * @return Vector of SpinVectors, one per sublattice (N_atoms sublattices)
      */
     vector<SpinVector> magnetization_sublattice() const {
@@ -1760,7 +1755,7 @@ public:
         }
         return M;
     }
-    
+
     /**
      * Compute static spin structure factor S(q) = |Σ_i S_i exp(-i q·r_i)|² / N
      * (consistent with Lattice)
@@ -1776,7 +1771,7 @@ public:
         }
         return (std::norm(Sq_x) + std::norm(Sq_y) + std::norm(Sq_z)) / lattice_size;
     }
-    
+
     /**
      * Measure observables: returns (total_energy, sublattice_magnetizations)
      * (consistent with Lattice)
@@ -1784,30 +1779,29 @@ public:
     std::pair<double, vector<SpinVector>> measure_observables() const {
         return {total_energy(), magnetization_sublattice()};
     }
-    
-    // ============================================================
-    // PARALLEL TEMPERING (consistent with Lattice / StrainPhononLattice)
-    // ============================================================
-    
+
     // ============================================================
     // PARALLEL TEMPERING & DIAGNOSTICS — delegated to mc::
     // ============================================================
-    
-    /** Parallel tempering with MPI (delegates to mc::parallel_tempering). */
+
+    /**
+     * Parallel tempering with MPI (delegates to mc::parallel_tempering). Each replica
+     * exchanges its spins TOGETHER with its lattice sector (extra_dof hooks), so the
+     * swap criterion uses the total energies of the states actually exchanged.
+     */
     void parallel_tempering(vector<double> temp, size_t n_anneal, size_t n_measure,
                            size_t overrelaxation_rate, size_t swap_rate, size_t probe_rate,
                            string dir_name, const vector<int>& rank_to_write,
                            bool gaussian_move = true, MPI_Comm comm = MPI_COMM_WORLD,
                            bool verbose = false, const vector<size_t>& sweeps_per_temp = {}) {
-        // Seed lattice RNG per rank
+        // Independent per-rank Monte Carlo streams derived from the process seed.
         int rank; MPI_Comm_rank(comm, &rank);
-        auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        rng.seed(static_cast<unsigned int>(seed + rank * 1000));
+        set_seed(lehman_master_seed_value(), 0x5054ULL + static_cast<uint64_t>(rank));
         mc::parallel_tempering(*this, temp, n_anneal, n_measure,
             overrelaxation_rate, swap_rate, probe_rate, dir_name, rank_to_write,
             gaussian_move, comm, verbose, sweeps_per_temp);
     }
-    
+
     /** Generate optimized temperature grid (delegates to mc::). */
     mc::OptimizedTempGridResult generate_optimized_temperature_grid_mpi(
         double Tmin, double Tmax,
@@ -1817,31 +1811,30 @@ public:
         double convergence_tol = 0.05, MPI_Comm comm = MPI_COMM_WORLD,
         bool use_gradient = true) {
         int rank; MPI_Comm_rank(comm, &rank);
-        auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
-        rng.seed(static_cast<unsigned int>(seed + rank * 12345));
+        set_seed(lehman_master_seed_value(), 0x4F5054ULL + static_cast<uint64_t>(rank));
         return mc::generate_optimized_temperature_grid_mpi(*this, Tmin, Tmax,
             warmup_sweeps, sweeps_per_iter, feedback_iters, gaussian_move,
             overrelaxation_rate, target_acceptance, convergence_tol, comm, use_gradient);
     }
-    
+
     /** Geometric temperature ladder (delegates to mc::). */
     static vector<double> generate_geometric_temperature_ladder(
         double Tmin, double Tmax, size_t R) {
         return mc::generate_geometric_temperature_ladder(Tmin, Tmax, R);
     }
-    
+
     /** Binning analysis (delegates to mc::). */
     static mc::BinningResult binning_analysis(const vector<double>& data) {
         return mc::binning_analysis(data);
     }
-    
+
     /** Autocorrelation estimation (delegates to mc::). */
     static void estimate_autocorrelation_time(const vector<double>& energies,
             size_t base_interval, double& tau_int_out, size_t& sampling_interval_out) {
         mc::estimate_autocorrelation_time(energies, base_interval,
                                           tau_int_out, sampling_interval_out);
     }
-    
+
     /** Thermodynamic observables (delegates to mc::). */
     mc::ThermodynamicObservables compute_thermodynamic_observables(
         const vector<double>& energies,
@@ -1850,12 +1843,62 @@ public:
         return mc::compute_thermodynamic_observables<SpinVector>(
             energies, sublattice_mags, temperature, lattice_size);
     }
-    
+
 private:
-    // RNG members for reproducible per-rank seeding (needed for parallel tempering)
+    // Private Monte Carlo / noise engine (seeded from the process seed; set_seed()).
     std::mt19937 rng;
     std::uniform_real_distribution<double> uniform_dist{0.0, 1.0};
     std::normal_distribution<double> normal_dist{0.0, 1.0};
+
+    // Quenched NN disorder, kept apart from the clean exchange so that set_parameters()
+    // can rebuild nn_interaction = nn_scale_ * nn_clean_ + nn_delta_.
+    vector<vector<Eigen::Matrix3d>> nn_clean_, nn_delta_;
+    vector<vector<double>> nn_scale_;
+    bool has_j2_ = false, has_j3_ = false;   // any non-zero J2 / J3 (hot-loop skip)
+    bool sld_relax_pending_ = false;         // enable_sld(true) → relax once in integrate_langevin
+    void rebuild_nn_exchange();
+    void update_exchange_flags();
+    void report_stability() const;
+    double lattice_potential(const Coords& c, const Eigen::Matrix3d C[3], const double Cj2[2][3],
+                             const double Cj3[3], double R7) const;
+    void build_hexagons();
+    void validate_topology() const;
+    size_t nn_index(size_t site, size_t partner, const string& context) const;
+
+    // Couplings cache for the committed coordinates (couplings()).
+    mutable Couplings coupling_cache_;
+    mutable std::vector<double> coupling_cache_q_;
+    mutable uint64_t coupling_epoch_ = 1;
+    mutable uint64_t coupling_cache_epoch_ = 0;
+
+    // Scratch for ode_system (sized on first use; ode_system is not reentrant on one object).
+    mutable std::vector<double> ring_grad_scratch_, ring_val_scratch_;
+    mutable std::vector<double> corr_scratch_;
+
+    Eigen::Vector3d random_unit_vector();
+    Eigen::Vector3d gaussian_move3(const Eigen::Vector3d& current, double sigma);
+
+    // Kernels (defined in phonon_lattice.cpp). SpinOf(j) and DispOf(j) return the spin /
+    // displacement of site j (Eigen expressions or Map<const Vector3d>).
+    template <class SpinOf, class DispOf>
+    Eigen::Vector3d field_without_ring(size_t i, const SpinOf& S, const DispOf& U,
+                                       const Couplings& cc) const;
+    template <class SpinOf>
+    Eigen::Vector3d ring_field_site(size_t i, const SpinOf& S, double J7eff) const;
+    template <class SpinOf>
+    double ring_operator(const SpinOf& S, double J7eff, double* weighted_energy) const;
+    template <class SpinOf>
+    void correlations_of(const SpinOf& S, Eigen::Matrix3d C[3], double Cj2[2][3], double Cj3[3]) const;
+
+    // Shared trajectory serialisation / HDF5 writer of the pump-probe drivers.
+    static void pack_trajectory(const MagTrajectory& traj, vector<double>& out);
+    static MagTrajectory unpack_trajectory(const double* buf, size_t n_times);
+    void write_pump_probe_hdf5(const string& filename, double polarization,
+                               double pulse_amp, double pulse_width, double pulse_freq,
+                               double E_ground, const vector<double>& tau_values,
+                               const MagTrajectory& M0,
+                               const vector<MagTrajectory>& M1,
+                               const vector<MagTrajectory>& M01) const;
 };
 
 #endif // PHONON_LATTICE_H

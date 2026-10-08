@@ -507,6 +507,7 @@ SpinConfig SpinConfig::from_file(const string& filename) {
                 // Treat as Hamiltonian parameter
                 config.hamiltonian_params[key] = stod(value);
             }
+            config.explicit_keys.insert(key);
         } catch (const exception& e) {
             cerr << "Error parsing line " << line_num << " in " << filename << ": " << e.what() << endl;
             cerr << "Line content: " << line << endl;

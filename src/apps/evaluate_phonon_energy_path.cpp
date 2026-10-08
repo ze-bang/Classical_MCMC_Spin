@@ -1,7 +1,7 @@
 #include "classical_spin/core/spin_config.h"
 #include "classical_spin/core/unitcell_builders.h"
 #include "classical_spin/lattice/phonon_lattice.h"
-#include "spin_solver_runners.h"
+#include "classical_spin/lattice/phonon_config.h"
 
 #include <cstdlib>
 #include <fstream>
