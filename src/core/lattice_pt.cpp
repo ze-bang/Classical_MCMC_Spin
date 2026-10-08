@@ -93,7 +93,7 @@ private:
 
 /// Gaussian proposals with an adapted width unless the heat bath is selected.
 bool adaptive_proposals(const Lattice& lat, bool gaussian_move) {
-    const bool heat_bath = lat.local_update == Lattice::LocalUpdate::HeatBath && lat.spin_dim == 3;
+    const bool heat_bath = lat.local_update == Lattice::LocalUpdate::HeatBath && lat.heat_bath_available();
     return !heat_bath && (gaussian_move || lat.local_update == Lattice::LocalUpdate::Gaussian);
 }
 

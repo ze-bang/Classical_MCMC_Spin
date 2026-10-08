@@ -234,7 +234,7 @@
         // that a run is reproducible from its `seed`.
         const vector<double> schedule = mc::annealing_schedule(T_start, T_end, cooling_rate);
         const bool adaptive = gaussian_move || local_update == LocalUpdate::Gaussian;
-        const bool heat_bath_moves = local_update == LocalUpdate::HeatBath && spin_dim == 3;
+        const bool heat_bath_moves = local_update == LocalUpdate::HeatBath && heat_bath_available();
         mc::StepSizeController step_size(/*sigma0=*/2.0, /*target=*/0.45);
         double sigma = step_size.sigma();
         // One adaptation block contains exactly one local-update sweep.

@@ -77,6 +77,7 @@ std::unique_ptr<Lattice> make_lattice(const SpinConfig& config) {
                                              config.lattice_size[2], config.spin_length);
     lattice->lattice_type = system_type_to_string(config.system);
     lattice->local_update = Lattice::parse_local_update(config.local_update);
+    if (lattice->spin_dim == 8) lattice->set_su3_mc_manifold(config.su3_mc_manifold);   // CP^2 or legacy S^7
     if (config.use_ferromagnetic_init) {
         lattice->init_ferromagnetic(ferromagnetic_direction(config, lattice->spin_dim, "lattice"));
     } else if (!config.initial_spin_config.empty()) {
