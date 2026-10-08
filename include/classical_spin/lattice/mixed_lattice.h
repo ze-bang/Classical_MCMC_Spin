@@ -20,6 +20,8 @@
 #include <iomanip>
 #include <complex>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <numeric>
 #include <algorithm>
@@ -112,7 +114,8 @@ struct MixedThermodynamicObservables {
  * Supports:
  * - Bilinear and trilinear interactions within each sublattice
  * - Mixed bilinear and trilinear interactions between sublattices
- * - Monte Carlo sampling (Metropolis, overrelaxation)
+ * - Monte Carlo sampling (Metropolis, heat bath, overrelaxation; SU(3)
+ *   sites on CP^2 with the Fubini-Study measure)
  * - Parallel tempering
  * - Molecular dynamics (Landau-Lifshitz equations)
  * - Time-dependent external fields
@@ -138,7 +141,7 @@ public:
     size_t lattice_size_SU2;     // Total SU(2) sites = N_atoms_SU2 * dim1 * dim2 * dim3
     size_t lattice_size_SU3;     // Total SU(3) sites = N_atoms_SU3 * dim1 * dim2 * dim3
     float spin_length_SU2;       // Magnitude of SU(2) spin vectors
-    float spin_length_SU3;       // Magnitude of SU(3) spin vectors
+    float spin_length_SU3;       // Radius of the legacy S^7 SU(3) manifold (unused on CP^2, |n| = 2/sqrt3)
 
     // Spin configurations and positions
     SpinConfigSU2 spins_SU2;                    // Current SU(2) spins
@@ -205,10 +208,10 @@ public:
     //     (stride = rows) to unit-stride row-major (stride = 1),
     //   - lets the compiler vectorize and unroll fixed-size kernels
     //     (3x3, 3x8, 8x8, 3x3x3, 3x3x8, 8x3x3, 8x8x8) used by the
-    //     SU(2)/SU(3) MD RHS.
-    // Built once in build_packed_interaction_buffers() at the end of the
-    // constructor; the original SpinMatrix / SpinTensor3 storage is kept
-    // for the MC code path and any rebuild operations.
+    //     SU(2)/SU(3) MD RHS and Monte Carlo local fields.
+    // Built in build_packed_interaction_buffers() at the end of the
+    // constructor (and after any change of the coupling tables); the
+    // original SpinMatrix / SpinTensor3 storage is the source of rebuilds.
     //
     // Layout per site (n indexes bonds at this site):
     //   bilinear_packed_*[site][n*da*db + a*db + b]
@@ -350,19 +353,108 @@ public:
     double thermal_cool = 0.0;                  // heat-reservoir cooling rate (1/time; 0 = no cooling)
 
     // ============================================================
-    // LOCAL FIELD CACHING FOR OPTIMIZED MONTE CARLO
+    // MONTE CARLO: STATE SPACE, UPDATE POLICY, LOCAL FORMS
     // ============================================================
-    // Cached local fields for each site (used in interleaved sweeps)
-    mutable vector<SpinVector> cached_local_field_SU2;
-    mutable vector<SpinVector> cached_local_field_SU3;
-    mutable vector<bool> field_valid_SU2;  // Whether cached field is valid
-    mutable vector<bool> field_valid_SU3;  // Whether cached field is valid
-    mutable bool use_field_caching;        // Enable/disable caching mode
 
-    // Reverse lookup: which SU3 sites are affected by changes to each SU2 site
-    vector<vector<size_t>> mixed_bilinear_reverse_SU2;  // SU2[i] -> list of SU3 sites coupled to it
-    // Reverse lookup: which SU2 sites are affected by changes to each SU3 site  
-    vector<vector<size_t>> mixed_bilinear_reverse_SU3;  // SU3[i] -> list of SU2 sites coupled to it
+    /**
+     * State space sampled for the SU(3) sites.
+     *  - CP2 (default): qutrit pure states psi in C^3, stored as their
+     *    Gell-Mann expectations n^a = <psi|lambda^a|psi> (|n|^2 = 4/3, cubic
+     *    Casimir 8/9) and sampled with the Fubini-Study (Haar) measure: the
+     *    manifold the SU(3) dynamics conserves, on which E(n) = <psi|H|psi>
+     *    is the energy of a product state (Zhang & Batista, PRB 104, 104409
+     *    (2021); Dahlbom et al., PRB 106, 235154 (2022)).
+     *  - Sphere (legacy): the 7-sphere |n| = spin_length_SU3 with its uniform
+     *    measure (most of its points are not density matrices). Default only
+     *    under su3_legacy_convention (SU(3) UnitCell::poisson_bracket == 1).
+     */
+    enum class SU3Manifold { CP2, Sphere };
+    SU3Manifold su3_mc_manifold = SU3Manifold::CP2;
+
+    /// "cp2" / "sphere" (case-sensitive); throws std::invalid_argument otherwise.
+    static SU3Manifold parse_su3_manifold(const string& name) {
+        if (name == "cp2" || name == "CP2") return SU3Manifold::CP2;
+        if (name == "sphere" || name == "S7") return SU3Manifold::Sphere;
+        throw std::invalid_argument("su3_mc_manifold: unknown manifold '" + name +
+                                    "' (valid: cp2, sphere)");
+    }
+
+    /**
+     * Select the SU(3) Monte Carlo manifold by name; "" or "auto" restores the
+     * default of the SU(3) convention (CP2, or Sphere under
+     * su3_legacy_convention). The stored spins are not changed: call
+     * init_random() or project_SU3_to_manifold() afterwards (the SA and PT
+     * drivers project automatically).
+     */
+    void set_su3_mc_manifold(const string& name) {
+        if (name.empty() || name == "auto") {
+            su3_mc_manifold = (su3_bracket == classical_spin::su3::kLegacyBracket) ? SU3Manifold::Sphere
+                                                                                 : SU3Manifold::CP2;
+        } else {
+            su3_mc_manifold = parse_su3_manifold(name);
+        }
+    }
+    bool su3_on_cp2() const { return su3_mc_manifold == SU3Manifold::CP2; }
+
+    /**
+     * Local update used by local_sweep() (SA, PT, final measurements):
+     *  - Metropolis: independent uniform proposals (SU(2): sphere; SU(3):
+     *    Haar on CP^2, or uniform on S^7);
+     *  - Gaussian: symmetric small moves of width sigma (SU(2):
+     *    S' ∝ S + sigma L u; SU(3) on CP^2: psi' ∝ psi + sigma xi, xi a complex
+     *    Gaussian 3-vector), sigma adapted by the drivers;
+     *  - HeatBath: rejection-free draw from the linear part of the local
+     *    energy (SU(2): Miyatake et al., J. Phys. C 19, 2539 (1986); SU(3)
+     *    on CP^2: populations of the local eigenbasis uniform on the simplex
+     *    under Fubini-Study), Metropolis-corrected for the quadratic self
+     *    terms (single-ion anisotropy, self-coupled trilinears). SU(3) sites
+     *    on the legacy sphere fall back to Metropolis.
+     * Config key `local_update` (as for Lattice).
+     */
+    enum class LocalUpdate { Metropolis, Gaussian, HeatBath };
+    LocalUpdate local_update = LocalUpdate::Metropolis;
+    /// Coloured OpenMP sweeps are used from this many sites (and > 1 thread) on.
+    size_t parallel_sweep_min_sites = 4096;
+
+    static LocalUpdate parse_local_update(const string& name) {
+        if (name == "metropolis" || name == "uniform") return LocalUpdate::Metropolis;
+        if (name == "gaussian" || name == "adaptive") return LocalUpdate::Gaussian;
+        if (name == "heat_bath" || name == "heatbath") return LocalUpdate::HeatBath;
+        throw std::invalid_argument("unknown local update '" + name +
+                                    "' (valid: metropolis, gaussian, heat_bath)");
+    }
+
+    // ------------------------------------------------------------------
+    // Local forms. With every other spin frozen, the energy of SU(2) site i
+    // as a function of its own spin is
+    //     E_i(S) = h_i . S + S^T A_i S  (+ cubic self terms, if any):
+    // h_i collects every coupling that contains S_i exactly once (field,
+    // bilinear, mixed bilinear, trilinear entries with two other partners),
+    // A_i the symmetrised on-site matrix plus every coupling that contains
+    // S_i twice, with its third partner contracted (the TmFeO3 vertex
+    // W(S_i, S_i, n_k) and any trilinear that wraps onto itself on a small
+    // lattice). Couplings with S_i in all three slots are kept as cubic
+    // entries. The same holds for SU(3) sites with n_j. Each trilinear entry
+    // stored at site i carries weight 1/(1 + number of its partner slots equal
+    // to i) in the local energy, which reproduces total_energy() exactly.
+    //
+    // The tables below hold the self-coupled part, merged per partner and
+    // symmetrised in the two self slots, so a site visit is one pass over
+    // its packed couplings with no allocation (rebuilt by
+    // build_packed_interaction_buffers()).
+    struct SelfQuadTerm {
+        size_t partner;      // partner site index
+        size_t offset;       // into selfq_coef_SU{2,3}: d x d x dim, row-major (a, b, c)
+        uint8_t partner_su3; // partner species: 0 = SU(2), 1 = SU(3)
+        uint8_t dim;         // partner components (3 or 8)
+    };
+    vector<double>           onsite_sym_SU2, onsite_sym_SU3;    // sym(onsite), d x d per site
+    vector<size_t>           selfq_off_SU2, selfq_off_SU3;      // CSR offsets, size N + 1
+    vector<SelfQuadTerm>     selfq_SU2, selfq_SU3;
+    vector<double>           selfq_coef_SU2, selfq_coef_SU3;
+    vector<vector<uint32_t>> cubic_self_SU2, cubic_self_SU3;    // trilinear entries with S_i in every slot
+    vector<uint8_t>          self_mode_SU2, self_mode_SU3;      // 0: no self energy, 1: quadratic, 2: + cubic
+    vector<uint8_t>          self_isotropic_SU2, self_isotropic_SU3;  // self energy constant on the manifold
 
     /**
      * Constructor: Build a mixed lattice from two unit cells
@@ -414,6 +506,7 @@ public:
                 + std::to_string(spin_dim_SU2) + ", spin_dim_SU3=" + std::to_string(spin_dim_SU3) + ")");
         }
         su3_bracket = mixed_uc.SU3_cell.poisson_bracket;
+        set_su3_mc_manifold("");   // CP^2, or the legacy S^7 under su3_legacy_convention
         lattice_size_SU2 = N_atoms_SU2 * dim1 * dim2 * dim3;
         lattice_size_SU3 = N_atoms_SU3 * dim1 * dim2 * dim3;
         
@@ -513,18 +606,8 @@ public:
         // Build mixed SU(2)-SU(3) interactions
         build_mixed_interactions(mixed_uc, num_bi_SU2_SU3, num_tri_SU2_SU3);
 
-        // Initialize local field caching infrastructure
-        cached_local_field_SU2.resize(lattice_size_SU2);
-        cached_local_field_SU3.resize(lattice_size_SU3);
-        field_valid_SU2.resize(lattice_size_SU2, false);
-        field_valid_SU3.resize(lattice_size_SU3, false);
-        use_field_caching = false;  // Disabled by default
-
         // Initialize SU(3) Bloch damping equilibrium (default: zero = infinite temperature)
         equilibrium_SU3.resize(lattice_size_SU3, SpinVector::Zero(spin_dim_SU3));
-
-        // Build reverse lookup tables for mixed interactions
-        build_reverse_lookup_tables();
 
         // Build per-sublattice colour partition for the parallel coloured
         // Metropolis / over-relaxation sweeps. See header doc on
@@ -532,8 +615,11 @@ public:
         build_color_partition();
 
         // Pack {bi,tri}linear interaction tensors into row-major double[]
-        // buffers used by the MD hot path (see field declarations).
+        // buffers (MD and MC hot paths) and build the MC local-form tables.
         build_packed_interaction_buffers();
+
+        // Random initial state on the Monte Carlo manifolds.
+        init_random();
 
         cout << "Mixed lattice initialization complete!" << endl;
         cout << "SU(2) - Max bilinear: " << num_bi_SU2 << ", Max trilinear: " << num_tri_SU2 << endl;
@@ -555,15 +641,16 @@ public:
     }
 
     /**
-     * Apply periodic boundary condition
+     * Periodic boundary condition: Euclidean (floor) reduction of a cell
+     * coordinate onto [0, dim_size), correct for bonds longer than the
+     * lattice (the previous single-step `coord ± L` returned an out-of-range
+     * index for |coord| > L, a heap overflow in the constructor).
      */
     size_t periodic_boundary(int coord, size_t dim_size) const {
-        if (coord < 0) {
-            return coord + dim_size;
-        } else if (coord >= (int)dim_size) {
-            return coord - dim_size;
-        }
-        return coord;
+        const long L = long(dim_size);
+        long r = long(coord) % L;
+        if (r < 0) r += L;
+        return size_t(r);
     }
 
     /**
@@ -622,8 +709,8 @@ public:
                         }
                         positions[site_idx] = pos;
                         
-                        // Generate random spin
-                        spins[site_idx] = gen_random_spin(spin_length, spin_dim);
+                        // Spins are drawn by init_random() once the lattice is built.
+                        spins[site_idx] = SpinVector::Zero(spin_dim);
                         
                         // Copy field and onsite interaction
                         field[site_idx] = uc.field[l];
@@ -678,7 +765,19 @@ public:
                             const auto& J = it->second;
                             size_t partner = flatten_index_periodic(
                                 int(i) + J.offset[0], int(j) + J.offset[1], int(k) + J.offset[2], J.partner, N_atoms);
-                            
+
+                            // A bond onto the site's own periodic image (lattice
+                            // extent 1 along a bonded direction) is the single-ion
+                            // term S^T J S: fold it into the on-site matrix so the
+                            // energy, the MC energy differences, the local field
+                            // and the dynamics all count it once (pushing J and J^T
+                            // with partner == site made the Metropolis dE miss the
+                            // quadratic part, max |dE - ΔE| = 2.4 on 1x1x1 TmFeO3).
+                            if (partner == site_idx) {
+                                onsite[site_idx] += 0.5 * (J.interaction + J.interaction.transpose());
+                                continue;
+                            }
+
                             bilinear[site_idx].push_back(J.interaction);
                             bi_partners[site_idx].push_back(partner);
                             
@@ -736,7 +835,13 @@ public:
             }
         }
 
-        num_bi = *std::max_element(bi_count.begin(), bi_count.end());
+        // Only the symmetric part of an on-site matrix enters S^T A S.
+        for (size_t idx = 0; idx < lattice_size; ++idx) {
+            onsite[idx] = 0.5 * (onsite[idx] + onsite[idx].transpose()).eval();
+        }
+
+        num_bi = 0;
+        for (const auto& b : bi_partners) num_bi = std::max(num_bi, b.size());
         num_tri = *std::max_element(tri_count.begin(), tri_count.end());
     }
 
@@ -908,16 +1013,16 @@ public:
     // ============================================================
     /**
      * Pack the bilinear / trilinear / mixed interaction tensors into
-     * contiguous row-major double[] buffers used by the MD hot path
-     * (`get_local_field_*_flat_into`).
+     * contiguous row-major double[] buffers used by the MD and MC hot paths
+     * (`get_local_field_*_flat_into`, `linear_field_*`), then rebuild the MC
+     * local-form tables (build_mc_tables).
      *
      * Layout (per site, n indexes the bond):
      *   bilinear_packed_*[site][n*da*db + a*db + b]              = J^n(a,b)
      *   trilinear_packed_*[site][n*da*db*dc + (a*db + b)*dc + c] = T^n[a](b,c)
      *
      * The original `bilinear_interaction_*`, `trilinear_interaction_*`,
-     * `mixed_*_interaction_*` storage is preserved (used by MC code path
-     * and for any rebuilds). Only one rebuild call is required after the
+     * `mixed_*_interaction_*` storage is preserved (source of every rebuild). Only one rebuild call is required after the
      * full interaction graph is set; in our setup that is at the end of
      * the `MixedLattice` constructor (after `build_color_partition()`).
      *
@@ -1068,68 +1173,8 @@ public:
                 }
             }
         }
-    }
 
-    // ============================================================
-    // LOCAL FIELD CACHING INFRASTRUCTURE
-    // ============================================================
-
-    /**
-     * Build reverse lookup tables for mixed bilinear interactions
-     * 
-     * These tables enable efficient cache invalidation:
-     * - mixed_bilinear_reverse_SU2[i] = list of SU(3) sites whose fields depend on SU(2) site i
-     * - mixed_bilinear_reverse_SU3[i] = list of SU(2) sites whose fields depend on SU(3) site i
-     */
-    void build_reverse_lookup_tables() {
-        // Initialize reverse lookup tables
-        mixed_bilinear_reverse_SU2.resize(lattice_size_SU2);
-        mixed_bilinear_reverse_SU3.resize(lattice_size_SU3);
-        
-        // Build reverse lookup from SU(2) -> SU(3)
-        // When SU(2) site i changes, we need to invalidate SU(3) sites that couple to it
-        for (size_t su3_site = 0; su3_site < lattice_size_SU3; ++su3_site) {
-            for (size_t n = 0; n < mixed_bilinear_partners_SU3[su3_site].size(); ++n) {
-                size_t su2_partner = mixed_bilinear_partners_SU3[su3_site][n];
-                mixed_bilinear_reverse_SU2[su2_partner].push_back(su3_site);
-            }
-        }
-        
-        // Build reverse lookup from SU(3) -> SU(2)
-        // When SU(3) site i changes, we need to invalidate SU(2) sites that couple to it
-        for (size_t su2_site = 0; su2_site < lattice_size_SU2; ++su2_site) {
-            for (size_t n = 0; n < mixed_bilinear_partners_SU2[su2_site].size(); ++n) {
-                size_t su3_partner = mixed_bilinear_partners_SU2[su2_site][n];
-                mixed_bilinear_reverse_SU3[su3_partner].push_back(su2_site);
-            }
-        }
-        
-        // Remove duplicates in reverse lookup tables
-        for (size_t i = 0; i < lattice_size_SU2; ++i) {
-            std::sort(mixed_bilinear_reverse_SU2[i].begin(), mixed_bilinear_reverse_SU2[i].end());
-            mixed_bilinear_reverse_SU2[i].erase(
-                std::unique(mixed_bilinear_reverse_SU2[i].begin(), mixed_bilinear_reverse_SU2[i].end()),
-                mixed_bilinear_reverse_SU2[i].end());
-        }
-        for (size_t i = 0; i < lattice_size_SU3; ++i) {
-            std::sort(mixed_bilinear_reverse_SU3[i].begin(), mixed_bilinear_reverse_SU3[i].end());
-            mixed_bilinear_reverse_SU3[i].erase(
-                std::unique(mixed_bilinear_reverse_SU3[i].begin(), mixed_bilinear_reverse_SU3[i].end()),
-                mixed_bilinear_reverse_SU3[i].end());
-        }
-        
-        // Report statistics
-        size_t max_reverse_SU2 = 0, max_reverse_SU3 = 0;
-        for (size_t i = 0; i < lattice_size_SU2; ++i) {
-            max_reverse_SU2 = std::max(max_reverse_SU2, mixed_bilinear_reverse_SU2[i].size());
-        }
-        for (size_t i = 0; i < lattice_size_SU3; ++i) {
-            max_reverse_SU3 = std::max(max_reverse_SU3, mixed_bilinear_reverse_SU3[i].size());
-        }
-        if (max_reverse_SU2 > 0 || max_reverse_SU3 > 0) {
-            cout << "Reverse lookup tables built: max SU2->SU3=" << max_reverse_SU2 
-                 << ", max SU3->SU2=" << max_reverse_SU3 << endl;
-        }
+        build_mc_tables();
     }
 
     /**
@@ -1237,387 +1282,310 @@ public:
                sites_by_color_csr_SU3, n_colors_SU3);
     }
 
-    /**
-     * Enable or disable local field caching mode
-     * 
-     * When enabled, local fields are cached and only invalidated when
-     * neighboring spins change. This is beneficial for interleaved sweeps
-     * with mixed interactions.
-     */
-    void enable_field_caching(bool enable = true) {
-        use_field_caching = enable;
-        if (enable) {
-            invalidate_all_fields();
-        }
-    }
-
-    /**
-     * Initialize field cache by computing all local fields
-     */
-    void init_field_cache() const {
-        for (size_t i = 0; i < lattice_size_SU2; ++i) {
-            if (!field_valid_SU2[i]) {
-                cached_local_field_SU2[i] = get_local_field_SU2(i);
-                field_valid_SU2[i] = true;
-            }
-        }
-        for (size_t i = 0; i < lattice_size_SU3; ++i) {
-            if (!field_valid_SU3[i]) {
-                cached_local_field_SU3[i] = get_local_field_SU3(i);
-                field_valid_SU3[i] = true;
-            }
-        }
-    }
-
-    /**
-     * Invalidate all cached fields
-     */
-    void invalidate_all_fields() const {
-        std::fill(field_valid_SU2.begin(), field_valid_SU2.end(), false);
-        std::fill(field_valid_SU3.begin(), field_valid_SU3.end(), false);
-    }
-
-    /**
-     * Invalidate fields affected by an SU(2) spin update
-     * 
-     * When SU(2) site i is updated:
-     * - All SU(2) sites coupled to i via bilinear/trilinear interactions
-     * - All SU(3) sites coupled to i via mixed interactions
-     */
-    void invalidate_fields_from_SU2_update(size_t su2_site) const {
-        // Invalidate the updated site itself
-        field_valid_SU2[su2_site] = false;
-        
-        // Invalidate SU(2) neighbors (bilinear partners)
-        for (size_t partner : bilinear_partners_SU2[su2_site]) {
-            field_valid_SU2[partner] = false;
-        }
-        
-        // Invalidate SU(2) trilinear partners
-        for (const auto& partners : trilinear_partners_SU2[su2_site]) {
-            field_valid_SU2[partners[0]] = false;
-            field_valid_SU2[partners[1]] = false;
-        }
-        
-        // Invalidate SU(3) sites coupled via mixed bilinear
-        for (size_t su3_site : mixed_bilinear_reverse_SU2[su2_site]) {
-            field_valid_SU3[su3_site] = false;
-        }
-        
-        // Invalidate SU(2) and SU(3) sites coupled via mixed trilinear
-        for (const auto& partners : mixed_trilinear_partners_SU2[su2_site]) {
-            field_valid_SU2[partners[0]] = false;  // SU(2) partner
-            field_valid_SU3[partners[1]] = false;  // SU(3) partner
-        }
-    }
-
-    /**
-     * Invalidate fields affected by an SU(3) spin update
-     * 
-     * When SU(3) site i is updated:
-     * - All SU(3) sites coupled to i via bilinear/trilinear interactions
-     * - All SU(2) sites coupled to i via mixed interactions
-     */
-    void invalidate_fields_from_SU3_update(size_t su3_site) const {
-        // Invalidate the updated site itself
-        field_valid_SU3[su3_site] = false;
-        
-        // Invalidate SU(3) neighbors (bilinear partners)
-        for (size_t partner : bilinear_partners_SU3[su3_site]) {
-            field_valid_SU3[partner] = false;
-        }
-        
-        // Invalidate SU(3) trilinear partners
-        for (const auto& partners : trilinear_partners_SU3[su3_site]) {
-            field_valid_SU3[partners[0]] = false;
-            field_valid_SU3[partners[1]] = false;
-        }
-        
-        // Invalidate SU(2) sites coupled via mixed bilinear
-        for (size_t su2_site : mixed_bilinear_reverse_SU3[su3_site]) {
-            field_valid_SU2[su2_site] = false;
-        }
-        
-        // Invalidate SU(2) and SU(3) sites coupled via mixed trilinear (SU3-SU2-SU2)
-        for (const auto& partners : mixed_trilinear_partners_SU3[su3_site]) {
-            field_valid_SU2[partners[0]] = false;  // SU(2) partner 1
-            field_valid_SU2[partners[1]] = false;  // SU(2) partner 2
-        }
-    }
-
-    /**
-     * Get cached local field for SU(2) site (computes if invalid)
-     */
-    SpinVector get_cached_local_field_SU2(size_t site_index) const {
-        if (!field_valid_SU2[site_index]) {
-            cached_local_field_SU2[site_index] = get_local_field_SU2(site_index);
-            field_valid_SU2[site_index] = true;
-        }
-        return cached_local_field_SU2[site_index];
-    }
-
-    /**
-     * Get cached local field for SU(3) site (computes if invalid)
-     */
-    SpinVector get_cached_local_field_SU3(size_t site_index) const {
-        if (!field_valid_SU3[site_index]) {
-            cached_local_field_SU3[site_index] = get_local_field_SU3(site_index);
-            field_valid_SU3[site_index] = true;
-        }
-        return cached_local_field_SU3[site_index];
-    }
-
     // ============================================================
     // ENERGY CALCULATIONS
     // ============================================================
 
     /**
-     * Compute energy difference for an SU(2) spin flip
+     * Build the Monte Carlo local-form tables (see SelfQuadTerm): symmetrised
+     * on-site matrices, the self-coupled trilinear entries merged per partner,
+     * and the per-site self-energy class. Called by
+     * build_packed_interaction_buffers() after every change of the coupling
+     * tables.
      */
-    double site_energy_SU2_diff(const SpinVector& new_spin, const SpinVector& old_spin, size_t site_index) const {
-        const SpinVector spin_diff = new_spin - old_spin;
-        
-        // Field energy
-        double field_energy = -spin_diff.dot(field_SU2[site_index]);
-        
-        // Onsite energy
-        double onsite_energy = (new_spin + old_spin).dot(onsite_interaction_SU2[site_index] * spin_diff);
-        
-        // Bilinear SU(2)-SU(2) interactions
-        double bilinear_energy = 0.0;
-        for (size_t i = 0; i < bilinear_partners_SU2[site_index].size(); ++i) {
-            const size_t partner_idx = bilinear_partners_SU2[site_index][i];
-            bilinear_energy += spin_diff.dot(bilinear_interaction_SU2[site_index][i] * spins_SU2[partner_idx]);
-        }
-        
-        // Mixed bilinear SU(2)-SU(3) interactions
-        double mixed_bilinear_energy = 0.0;
-        for (size_t i = 0; i < mixed_bilinear_partners_SU2[site_index].size(); ++i) {
-            const size_t partner_idx = mixed_bilinear_partners_SU2[site_index][i];
-            mixed_bilinear_energy += spin_diff.dot(mixed_bilinear_interaction_SU2[site_index][i] * spins_SU3[partner_idx]);
-        }
-        
-        // Trilinear SU(2)-SU(2)-SU(2) interactions.
-        //
-        // For a single-spin Metropolis move at site i, the change in any
-        // trilinear term T_{abc} S^i_a S^j_b S^k_c is
-        //     dE = (S_new - S_old) . V,  V[a] = sum_{bc} T[a,b,c] S^j_b S^k_c
-        // when neither partner is site i. This collapses two O(d^3)
-        // monomial evaluations (old and new) into a single O(d^3)
-        // contraction plus an O(d) dot product -- the canonical
-        // tensor-network "contract first, project later" optimization.
-        // The rare self-coupling case (p1==i or p2==i) still needs the
-        // explicit old/new path because S^i appears in two or three slots.
-        double trilinear_energy = 0.0;
-        for (size_t i = 0; i < trilinear_partners_SU2[site_index].size(); ++i) {
-            const size_t p1_idx = trilinear_partners_SU2[site_index][i][0];
-            const size_t p2_idx = trilinear_partners_SU2[site_index][i][1];
-            const auto& T = trilinear_interaction_SU2[site_index][i];
-            const bool p1_self = (p1_idx == site_index);
-            const bool p2_self = (p2_idx == site_index);
+    void build_mc_tables() {
+        build_mc_tables_species(false);
+        build_mc_tables_species(true);
+    }
 
-            if (!p1_self && !p2_self) {
-                // Fast path (the common case): pre-contract partners.
-                const SpinVector& p1 = spins_SU2[p1_idx];
-                const SpinVector& p2 = spins_SU2[p2_idx];
-                double dE_term = 0.0;
-                for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                    double Va = 0.0;
-                    const auto& Ta = T[a];
-                    for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                        const double p1b = p1(b);
-                        for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                            Va += Ta(b, c) * p1b * p2(c);
-                        }
-                    }
-                    dE_term += spin_diff(a) * Va;
-                }
-                trilinear_energy += dE_term;  // multiplicity == 1
-            } else {
-                // Slow path: a single-spin flip changes more than one slot
-                // of the trilinear monomial, so the full old/new evaluation
-                // is required and a multiplicity correction restores the
-                // unique-term counting expected by total_energy().
-                const SpinVector& p1_old = p1_self ? old_spin : spins_SU2[p1_idx];
-                const SpinVector& p1_new = p1_self ? new_spin : spins_SU2[p1_idx];
-                const SpinVector& p2_old = p2_self ? old_spin : spins_SU2[p2_idx];
-                const SpinVector& p2_new = p2_self ? new_spin : spins_SU2[p2_idx];
+private:
+    void build_mc_tables_species(bool su3) {
+        const size_t N = su3 ? lattice_size_SU3 : lattice_size_SU2;
+        const size_t d = su3 ? spin_dim_SU3 : spin_dim_SU2;
+        const auto& onsite = su3 ? onsite_interaction_SU3 : onsite_interaction_SU2;
+        const auto& tri = su3 ? trilinear_interaction_SU3 : trilinear_interaction_SU2;
+        const auto& tri_p = su3 ? trilinear_partners_SU3 : trilinear_partners_SU2;
+        auto& osym = su3 ? onsite_sym_SU3 : onsite_sym_SU2;
+        auto& off = su3 ? selfq_off_SU3 : selfq_off_SU2;
+        auto& terms = su3 ? selfq_SU3 : selfq_SU2;
+        auto& coef = su3 ? selfq_coef_SU3 : selfq_coef_SU2;
+        auto& cubic = su3 ? cubic_self_SU3 : cubic_self_SU2;
+        auto& mode = su3 ? self_mode_SU3 : self_mode_SU2;
+        auto& iso = su3 ? self_isotropic_SU3 : self_isotropic_SU2;
 
-                double old_term = 0.0;
-                double new_term = 0.0;
-                for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                    const auto& Ta = T[a];
-                    for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                        for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                            const double coeff = Ta(b, c);
-                            old_term += coeff * old_spin(a) * p1_old(b) * p2_old(c);
-                            new_term += coeff * new_spin(a) * p1_new(b) * p2_new(c);
-                        }
-                    }
+        osym.assign(N * d * d, 0.0);
+        off.assign(N + 1, 0);
+        terms.clear();
+        coef.clear();
+        cubic.assign(N, {});
+        mode.assign(N, 0);
+        iso.assign(N, 1);
+
+        for (size_t i = 0; i < N; ++i) {
+            // On-site matrix: symmetric part, and whether it is a multiple of
+            // the identity (then S^T A S is constant on the manifold).
+            double* O = &osym[i * d * d];
+            double scale = 0.0, trace = 0.0;
+            for (size_t a = 0; a < d; ++a)
+                for (size_t b = 0; b < d; ++b) {
+                    O[a * d + b] = 0.5 * (onsite[i](a, b) + onsite[i](b, a));
+                    scale = std::max(scale, std::abs(O[a * d + b]));
                 }
-                const double multiplicity = 1.0 +
-                    (p1_self ? 1.0 : 0.0) + (p2_self ? 1.0 : 0.0);
-                trilinear_energy += (new_term - old_term) / multiplicity;
+            for (size_t a = 0; a < d; ++a) trace += O[a * d + a];
+            trace /= double(d);
+            bool onsite_scalar = true;
+            for (size_t a = 0; a < d; ++a)
+                for (size_t b = 0; b < d; ++b)
+                    if (std::abs(O[a * d + b] - (a == b ? trace : 0.0)) > 1e-14 * scale) onsite_scalar = false;
+
+            // Self-coupled entries, merged per (species, partner). Each entry
+            // with one partner slot equal to i is quadratic in S_i with weight
+            // 1/2; Q[a][b][c] multiplies S_a S_b x_c, symmetrised in (a, b).
+            const size_t first = terms.size();
+            auto term_offset = [&](bool partner_su3, size_t partner) -> size_t {
+                for (size_t t = first; t < terms.size(); ++t)
+                    if (terms[t].partner == partner && bool(terms[t].partner_su3) == partner_su3)
+                        return terms[t].offset;
+                const size_t dim = partner_su3 ? spin_dim_SU3 : spin_dim_SU2;
+                terms.push_back({partner, coef.size(), uint8_t(partner_su3), uint8_t(dim)});
+                coef.resize(coef.size() + d * d * dim, 0.0);
+                return terms.back().offset;
+            };
+            for (size_t n = 0; n < tri[i].size(); ++n) {
+                const size_t p1 = tri_p[i][n][0], p2 = tri_p[i][n][1];
+                const bool s1 = (p1 == i), s2 = (p2 == i);
+                if (s1 && s2) { cubic[i].push_back(uint32_t(n)); continue; }
+                if (!s1 && !s2) continue;
+                const auto& T = tri[i][n];   // T[a](b, c): slots (i, p1, p2)
+                const size_t q = term_offset(su3, s1 ? p2 : p1);
+                for (size_t a = 0; a < d; ++a)
+                    for (size_t b = 0; b < d; ++b)
+                        for (size_t c = 0; c < d; ++c) {
+                            const double v_ab = s1 ? T[a](b, c) : T[a](c, b);
+                            const double v_ba = s1 ? T[b](a, c) : T[b](c, a);
+                            coef[q + (a * d + b) * d + c] += 0.25 * (v_ab + v_ba);
+                        }
+            }
+            if (!su3) {
+                // SU(2)-SU(2)-SU(3): only the SU(2) partner can coincide with i.
+                for (size_t n = 0; n < mixed_trilinear_partners_SU2[i].size(); ++n) {
+                    if (mixed_trilinear_partners_SU2[i][n][0] != i) continue;
+                    const auto& K = mixed_trilinear_interaction_SU2[i][n];   // K[a](b, c), c in SU(3)
+                    const size_t q = term_offset(true, mixed_trilinear_partners_SU2[i][n][1]);
+                    for (size_t a = 0; a < d; ++a)
+                        for (size_t b = 0; b < d; ++b)
+                            for (size_t c = 0; c < spin_dim_SU3; ++c)
+                                coef[q + (a * d + b) * spin_dim_SU3 + c] += 0.25 * (K[a](b, c) + K[b](a, c));
+                }
+            }
+            off[i + 1] = terms.size();
+            const bool has_self = terms.size() > first || !cubic[i].empty();
+            mode[i] = !cubic[i].empty() ? 2 : ((has_self || scale > 0.0) ? 1 : 0);
+            iso[i] = (!has_self && onsite_scalar) ? 1 : 0;
+        }
+    }
+
+    // h[a] += sum_bc T[(a DB + b) DC + c] x[b] y[c]  (row-major packed trilinear entry)
+    template <int DA, int DB, int DC>
+    static inline void contract_trilinear(const double* __restrict T, const double* __restrict x,
+                                          const double* __restrict y, double* __restrict h) {
+        for (int a = 0; a < DA; ++a) {
+            double acc = 0.0;
+            for (int b = 0; b < DB; ++b) {
+                double row = 0.0;
+                for (int c = 0; c < DC; ++c) row += T[(a * DB + b) * DC + c] * y[c];
+                acc += x[b] * row;
+            }
+            h[a] += acc;
+        }
+    }
+
+    // h[a] += sum_b J[a DB + b] x[b]  (row-major packed bilinear entry)
+    template <int DA, int DB>
+    static inline void contract_bilinear(const double* __restrict J, const double* __restrict x,
+                                         double* __restrict h) {
+        for (int a = 0; a < DA; ++a) {
+            double acc = 0.0;
+            for (int b = 0; b < DB; ++b) acc += J[a * DB + b] * x[b];
+            h[a] += acc;
+        }
+    }
+
+    template <int D>
+    static inline double quadratic_form(const double* __restrict A, const double* __restrict S) {
+        double e = 0.0;
+        for (int a = 0; a < D; ++a) {
+            double row = 0.0;
+            for (int b = 0; b < D; ++b) row += A[a * D + b] * S[b];
+            e += S[a] * row;
+        }
+        return e;
+    }
+
+public:
+    /**
+     * Linear coefficient h_i of the local energy of SU(2) site i (every term
+     * that contains S_i exactly once): the local energy is
+     * h_i . S + S^T A_i S (+ cubic self terms). Writes h[0..2]. Excludes the
+     * on-site and self-coupled terms, so unlike get_local_field_SU2 (the full
+     * gradient dE/dS) it does not depend on S_i itself.
+     */
+    inline void linear_field_SU2(size_t i, double* __restrict h) const {
+        const double* B = field_SU2[i].data();
+        h[0] = -B[0]; h[1] = -B[1]; h[2] = -B[2];
+        const auto& bp = bilinear_partners_SU2[i];
+        if (!bp.empty()) {
+            const double* J = bilinear_packed_SU2[i].data();
+            for (size_t n = 0; n < bp.size(); ++n) contract_bilinear<3, 3>(J + 9 * n, spins_SU2[bp[n]].data(), h);
+        }
+        const auto& mbp = mixed_bilinear_partners_SU2[i];
+        if (!mbp.empty()) {
+            const double* J = mixed_bilinear_packed_SU2[i].data();
+            for (size_t n = 0; n < mbp.size(); ++n) contract_bilinear<3, 8>(J + 24 * n, spins_SU3[mbp[n]].data(), h);
+        }
+        const auto& tp = trilinear_partners_SU2[i];
+        if (!tp.empty()) {
+            const double* T = trilinear_packed_SU2[i].data();
+            for (size_t n = 0; n < tp.size(); ++n) {
+                if (tp[n][0] == i || tp[n][1] == i) continue;   // self-coupled: in A_i
+                contract_trilinear<3, 3, 3>(T + 27 * n, spins_SU2[tp[n][0]].data(), spins_SU2[tp[n][1]].data(), h);
             }
         }
-
-        // Mixed trilinear SU(2)-SU(2)-SU(3) interactions.
-        // The SU(3) partner can never collide with an SU(2) site (different
-        // species), so only the SU(2) partner p1 may collide.
-        double mixed_trilinear_energy = 0.0;
-        for (size_t i = 0; i < mixed_trilinear_partners_SU2[site_index].size(); ++i) {
-            const size_t p1_idx = mixed_trilinear_partners_SU2[site_index][i][0];
-            const size_t p2_idx = mixed_trilinear_partners_SU2[site_index][i][1];
-            const auto& T = mixed_trilinear_interaction_SU2[site_index][i];
-            const bool p1_self = (p1_idx == site_index);
-
-            if (!p1_self) {
-                // Fast path: pre-contract V[a] = sum_{bc} T[a,b,c] p1(b) p2(c).
-                const SpinVector& p1 = spins_SU2[p1_idx];
-                const SpinVector& p2 = spins_SU3[p2_idx];
-                double dE_term = 0.0;
-                for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                    double Va = 0.0;
-                    const auto& Ta = T[a];
-                    for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                        const double p1b = p1(b);
-                        for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                            Va += Ta(b, c) * p1b * p2(c);
-                        }
-                    }
-                    dE_term += spin_diff(a) * Va;
-                }
-                mixed_trilinear_energy += dE_term;  // multiplicity == 1
-            } else {
-                const SpinVector& p1_old = old_spin;
-                const SpinVector& p1_new = new_spin;
-                const SpinVector& p2 = spins_SU3[p2_idx];
-                double old_term = 0.0;
-                double new_term = 0.0;
-                for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                    const auto& Ta = T[a];
-                    for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                        for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                            const double coeff = Ta(b, c);
-                            old_term += coeff * old_spin(a) * p1_old(b) * p2(c);
-                            new_term += coeff * new_spin(a) * p1_new(b) * p2(c);
-                        }
-                    }
-                }
-                mixed_trilinear_energy += (new_term - old_term) / 2.0;
+        const auto& mtp = mixed_trilinear_partners_SU2[i];
+        if (!mtp.empty()) {
+            const double* T = mixed_trilinear_packed_SU2[i].data();
+            for (size_t n = 0; n < mtp.size(); ++n) {
+                if (mtp[n][0] == i) continue;                   // W(S_i, S_i, n_k): in A_i
+                contract_trilinear<3, 3, 8>(T + 72 * n, spins_SU2[mtp[n][0]].data(), spins_SU3[mtp[n][1]].data(), h);
             }
         }
-        
-        return field_energy + onsite_energy + bilinear_energy + mixed_bilinear_energy + 
-               trilinear_energy + mixed_trilinear_energy;
+    }
+
+    /// SU(3) analogue of linear_field_SU2; writes h[0..7] (h . n is the linear part of the local energy).
+    inline void linear_field_SU3(size_t j, double* __restrict h) const {
+        const double* B = field_SU3[j].data();
+        for (int a = 0; a < 8; ++a) h[a] = -B[a];
+        const auto& bp = bilinear_partners_SU3[j];
+        if (!bp.empty()) {
+            const double* J = bilinear_packed_SU3[j].data();
+            for (size_t n = 0; n < bp.size(); ++n) contract_bilinear<8, 8>(J + 64 * n, spins_SU3[bp[n]].data(), h);
+        }
+        const auto& mbp = mixed_bilinear_partners_SU3[j];
+        if (!mbp.empty()) {
+            const double* J = mixed_bilinear_packed_SU3[j].data();
+            for (size_t n = 0; n < mbp.size(); ++n) contract_bilinear<8, 3>(J + 24 * n, spins_SU2[mbp[n]].data(), h);
+        }
+        const auto& tp = trilinear_partners_SU3[j];
+        if (!tp.empty()) {
+            const double* T = trilinear_packed_SU3[j].data();
+            for (size_t n = 0; n < tp.size(); ++n) {
+                if (tp[n][0] == j || tp[n][1] == j) continue;
+                contract_trilinear<8, 8, 8>(T + 512 * n, spins_SU3[tp[n][0]].data(), spins_SU3[tp[n][1]].data(), h);
+            }
+        }
+        const auto& mtp = mixed_trilinear_partners_SU3[j];
+        if (!mtp.empty()) {   // partners are SU(2) sites: never self-coupled
+            const double* T = mixed_trilinear_packed_SU3[j].data();
+            for (size_t n = 0; n < mtp.size(); ++n)
+                contract_trilinear<8, 3, 3>(T + 72 * n, spins_SU2[mtp[n][0]].data(), spins_SU2[mtp[n][1]].data(), h);
+        }
+    }
+
+    /// Quadratic self form A_i of SU(2) site i (row-major 3x3, symmetric): sym(onsite) plus the
+    /// self-coupled trilinear entries with their partner contracted.
+    inline void self_form_SU2(size_t i, double* __restrict A) const {
+        const double* O = &onsite_sym_SU2[i * 9];
+        for (int k = 0; k < 9; ++k) A[k] = O[k];
+        for (size_t t = selfq_off_SU2[i]; t < selfq_off_SU2[i + 1]; ++t) {
+            const SelfQuadTerm& q = selfq_SU2[t];
+            const double* x = q.partner_su3 ? spins_SU3[q.partner].data() : spins_SU2[q.partner].data();
+            if (q.dim == 8) contract_bilinear<9, 8>(&selfq_coef_SU2[q.offset], x, A);
+            else contract_bilinear<9, 3>(&selfq_coef_SU2[q.offset], x, A);
+        }
+    }
+
+    /// Quadratic self form A_j of SU(3) site j (row-major 8x8, symmetric).
+    inline void self_form_SU3(size_t j, double* __restrict A) const {
+        const double* O = &onsite_sym_SU3[j * 64];
+        for (int k = 0; k < 64; ++k) A[k] = O[k];
+        for (size_t t = selfq_off_SU3[j]; t < selfq_off_SU3[j + 1]; ++t) {
+            const SelfQuadTerm& q = selfq_SU3[t];
+            contract_bilinear<64, 8>(&selfq_coef_SU3[q.offset], spins_SU3[q.partner].data(), A);
+        }
+    }
+
+    /// Self energy S^T A S of SU(2) site i at S, plus its cubic self entries (weight 1/3 each).
+    inline double self_energy_SU2(size_t i, const double* A, const double* S) const {
+        double e = quadratic_form<3>(A, S);
+        if (self_mode_SU2[i] == 2) {
+            for (uint32_t n : cubic_self_SU2[i]) {
+                double g[3] = {0.0, 0.0, 0.0};
+                contract_trilinear<3, 3, 3>(trilinear_packed_SU2[i].data() + 27 * n, S, S, g);
+                e += (g[0] * S[0] + g[1] * S[1] + g[2] * S[2]) / 3.0;
+            }
+        }
+        return e;
+    }
+
+    /// Self energy n^T A n of SU(3) site j at n, plus its cubic self entries.
+    inline double self_energy_SU3(size_t j, const double* A, const double* n) const {
+        double e = quadratic_form<8>(A, n);
+        if (self_mode_SU3[j] == 2) {
+            for (uint32_t m : cubic_self_SU3[j]) {
+                double g[8] = {};
+                contract_trilinear<8, 8, 8>(trilinear_packed_SU3[j].data() + 512 * m, n, n, g);
+                double s = 0.0;
+                for (int a = 0; a < 8; ++a) s += g[a] * n[a];
+                e += s / 3.0;
+            }
+        }
+        return e;
+    }
+
+    /// Exact local energy change of SU(2) site i from So to Sn, given its linear field h.
+    inline double local_energy_change_SU2(size_t i, const double* h, const double* Sn, const double* So) const {
+        double dE = h[0] * (Sn[0] - So[0]) + h[1] * (Sn[1] - So[1]) + h[2] * (Sn[2] - So[2]);
+        if (self_mode_SU2[i]) {
+            double A[9];
+            self_form_SU2(i, A);
+            dE += self_energy_SU2(i, A, Sn) - self_energy_SU2(i, A, So);
+        }
+        return dE;
+    }
+
+    /// Exact local energy change of SU(3) site j from no to nn, given its linear field h.
+    inline double local_energy_change_SU3(size_t j, const double* h, const double* nn, const double* no) const {
+        double dE = 0.0;
+        for (int a = 0; a < 8; ++a) dE += h[a] * (nn[a] - no[a]);
+        if (self_mode_SU3[j]) {
+            double A[64];
+            self_form_SU3(j, A);
+            dE += self_energy_SU3(j, A, nn) - self_energy_SU3(j, A, no);
+        }
+        return dE;
     }
 
     /**
-     * Compute energy difference for an SU(3) spin flip
+     * Change of total_energy() when SU(2) site `site_index` goes from
+     * old_spin to new_spin with every other spin fixed. Exact for every
+     * coupling, including on-site anisotropy, self-bonds (folded into the
+     * on-site matrix) and trilinear terms with S_i in more than one slot;
+     * new_spin and old_spin need not have the same length.
+     */
+    double site_energy_SU2_diff(const SpinVector& new_spin, const SpinVector& old_spin, size_t site_index) const {
+        double h[3];
+        linear_field_SU2(site_index, h);
+        return local_energy_change_SU2(site_index, h, new_spin.data(), old_spin.data());
+    }
+
+    /**
+     * Change of total_energy() when SU(3) site `site_index` goes from
+     * old_spin to new_spin (see site_energy_SU2_diff).
      */
     double site_energy_SU3_diff(const SpinVector& new_spin, const SpinVector& old_spin, size_t site_index) const {
-        const SpinVector spin_diff = new_spin - old_spin;
-        
-        // Field energy
-        double field_energy = -spin_diff.dot(field_SU3[site_index]);
-        
-        // Onsite energy
-        double onsite_energy = (new_spin + old_spin).dot(onsite_interaction_SU3[site_index] * spin_diff);
-        
-        // Bilinear SU(3)-SU(3) interactions
-        double bilinear_energy = 0.0;
-        for (size_t i = 0; i < bilinear_partners_SU3[site_index].size(); ++i) {
-            const size_t partner_idx = bilinear_partners_SU3[site_index][i];
-            bilinear_energy += spin_diff.dot(bilinear_interaction_SU3[site_index][i] * spins_SU3[partner_idx]);
-        }
-        
-        // Mixed bilinear SU(3)-SU(2) interactions
-        double mixed_bilinear_energy = 0.0;
-        for (size_t i = 0; i < mixed_bilinear_partners_SU3[site_index].size(); ++i) {
-            const size_t partner_idx = mixed_bilinear_partners_SU3[site_index][i];
-            mixed_bilinear_energy += spin_diff.dot(mixed_bilinear_interaction_SU3[site_index][i] * spins_SU2[partner_idx]);
-        }
-        
-        // Trilinear SU(3)-SU(3)-SU(3) interactions.
-        // See site_energy_SU2_diff for the algebra; the savings here are
-        // proportionally larger because spin_dim_SU3 = 8 (so a triple loop
-        // is 512 multiply-adds vs 27 for SU(2)).
-        double trilinear_energy = 0.0;
-        for (size_t i = 0; i < trilinear_partners_SU3[site_index].size(); ++i) {
-            const size_t p1_idx = trilinear_partners_SU3[site_index][i][0];
-            const size_t p2_idx = trilinear_partners_SU3[site_index][i][1];
-            const auto& T = trilinear_interaction_SU3[site_index][i];
-            const bool p1_self = (p1_idx == site_index);
-            const bool p2_self = (p2_idx == site_index);
-
-            if (!p1_self && !p2_self) {
-                const SpinVector& p1 = spins_SU3[p1_idx];
-                const SpinVector& p2 = spins_SU3[p2_idx];
-                double dE_term = 0.0;
-                for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                    double Va = 0.0;
-                    const auto& Ta = T[a];
-                    for (size_t b = 0; b < spin_dim_SU3; ++b) {
-                        const double p1b = p1(b);
-                        for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                            Va += Ta(b, c) * p1b * p2(c);
-                        }
-                    }
-                    dE_term += spin_diff(a) * Va;
-                }
-                trilinear_energy += dE_term;  // multiplicity == 1
-            } else {
-                const SpinVector& p1_old = p1_self ? old_spin : spins_SU3[p1_idx];
-                const SpinVector& p1_new = p1_self ? new_spin : spins_SU3[p1_idx];
-                const SpinVector& p2_old = p2_self ? old_spin : spins_SU3[p2_idx];
-                const SpinVector& p2_new = p2_self ? new_spin : spins_SU3[p2_idx];
-
-                double old_term = 0.0;
-                double new_term = 0.0;
-                for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                    const auto& Ta = T[a];
-                    for (size_t b = 0; b < spin_dim_SU3; ++b) {
-                        for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                            const double coeff = Ta(b, c);
-                            old_term += coeff * old_spin(a) * p1_old(b) * p2_old(c);
-                            new_term += coeff * new_spin(a) * p1_new(b) * p2_new(c);
-                        }
-                    }
-                }
-                const double multiplicity = 1.0 +
-                    (p1_self ? 1.0 : 0.0) + (p2_self ? 1.0 : 0.0);
-                trilinear_energy += (new_term - old_term) / multiplicity;
-            }
-        }
-
-        // Mixed trilinear SU(3)-SU(2)-SU(2) interactions.
-        // SU(2) partners are on a different sublattice from the SU(3) site,
-        // so collisions are impossible; we always take the fast path.
-        double mixed_trilinear_energy = 0.0;
-        for (size_t i = 0; i < mixed_trilinear_partners_SU3[site_index].size(); ++i) {
-            const size_t p1_idx = mixed_trilinear_partners_SU3[site_index][i][0];
-            const size_t p2_idx = mixed_trilinear_partners_SU3[site_index][i][1];
-            const auto& T = mixed_trilinear_interaction_SU3[site_index][i];
-            const SpinVector& p1 = spins_SU2[p1_idx];
-            const SpinVector& p2 = spins_SU2[p2_idx];
-
-            double dE_term = 0.0;
-            for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                double Va = 0.0;
-                const auto& Ta = T[a];
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    const double p1b = p1(b);
-                    for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                        Va += Ta(b, c) * p1b * p2(c);
-                    }
-                }
-                dE_term += spin_diff(a) * Va;
-            }
-            mixed_trilinear_energy += dE_term;
-        }
-        
-        return field_energy + onsite_energy + bilinear_energy + mixed_bilinear_energy + 
-               trilinear_energy + mixed_trilinear_energy;
+        double h[8];
+        linear_field_SU3(site_index, h);
+        return local_energy_change_SU3(site_index, h, new_spin.data(), old_spin.data());
     }
 
     /**
@@ -1650,129 +1618,66 @@ public:
 
     /**
      * Compute total energy of the SU(2) sublattice only
-     * Includes SU2-SU2 interactions, SU2 field/onsite, and half of mixed interactions
+     * Includes SU2-SU2 interactions, SU2 field/onsite, half of each mixed
+     * bilinear and one third of each mixed-trilinear entry stored at SU(2)
+     * sites (only the sum total_energy() is convention-free).
      */
     double total_energy_SU2() const {
         double energy = 0.0;
-        
         for (size_t i = 0; i < lattice_size_SU2; ++i) {
-            const auto& spin = spins_SU2[i];
-            
-            // Field and onsite
-            energy -= spin.dot(field_SU2[i]);
-            energy += spin.dot(onsite_interaction_SU2[i] * spin);
-            
-            // Bilinear SU2-SU2
-            for (size_t j = 0; j < bilinear_partners_SU2[i].size(); ++j) {
-                const size_t partner = bilinear_partners_SU2[i][j];
-                energy += 0.5 * spin.dot(bilinear_interaction_SU2[i][j] * spins_SU2[partner]);
-            }
-            
-            // Mixed bilinear SU2-SU3 (count half for SU2)
-            for (size_t j = 0; j < mixed_bilinear_partners_SU2[i].size(); ++j) {
-                const size_t partner = mixed_bilinear_partners_SU2[i][j];
-                energy += 0.5 * spin.dot(mixed_bilinear_interaction_SU2[i][j] * spins_SU3[partner]);
-            }
-
-            // Mixed trilinear SU2-SU2-SU3
-            for (size_t j = 0; j < mixed_trilinear_partners_SU2[i].size(); ++j) {
-                const size_t p1 = mixed_trilinear_partners_SU2[i][j][0];
-                const size_t p2 = mixed_trilinear_partners_SU2[i][j][1];
-                const auto& T = mixed_trilinear_interaction_SU2[i][j];
-
-                for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                    double temp = 0.0;
-                    for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                        for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                            temp += T[a](b, c) * spins_SU2[p1](b) * spins_SU3[p2](c);
-                        }
-                    }
-                    energy += (1.0 / 3.0) * spin(a) * temp;
-                }
-            }
-            
-            // Trilinear SU2-SU2-SU2
-            for (size_t j = 0; j < trilinear_partners_SU2[i].size(); ++j) {
-                const size_t p1 = trilinear_partners_SU2[i][j][0];
-                const size_t p2 = trilinear_partners_SU2[i][j][1];
-                const auto& T = trilinear_interaction_SU2[i][j];
-                
-                for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                    double temp = 0.0;
-                    for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                        for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                            temp += T[a](b, c) * spins_SU2[p1](b) * spins_SU2[p2](c);
-                        }
-                    }
-                    energy += (1.0/3.0) * spin(a) * temp;
-                }
-            }
+            const double* S = spins_SU2[i].data();
+            const double* B = field_SU2[i].data();
+            double half[3] = {0.0, 0.0, 0.0}, third[3] = {0.0, 0.0, 0.0};
+            const auto& bp = bilinear_partners_SU2[i];
+            for (size_t n = 0; n < bp.size(); ++n)
+                contract_bilinear<3, 3>(bilinear_packed_SU2[i].data() + 9 * n, spins_SU2[bp[n]].data(), half);
+            const auto& mbp = mixed_bilinear_partners_SU2[i];
+            for (size_t n = 0; n < mbp.size(); ++n)
+                contract_bilinear<3, 8>(mixed_bilinear_packed_SU2[i].data() + 24 * n, spins_SU3[mbp[n]].data(), half);
+            const auto& tp = trilinear_partners_SU2[i];
+            for (size_t n = 0; n < tp.size(); ++n)
+                contract_trilinear<3, 3, 3>(trilinear_packed_SU2[i].data() + 27 * n, spins_SU2[tp[n][0]].data(),
+                                            spins_SU2[tp[n][1]].data(), third);
+            const auto& mtp = mixed_trilinear_partners_SU2[i];
+            for (size_t n = 0; n < mtp.size(); ++n)
+                contract_trilinear<3, 3, 8>(mixed_trilinear_packed_SU2[i].data() + 72 * n, spins_SU2[mtp[n][0]].data(),
+                                            spins_SU3[mtp[n][1]].data(), third);
+            double e = quadratic_form<3>(&onsite_sym_SU2[i * 9], S);
+            for (int a = 0; a < 3; ++a) e += S[a] * (-B[a] + 0.5 * half[a] + third[a] / 3.0);
+            energy += e;
         }
-        
         return energy;
     }
 
     /**
      * Compute total energy of the SU(3) sublattice only
-     * Includes SU3-SU3 interactions, SU3 field/onsite, and half of mixed interactions
+     * Includes SU3-SU3 interactions, SU3 field/onsite, and the remaining half
+     * (mixed bilinear) / third (mixed trilinear) of the mixed terms.
      */
     double total_energy_SU3() const {
         double energy = 0.0;
-        
-        for (size_t i = 0; i < lattice_size_SU3; ++i) {
-            const auto& spin = spins_SU3[i];
-            
-            // Field and onsite
-            energy -= spin.dot(field_SU3[i]);
-            energy += spin.dot(onsite_interaction_SU3[i] * spin);
-            
-            // Bilinear SU3-SU3
-            for (size_t j = 0; j < bilinear_partners_SU3[i].size(); ++j) {
-                const size_t partner = bilinear_partners_SU3[i][j];
-                energy += 0.5 * spin.dot(bilinear_interaction_SU3[i][j] * spins_SU3[partner]);
-            }
-            
-            // Mixed bilinear SU3-SU2 (count half for SU3)
-            for (size_t j = 0; j < mixed_bilinear_partners_SU3[i].size(); ++j) {
-                const size_t partner = mixed_bilinear_partners_SU3[i][j];
-                energy += 0.5 * spin.dot(mixed_bilinear_interaction_SU3[i][j] * spins_SU2[partner]);
-            }
-
-            // Mixed trilinear SU3-SU2-SU2
-            for (size_t j = 0; j < mixed_trilinear_partners_SU3[i].size(); ++j) {
-                const size_t p1 = mixed_trilinear_partners_SU3[i][j][0];
-                const size_t p2 = mixed_trilinear_partners_SU3[i][j][1];
-                const auto& T = mixed_trilinear_interaction_SU3[i][j];
-
-                for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                    double temp = 0.0;
-                    for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                        for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                            temp += T[a](b, c) * spins_SU2[p1](b) * spins_SU2[p2](c);
-                        }
-                    }
-                    energy += (1.0 / 3.0) * spin(a) * temp;
-                }
-            }
-            
-            // Trilinear SU3-SU3-SU3
-            for (size_t j = 0; j < trilinear_partners_SU3[i].size(); ++j) {
-                const size_t p1 = trilinear_partners_SU3[i][j][0];
-                const size_t p2 = trilinear_partners_SU3[i][j][1];
-                const auto& T = trilinear_interaction_SU3[i][j];
-                
-                for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                    double temp = 0.0;
-                    for (size_t b = 0; b < spin_dim_SU3; ++b) {
-                        for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                            temp += T[a](b, c) * spins_SU3[p1](b) * spins_SU3[p2](c);
-                        }
-                    }
-                    energy += (1.0/3.0) * spin(a) * temp;
-                }
-            }
+        for (size_t j = 0; j < lattice_size_SU3; ++j) {
+            const double* n3 = spins_SU3[j].data();
+            const double* B = field_SU3[j].data();
+            double half[8] = {}, third[8] = {};
+            const auto& bp = bilinear_partners_SU3[j];
+            for (size_t n = 0; n < bp.size(); ++n)
+                contract_bilinear<8, 8>(bilinear_packed_SU3[j].data() + 64 * n, spins_SU3[bp[n]].data(), half);
+            const auto& mbp = mixed_bilinear_partners_SU3[j];
+            for (size_t n = 0; n < mbp.size(); ++n)
+                contract_bilinear<8, 3>(mixed_bilinear_packed_SU3[j].data() + 24 * n, spins_SU2[mbp[n]].data(), half);
+            const auto& tp = trilinear_partners_SU3[j];
+            for (size_t n = 0; n < tp.size(); ++n)
+                contract_trilinear<8, 8, 8>(trilinear_packed_SU3[j].data() + 512 * n, spins_SU3[tp[n][0]].data(),
+                                            spins_SU3[tp[n][1]].data(), third);
+            const auto& mtp = mixed_trilinear_partners_SU3[j];
+            for (size_t n = 0; n < mtp.size(); ++n)
+                contract_trilinear<8, 3, 3>(mixed_trilinear_packed_SU3[j].data() + 72 * n, spins_SU2[mtp[n][0]].data(),
+                                            spins_SU2[mtp[n][1]].data(), third);
+            double e = quadratic_form<8>(&onsite_sym_SU3[j * 64], n3);
+            for (int a = 0; a < 8; ++a) e += n3[a] * (-B[a] + 0.5 * half[a] + third[a] / 3.0);
+            energy += e;
         }
-        
         return energy;
     }
 
@@ -1945,620 +1850,537 @@ public:
     // ============================================================
     // MONTE CARLO METHODS
     // ============================================================
+    //
+    // Every sweep visits each site exactly once in a fixed order: natural
+    // order (SU(2) sites, then SU(3) sites), unit cell by unit cell for the
+    // *_interleaved variants (so the two species see each other's updates
+    // within the sweep), or colour by colour in the OpenMP kernels. Each
+    // single-site update leaves the Boltzmann distribution invariant, hence
+    // so does any fixed scan (balance); the previous random-site selection
+    // with replacement left ~37 % of the sites untouched per sweep. The site
+    // kernels are allocation-free: proposals live in stack arrays, couplings
+    // are read from the packed buffers (local forms above).
+    //
+    // SU(3) sites follow su3_mc_manifold. On CP^2 every update writes
+    // n = <psi|lambda|psi> of a normalised psi, so |n|^2 = 4/3 and the cubic
+    // Casimir 8/9 hold to round-off after any number of moves; psi is
+    // recovered from the stored n without an eigensolver
+    // (su3::psi_from_pure_expectations).
+
+    /// Symmetric SU(2) proposal: uniform on the sphere, or S + sigma L u (u uniform) renormalised.
+    inline void propose_SU2(const double* S, bool gaussian, double sigma, double* out) const {
+        const double L = double(spin_length_SU2);
+        if (!gaussian) { random_point_on_sphere(out, 3, L); return; }
+        double u[3];
+        random_point_on_sphere(u, 3, L);
+        double s2 = 0.0;
+        for (int d = 0; d < 3; ++d) { out[d] = S[d] + sigma * u[d]; s2 += out[d] * out[d]; }
+        if (s2 < 1e-300) { for (int d = 0; d < 3; ++d) out[d] = S[d]; return; }   // measure zero
+        const double f = L / std::sqrt(s2);
+        for (int d = 0; d < 3; ++d) out[d] *= f;
+    }
+
+    /// Complex normal deviate with independent real and imaginary parts of variance 1/6, so that
+    /// psi + sigma z moves a normalised qutrit state by the same typical geodesic angle as an SU(2)
+    /// Gaussian move of width sigma (E|z_perp|^2 = 2/3 in both cases).
+    static inline std::complex<double> complex_normal_sixth() {
+        constexpr double s = 0.40824829046386301637;   // 1/sqrt(6)
+        const double re = random_normal_lehman();
+        return {s * re, s * random_normal_lehman()};
+    }
 
     /**
-     * Single Metropolis sweep over both sublattices (sequential: SU2 then SU3)
-     * 
-     * Optimized with:
-     * - Precomputed inverse temperature
-     * - Batched random number generation
-     * - Branchless acceptance criterion
+     * Symmetric SU(3) proposal on the configured manifold.
+     * CP^2: psi' = normalise(z) (Haar / Fubini-Study) or
+     * psi' = normalise(psi + sigma z) with z complex Gaussian: the kernel is
+     * invariant under the U(2) x U(1) stabiliser of [psi] (and z -> e^{ia} z),
+     * so its density depends only on |<psi|psi'>| and is symmetric.
+     * Sphere: uniform on |n| = spin_length_SU3, or n + sigma L u renormalised.
+     */
+    inline void propose_SU3(const double* n, bool gaussian, double sigma, double* out) const {
+        if (su3_on_cp2()) {
+            std::complex<double> psi[3];
+            if (gaussian) {
+                classical_spin::su3::psi_from_pure_expectations(n, psi);
+                for (int k = 0; k < 3; ++k) psi[k] += sigma * complex_normal_sixth();
+            } else {
+                for (int k = 0; k < 3; ++k) psi[k] = complex_normal_sixth();
+            }
+            const double nrm2 = std::norm(psi[0]) + std::norm(psi[1]) + std::norm(psi[2]);
+            if (nrm2 < 1e-300) { for (int a = 0; a < 8; ++a) out[a] = n[a]; return; }
+            const double inv = 1.0 / std::sqrt(nrm2);
+            for (int k = 0; k < 3; ++k) psi[k] *= inv;
+            classical_spin::su3::pure_expectations(psi, out);
+            return;
+        }
+        const double L = double(spin_length_SU3);
+        if (!gaussian) { random_point_on_sphere(out, 8, L); return; }
+        double u[8];
+        random_point_on_sphere(u, 8, L);
+        double s2 = 0.0;
+        for (int a = 0; a < 8; ++a) { out[a] = n[a] + sigma * u[a]; s2 += out[a] * out[a]; }
+        if (s2 < 1e-300) { for (int a = 0; a < 8; ++a) out[a] = n[a]; return; }
+        const double f = L / std::sqrt(s2);
+        for (int a = 0; a < 8; ++a) out[a] *= f;
+    }
+
+    /// Uniformly random state of one SU(3) site on the configured manifold, written to n[0..7].
+    void random_SU3_state(double* n) const { propose_SU3(n, false, 0.0, n); }
+
+    /**
+     * Exact draw from P(S) ∝ exp(-beta h.S) on the sphere |S| = L:
+     * u = cos(S, -h) has density ∝ exp(b u) on [-1, 1], b = beta |h| L,
+     * u = 1 + log1p(xi expm1(-2b)) / b, azimuth uniform.
+     */
+    static void sample_linear_sphere(const double* h, double beta, double L, double* out) {
+        const double hn = std::sqrt(h[0] * h[0] + h[1] * h[1] + h[2] * h[2]);
+        const double b = beta * hn * L;
+        if (b < 1e-12) { random_point_on_sphere(out, 3, L); return; }
+        const double xi = random_double_lehman(0.0, 1.0);
+        const double u = std::clamp(1.0 + std::log1p(xi * std::expm1(-2.0 * b)) / b, -1.0, 1.0);
+        const double phi = random_double_lehman(0.0, 2.0 * M_PI);
+        const double e[3] = {-h[0] / hn, -h[1] / hn, -h[2] / hn};
+        double e1[3];
+        if (std::abs(e[0]) < 0.9) { e1[0] = 0.0; e1[1] = -e[2]; e1[2] = e[1]; }
+        else                      { e1[0] = e[2]; e1[1] = 0.0; e1[2] = -e[0]; }
+        const double n1 = std::sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+        for (double& c : e1) c /= n1;
+        const double e2[3] = {e[1] * e1[2] - e[2] * e1[1], e[2] * e1[0] - e[0] * e1[2],
+                              e[0] * e1[1] - e[1] * e1[0]};
+        const double r = std::sqrt(std::max(0.0, 1.0 - u * u));
+        const double c = std::cos(phi), s = std::sin(phi);
+        for (int d = 0; d < 3; ++d) out[d] = L * (u * e[d] + r * (c * e1[d] + s * e2[d]));
+    }
+
+    /**
+     * Exact draw from P(psi) ∝ exp(-beta <psi|H|psi>) on CP^2 with the
+     * Fubini-Study measure, H = h.lambda. In the eigenbasis H v_k = e_k v_k
+     * (e_0 <= e_1 <= e_2), psi = sum_k sqrt(p_k) e^{i phi_k} v_k; the
+     * Fubini-Study measure is uniform in the populations p on the simplex
+     * and in the phases (moment map of the torus action, Duistermaat-
+     * Heckman), and the energy is sum_k p_k e_k. With a = beta(e_1 - e_0),
+     * b = beta(e_2 - e_0): p_2 has the marginal ∝ e^{-b p_2}(1 - e^{-a(1-p_2)}),
+     * drawn from the truncated exponential e^{-b p_2} and accepted with
+     * (1 - e^{-a(1-p_2)}) / (1 - e^{-a}) (>= 1/2 on average); then p_1 | p_2
+     * is a truncated exponential on [0, 1 - p_2]. Writes n[0..7].
+     */
+    static void sample_linear_cp2(const double* h, double beta, double* n) {
+        using classical_spin::su3::Matrix3c;
+        Eigen::SelfAdjointEigenSolver<Matrix3c> es(classical_spin::su3::gell_mann_sum(h));
+        const Eigen::Vector3d& ev = es.eigenvalues();
+        const double a = beta * (ev(1) - ev(0)), b = beta * (ev(2) - ev(0));
+        double p2 = 0.0;
+        for (;;) {
+            const double u = random_double_lehman(0.0, 1.0);
+            p2 = (b > 1e-12) ? -std::log1p(u * std::expm1(-b)) / b : u;
+            p2 = std::clamp(p2, 0.0, 1.0);
+            const double acc = (a > 1e-12) ? std::expm1(-a * (1.0 - p2)) / std::expm1(-a) : 1.0 - p2;
+            if (random_double_lehman(0.0, 1.0) < acc) break;
+        }
+        const double w = 1.0 - p2;
+        const double u = random_double_lehman(0.0, 1.0);
+        double p1 = (a * w > 1e-12) ? -std::log1p(u * std::expm1(-a * w)) / a : u * w;
+        p1 = std::clamp(p1, 0.0, w);
+        const double p0 = std::max(0.0, 1.0 - p1 - p2);
+        const double phi1 = random_double_lehman(0.0, 2.0 * M_PI);
+        const double phi2 = random_double_lehman(0.0, 2.0 * M_PI);
+        const std::complex<double> c0(std::sqrt(p0), 0.0);
+        const std::complex<double> c1 = std::polar(std::sqrt(p1), phi1), c2 = std::polar(std::sqrt(p2), phi2);
+        const Matrix3c& V = es.eigenvectors();
+        std::complex<double> psi[3];
+        double nrm2 = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            psi[k] = c0 * V(k, 0) + c1 * V(k, 1) + c2 * V(k, 2);
+            nrm2 += std::norm(psi[k]);
+        }
+        const double inv = 1.0 / std::sqrt(nrm2);
+        for (int k = 0; k < 3; ++k) psi[k] *= inv;
+        classical_spin::su3::pure_expectations(psi, n);
+    }
+
+    // ---- single-site kernels (return true if the site changed) ----
+
+    /// Metropolis update of SU(2) site i (uniform or Gaussian proposal).
+    inline bool metropolis_site_SU2(size_t i, double beta, bool gaussian, double sigma) {
+        double* S = spins_SU2[i].data();
+        double Sn[3], h[3];
+        propose_SU2(S, gaussian, sigma, Sn);
+        linear_field_SU2(i, h);
+        const double dE = local_energy_change_SU2(i, h, Sn, S);
+        if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE)) return false;
+        S[0] = Sn[0]; S[1] = Sn[1]; S[2] = Sn[2];
+        return true;
+    }
+
+    /// Metropolis update of SU(3) site j on the configured manifold.
+    inline bool metropolis_site_SU3(size_t j, double beta, bool gaussian, double sigma) {
+        double* n = spins_SU3[j].data();
+        double nn[8], h[8];
+        propose_SU3(n, gaussian, sigma, nn);
+        linear_field_SU3(j, h);
+        const double dE = local_energy_change_SU3(j, h, nn, n);
+        if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE)) return false;
+        std::memcpy(n, nn, sizeof(nn));
+        return true;
+    }
+
+    /**
+     * Heat-bath update of SU(2) site i: exact draw from exp(-beta h.S); the
+     * self energy S^T A S (+ cubic) is then accepted with
+     * min(1, exp(-beta ΔE_self)) (independence Metropolis-Hastings with the
+     * linear heat bath as proposal), skipped when it is constant on the sphere.
+     */
+    inline bool heat_bath_site_SU2(size_t i, double beta) {
+        double* S = spins_SU2[i].data();
+        double Sn[3], h[3];
+        linear_field_SU2(i, h);
+        sample_linear_sphere(h, beta, double(spin_length_SU2), Sn);
+        if (!self_isotropic_SU2[i]) {
+            double A[9];
+            self_form_SU2(i, A);
+            const double dE = self_energy_SU2(i, A, Sn) - self_energy_SU2(i, A, S);
+            if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE)) return false;
+        }
+        S[0] = Sn[0]; S[1] = Sn[1]; S[2] = Sn[2];
+        return true;
+    }
+
+    /// Heat-bath update of SU(3) site j on CP^2 (sample_linear_cp2, Metropolis-corrected self energy).
+    inline bool heat_bath_site_SU3(size_t j, double beta) {
+        double* n = spins_SU3[j].data();
+        double nn[8], h[8];
+        linear_field_SU3(j, h);
+        sample_linear_cp2(h, beta, nn);
+        if (!self_isotropic_SU3[j]) {
+            double A[64];
+            self_form_SU3(j, A);
+            const double dE = self_energy_SU3(j, A, nn) - self_energy_SU3(j, A, n);
+            if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-beta * dE)) return false;
+        }
+        std::memcpy(n, nn, sizeof(nn));
+        return true;
+    }
+
+    /**
+     * Overrelaxation of SU(2) site i: reflect S about its linear field h
+     * (which does not depend on S), S' = 2 (S.h) h / |h|^2 - S. The reflection
+     * is an isometric involution of the sphere and conserves h.S, so it is an
+     * exact microcanonical move when the self energy is constant on the
+     * sphere. Otherwise (single-ion anisotropy, self-coupled W) it is a
+     * symmetric proposal accepted with min(1, exp(-ΔE_self / T)) for T > 0 and
+     * skipped for T <= 0 (as Lattice::overrelax_site). The old kernel
+     * reflected about the full gradient h + 2 A S, which conserves neither
+     * the energy nor the measure (E 33 -> 14 in 20 sweeps on 2x2x2 TmFeO3).
+     */
+    inline bool overrelax_site_SU2(size_t i, double T) {
+        double* S = spins_SU2[i].data();
+        double h[3];
+        linear_field_SU2(i, h);
+        const double hh = h[0] * h[0] + h[1] * h[1] + h[2] * h[2];
+        if (hh <= 0.0) return false;
+        const double k = 2.0 * (S[0] * h[0] + S[1] * h[1] + S[2] * h[2]) / hh;
+        const double Sn[3] = {k * h[0] - S[0], k * h[1] - S[1], k * h[2] - S[2]};
+        if (!self_isotropic_SU2[i]) {
+            if (T <= 0.0) return false;
+            double A[9];
+            self_form_SU2(i, A);
+            const double dE = self_energy_SU2(i, A, Sn) - self_energy_SU2(i, A, S);
+            if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-dE / T)) return false;
+        }
+        S[0] = Sn[0]; S[1] = Sn[1]; S[2] = Sn[2];
+        return true;
+    }
+
+    /**
+     * Overrelaxation of SU(3) site j.
+     * CP^2: the S^7 reflection leaves CP^2, so instead the state gets random
+     * relative phases in the eigenbasis of H = h.lambda:
+     * psi' = V diag(1, e^{i phi_1}, e^{i phi_2}) V^dagger psi, phi uniform.
+     * The populations |<v_k|psi>|^2, hence h.n = sum_k p_k e_k, are
+     * conserved; the move is a random unitary drawn from a distribution
+     * invariant under inversion (phi -> -phi), and unitaries preserve the
+     * Fubini-Study measure, so the kernel is symmetric (detailed balance)
+     * and maps CP^2 onto itself. Sphere: reflection about h in R^8.
+     * Non-constant self energies are Metropolis-corrected as for SU(2).
+     */
+    inline bool overrelax_site_SU3(size_t j, double T) {
+        double* n = spins_SU3[j].data();
+        double h[8], nn[8];
+        linear_field_SU3(j, h);
+        if (su3_on_cp2()) {
+            using classical_spin::su3::Matrix3c;
+            Eigen::SelfAdjointEigenSolver<Matrix3c> es(classical_spin::su3::gell_mann_sum(h));
+            const Matrix3c& V = es.eigenvectors();
+            std::complex<double> psi[3];
+            classical_spin::su3::psi_from_pure_expectations(n, psi);
+            std::complex<double> c[3];
+            for (int k = 0; k < 3; ++k)
+                c[k] = std::conj(V(0, k)) * psi[0] + std::conj(V(1, k)) * psi[1] + std::conj(V(2, k)) * psi[2];
+            c[1] *= std::polar(1.0, random_double_lehman(0.0, 2.0 * M_PI));
+            c[2] *= std::polar(1.0, random_double_lehman(0.0, 2.0 * M_PI));
+            for (int k = 0; k < 3; ++k) psi[k] = V(k, 0) * c[0] + V(k, 1) * c[1] + V(k, 2) * c[2];
+            classical_spin::su3::pure_expectations(psi, nn);
+        } else {
+            double hh = 0.0, nh = 0.0;
+            for (int a = 0; a < 8; ++a) { hh += h[a] * h[a]; nh += n[a] * h[a]; }
+            if (hh <= 0.0) return false;
+            const double k = 2.0 * nh / hh;
+            for (int a = 0; a < 8; ++a) nn[a] = k * h[a] - n[a];
+        }
+        if (!self_isotropic_SU3[j]) {
+            if (T <= 0.0) return false;
+            double A[64];
+            self_form_SU3(j, A);
+            const double dE = self_energy_SU3(j, A, nn) - self_energy_SU3(j, A, n);
+            if (dE > 0.0 && random_double_lehman(0.0, 1.0) >= std::exp(-dE / T)) return false;
+        }
+        std::memcpy(n, nn, sizeof(nn));
+        return true;
+    }
+
+    /**
+     * Exact single-site minimisation of SU(2) site i (T = 0 descent step):
+     * the global minimiser of h.S + S^T A S on |S| = L (trust-region
+     * subproblem, Lattice::minimize_quadratic_on_sphere), -L h/|h| when the
+     * self energy is constant; with cubic self terms a gradient-aligned
+     * candidate accepted only if it lowers the local energy. Never raises
+     * the energy. Returns |ΔS|.
+     */
+    double deterministic_site_SU2(size_t i);
+
+    /**
+     * Exact single-site minimisation of SU(3) site j: on CP^2 the ground
+     * state of H = h.lambda (local exact diagonalisation; with quadratic self
+     * terms the ground state of the linearised H, accepted only if it lowers
+     * the local energy), on the sphere -L h/|h| or the trust-region
+     * minimiser. `force_cp2` uses the CP^2 rule whatever the manifold.
+     * Returns |Δn|.
+     */
+    double deterministic_site_SU3(size_t j, bool force_cp2 = false);
+
+    // ---- sweep drivers ----
+
+    /// Apply f2 to every SU(2) site and f3 to every SU(3) site once; returns the summed results.
+    template <class F2, class F3>
+    size_t sweep_sites(bool interleaved, F2&& f2, F3&& f3) {
+        size_t n = 0;
+        if (interleaved) {
+            const size_t n_cells = dim1 * dim2 * dim3;
+            for (size_t c = 0; c < n_cells; ++c) {
+                for (size_t a = 0; a < N_atoms_SU2; ++a) n += f2(c * N_atoms_SU2 + a);
+                for (size_t a = 0; a < N_atoms_SU3; ++a) n += f3(c * N_atoms_SU3 + a);
+            }
+        } else {
+            for (size_t i = 0; i < lattice_size_SU2; ++i) n += f2(i);
+            for (size_t j = 0; j < lattice_size_SU3; ++j) n += f3(j);
+        }
+        return n;
+    }
+
+    /**
+     * Coloured OpenMP sweep: SU(2) colours, then SU(3) colours; within a
+     * colour no two sites share a coupling of their own species, and the
+     * other species is frozen during the pass, so the site kernels run
+     * concurrently without races (see build_color_partition). RNG: per-thread
+     * Lehmer streams (reproducible for a fixed thread count).
+     */
+    template <class F2, class F3>
+    size_t sweep_sites_coloured(F2&& f2, F3&& f3) {
+        size_t n = 0;
+#ifdef _OPENMP
+        #pragma omp parallel reduction(+:n)
+#endif
+        {
+            for (size_t c = 0; c < n_colors_SU2; ++c) {
+                const size_t lo = sites_by_color_csr_off_SU2[c], hi = sites_by_color_csr_off_SU2[c + 1];
+#ifdef _OPENMP
+                #pragma omp for schedule(static)
+#endif
+                for (size_t off = lo; off < hi; ++off) n += f2(sites_by_color_csr_SU2[off]);
+            }
+            for (size_t c = 0; c < n_colors_SU3; ++c) {
+                const size_t lo = sites_by_color_csr_off_SU3[c], hi = sites_by_color_csr_off_SU3[c + 1];
+#ifdef _OPENMP
+                #pragma omp for schedule(static)
+#endif
+                for (size_t off = lo; off < hi; ++off) n += f3(sites_by_color_csr_SU3[off]);
+            }
+        }
+        return n;
+    }
+
+    bool can_run_coloured() const {
+#ifdef _OPENMP
+        return (n_colors_SU2 > 0 || n_colors_SU3 > 0) && omp_get_max_threads() > 1;
+#else
+        return false;
+#endif
+    }
+
+    /// True if local_sweep() uses the coloured OpenMP kernels (large lattice, > 1 thread).
+    bool use_parallel_sweeps() const {
+        return can_run_coloured() && lattice_size_SU2 + lattice_size_SU3 >= parallel_sweep_min_sites;
+    }
+
+    double acceptance_ratio(size_t accepted) const {
+        const size_t N = lattice_size_SU2 + lattice_size_SU3;
+        return N ? double(accepted) / double(N) : 0.0;
+    }
+
+    /**
+     * Metropolis sweep: every SU(2) site, then every SU(3) site, in natural
+     * order. `gaussian_move` selects the small symmetric moves of width
+     * `sigma` (see propose_SU2 / propose_SU3), otherwise independent uniform
+     * proposals. Returns the acceptance ratio.
      */
     double metropolis(double T, bool gaussian_move = false, double sigma = 60.0) {
         if (T <= 0) return 0.0;
-        
-        size_t accepted = 0;
-        const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
-        const double inv_T = 1.0 / T;  // Precompute inverse temperature
-        
-        // Batch size for random number pre-generation
-        constexpr size_t BATCH_SIZE = 64;
-        vector<size_t> random_sites(BATCH_SIZE);
-        vector<double> random_uniforms(BATCH_SIZE);
-        
-        // Sweep SU(2) sublattice
-        for (size_t batch_start = 0; batch_start < lattice_size_SU2; batch_start += BATCH_SIZE) {
-            const size_t batch_end = std::min(batch_start + BATCH_SIZE, lattice_size_SU2);
-            const size_t current_batch_size = batch_end - batch_start;
-            
-            // Pre-generate random numbers for this batch
-            for (size_t j = 0; j < current_batch_size; ++j) {
-                random_sites[j] = random_int_lehman(lattice_size_SU2);
-                random_uniforms[j] = random_double_lehman(0, 1);
-            }
-            
-            // Process batch
-            for (size_t j = 0; j < current_batch_size; ++j) {
-                const size_t i = random_sites[j];
-                const double rand_uniform = random_uniforms[j];
-                
-                SpinVector new_spin;
-                if (gaussian_move) {
-                    new_spin = spins_SU2[i] + gen_random_spin(sigma, spin_dim_SU2);
-                    double norm = new_spin.norm();
-                    if (norm > 1e-12) new_spin *= spin_length_SU2 / norm;
-                    else new_spin = gen_random_spin(spin_length_SU2, spin_dim_SU2);
-                } else {
-                    new_spin = gen_random_spin(spin_length_SU2, spin_dim_SU2);
-                }
-                
-                const double dE = site_energy_SU2_diff(new_spin, spins_SU2[i], i);
-
-                // Acceptance: short-circuit for downhill moves (was bitwise `|`,
-                // which wastefully evaluated exp() even when dE <= 0).
-                const bool accept = (dE <= 0) || (rand_uniform < exp(-dE * inv_T));
-                if (accept) {
-                    spins_SU2[i] = new_spin;
-                    accepted++;
-                }
-            }
-        }
-
-        // Sweep SU(3) sublattice
-        for (size_t batch_start = 0; batch_start < lattice_size_SU3; batch_start += BATCH_SIZE) {
-            const size_t batch_end = std::min(batch_start + BATCH_SIZE, lattice_size_SU3);
-            const size_t current_batch_size = batch_end - batch_start;
-            
-            // Pre-generate random numbers for this batch
-            for (size_t j = 0; j < current_batch_size; ++j) {
-                random_sites[j] = random_int_lehman(lattice_size_SU3);
-                random_uniforms[j] = random_double_lehman(0, 1);
-            }
-            
-            // Process batch
-            for (size_t j = 0; j < current_batch_size; ++j) {
-                const size_t i = random_sites[j];
-                const double rand_uniform = random_uniforms[j];
-                
-                SpinVector new_spin;
-                if (gaussian_move) {
-                    new_spin = spins_SU3[i] + gen_random_spin(sigma, spin_dim_SU3);
-                    double norm = new_spin.norm();
-                    if (norm > 1e-12) new_spin *= spin_length_SU3 / norm;
-                    else new_spin = gen_random_spin(spin_length_SU3, spin_dim_SU3);
-                } else {
-                    new_spin = gen_random_spin(spin_length_SU3, spin_dim_SU3);
-                }
-                
-                const double dE = site_energy_SU3_diff(new_spin, spins_SU3[i], i);
-
-                // Acceptance: logical OR for short-circuit (was bitwise).
-                const bool accept = (dE <= 0) || (rand_uniform < exp(-dE * inv_T));
-                if (accept) {
-                    spins_SU3[i] = new_spin;
-                    accepted++;
-                }
-            }
-        }
-
-        return double(accepted) / double(total_sites);
+        const double beta = 1.0 / T;
+        return acceptance_ratio(sweep_sites(false,
+            [&](size_t i) { return metropolis_site_SU2(i, beta, gaussian_move, sigma); },
+            [&](size_t j) { return metropolis_site_SU3(j, beta, gaussian_move, sigma); }));
     }
 
     /**
-     * Coloured Metropolis sweep — parallel over SU(2) sites within each
-     * SU(2) colour, then parallel over SU(3) sites within each SU(3) colour.
-     *
-     * Differs from `metropolis()` (random-with-replacement, coupon-collector
-     * style) in that this version visits every SU(2) and every SU(3) site
-     * exactly once per call, in a colour-stratified deterministic order
-     * within each colour. The Markov chain is still detailed-balance
-     * correct (each colour pass is a valid Metropolis sub-sweep over a
-     * subset of independent single-spin moves), and the per-site sampling
-     * is *better* (no missed sites).
-     *
-     * Race-free guarantee: within an SU(2) colour, no two sites share any
-     * SU(2)-SU(2) bilinear, SU(2)-SU(2)-SU(2) trilinear, or
-     * SU(2)-SU(2)-SU(3) trilinear interaction (the SU(3) read partners are
-     * frozen during the SU(2) pass, hence not racy). Symmetric story for
-     * SU(3). Mixed bilinear couples SU(2) ↔ SU(3) directly across the two
-     * passes, and is correct because each pass treats the other species as
-     * a frozen background.
-     *
-     * Falls back to serial `metropolis()` if no colour partition is built
-     * or only one OpenMP thread is available.
-     */
-    double metropolis_parallel(double T, bool gaussian_move = false,
-                               double sigma = 60.0) {
-        if (n_colors_SU2 == 0 && n_colors_SU3 == 0)
-            return metropolis(T, gaussian_move, sigma);
-#ifdef _OPENMP
-        if (omp_get_max_threads() <= 1) return metropolis(T, gaussian_move, sigma);
-#else
-        return metropolis(T, gaussian_move, sigma);
-#endif
-        if (T <= 0) return 0.0;
-
-        const double inv_T = 1.0 / T;
-        const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
-
-#ifdef _OPENMP
-        const int n_threads = omp_get_max_threads();
-#else
-        const int n_threads = 1;
-#endif
-        // Cache-line padded per-thread counters: avoid false sharing of
-        // adjacent counter slots in the final reduction.
-        struct alignas(64) PaddedAccept { size_t v = 0; char pad[64 - sizeof(size_t)]; };
-        std::vector<PaddedAccept> per_thread_accepted(n_threads);
-
-        // PERSISTENT OpenMP region wrapping BOTH the SU(2) and SU(3) colour
-        // passes — one fork/join per sweep, with #pragma omp barrier
-        // between every colour boundary. For a TmFeO3 mixed lattice this
-        // collapses (n_colors_SU2 + n_colors_SU3) team-creation costs (each
-        // ~few µs) into one. At small L this was the dominant per-sweep
-        // overhead for the parallel kernel.
-#ifdef _OPENMP
-        #pragma omp parallel
-#endif
-        {
-#ifdef _OPENMP
-            const int tid = omp_get_thread_num();
-#else
-            const int tid = 0;
-#endif
-            size_t local_accepted = 0;
-
-            // -------------------------- SU(2) pass --------------------------
-            for (size_t c = 0; c < n_colors_SU2; ++c) {
-                const size_t off_lo = sites_by_color_csr_off_SU2[c];
-                const size_t off_hi = sites_by_color_csr_off_SU2[c + 1];
-#ifdef _OPENMP
-                #pragma omp for schedule(static) nowait
-#endif
-                for (size_t off = off_lo; off < off_hi; ++off) {
-                    const size_t i = sites_by_color_csr_SU2[off];
-
-                    SpinVector new_spin;
-                    if (gaussian_move) {
-                        new_spin = spins_SU2[i] + gen_random_spin(sigma, spin_dim_SU2);
-                        const double norm = new_spin.norm();
-                        if (norm > 1e-12) new_spin *= spin_length_SU2 / norm;
-                        else new_spin = gen_random_spin(spin_length_SU2, spin_dim_SU2);
-                    } else {
-                        new_spin = gen_random_spin(spin_length_SU2, spin_dim_SU2);
-                    }
-
-                    const double dE = site_energy_SU2_diff(new_spin, spins_SU2[i], i);
-                    const double rand_uniform = random_double_lehman(0.0, 1.0);
-                    const bool accept = (dE <= 0.0) ||
-                                        (rand_uniform < std::exp(-dE * inv_T));
-                    if (accept) {
-                        spins_SU2[i] = new_spin;
-                        ++local_accepted;
-                    }
-                }
-#ifdef _OPENMP
-                #pragma omp barrier
-#endif
-            }
-
-            // -------------------------- SU(3) pass --------------------------
-            for (size_t c = 0; c < n_colors_SU3; ++c) {
-                const size_t off_lo = sites_by_color_csr_off_SU3[c];
-                const size_t off_hi = sites_by_color_csr_off_SU3[c + 1];
-#ifdef _OPENMP
-                #pragma omp for schedule(static) nowait
-#endif
-                for (size_t off = off_lo; off < off_hi; ++off) {
-                    const size_t i = sites_by_color_csr_SU3[off];
-
-                    SpinVector new_spin;
-                    if (gaussian_move) {
-                        new_spin = spins_SU3[i] + gen_random_spin(sigma, spin_dim_SU3);
-                        const double norm = new_spin.norm();
-                        if (norm > 1e-12) new_spin *= spin_length_SU3 / norm;
-                        else new_spin = gen_random_spin(spin_length_SU3, spin_dim_SU3);
-                    } else {
-                        new_spin = gen_random_spin(spin_length_SU3, spin_dim_SU3);
-                    }
-
-                    const double dE = site_energy_SU3_diff(new_spin, spins_SU3[i], i);
-                    const double rand_uniform = random_double_lehman(0.0, 1.0);
-                    const bool accept = (dE <= 0.0) ||
-                                        (rand_uniform < std::exp(-dE * inv_T));
-                    if (accept) {
-                        spins_SU3[i] = new_spin;
-                        ++local_accepted;
-                    }
-                }
-#ifdef _OPENMP
-                #pragma omp barrier
-#endif
-            }
-
-            per_thread_accepted[tid].v += local_accepted;
-        } // end omp parallel
-
-        size_t accepted = 0;
-        for (auto& a : per_thread_accepted) accepted += a.v;
-        return double(accepted) / double(total_sites);
-    }
-
-    /**
-     * Coloured over-relaxation sweep. Same race-free / parallelism story as
-     * `metropolis_parallel`. Falls back to serial `overrelaxation()` if the
-     * colour partition is empty or only one thread is available.
-     *
-     * NOTE: unlike serial `overrelaxation()`, this version does *not* call
-     * `get_cached_local_field_*` even if `use_field_caching` is on. The
-     * field cache uses shared `field_valid_*` / `cached_local_field_*`
-     * arrays that are not safe to mutate from multiple threads. The
-     * cache is much less useful in a coloured sweep anyway because each
-     * site's local field would typically be invalidated by neighbour
-     * updates in the previous colour pass.
-     */
-    void overrelaxation_parallel() {
-        if (n_colors_SU2 == 0 && n_colors_SU3 == 0) { overrelaxation(); return; }
-#ifdef _OPENMP
-        if (omp_get_max_threads() <= 1) { overrelaxation(); return; }
-#else
-        overrelaxation(); return;
-#endif
-
-        // PERSISTENT OpenMP region wrapping both sublattices.
-#ifdef _OPENMP
-        #pragma omp parallel
-#endif
-        {
-            // -------------------------- SU(2) pass --------------------------
-            for (size_t c = 0; c < n_colors_SU2; ++c) {
-                const size_t off_lo = sites_by_color_csr_off_SU2[c];
-                const size_t off_hi = sites_by_color_csr_off_SU2[c + 1];
-#ifdef _OPENMP
-                #pragma omp for schedule(static) nowait
-#endif
-                for (size_t off = off_lo; off < off_hi; ++off) {
-                    const size_t i = sites_by_color_csr_SU2[off];
-                    SpinVector local_field = get_local_field_SU2(i);
-                    const double norm = local_field.squaredNorm();
-                    if (norm > 1e-12) {
-                        const double proj = 2.0 * spins_SU2[i].dot(local_field) / norm;
-                        spins_SU2[i] = local_field * proj - spins_SU2[i];
-                    }
-                }
-#ifdef _OPENMP
-                #pragma omp barrier
-#endif
-            }
-
-            // -------------------------- SU(3) pass --------------------------
-            for (size_t c = 0; c < n_colors_SU3; ++c) {
-                const size_t off_lo = sites_by_color_csr_off_SU3[c];
-                const size_t off_hi = sites_by_color_csr_off_SU3[c + 1];
-#ifdef _OPENMP
-                #pragma omp for schedule(static) nowait
-#endif
-                for (size_t off = off_lo; off < off_hi; ++off) {
-                    const size_t i = sites_by_color_csr_SU3[off];
-                    SpinVector local_field = get_local_field_SU3(i);
-                    const double norm = local_field.squaredNorm();
-                    if (norm > 1e-12) {
-                        const double proj = 2.0 * spins_SU3[i].dot(local_field) / norm;
-                        spins_SU3[i] = local_field * proj - spins_SU3[i];
-                    }
-                }
-#ifdef _OPENMP
-                #pragma omp barrier
-#endif
-            }
-        } // end omp parallel
-    }
-
-    /**
-     * Interleaved Metropolis sweep: alternates between SU(2) and SU(3) updates
-     * 
-     * This improves equilibration when mixed bilinear interactions are non-zero,
-     * as changes in one sublattice immediately affect the other sublattice's
-     * energy landscape during the same sweep.
-     * 
-     * Uses local field caching with lazy invalidation for efficiency.
-     * 
-     * Optimized with:
-     * - Precomputed inverse temperature
-     * - Batched random number generation
-     * - Branchless acceptance criterion
-     * 
-     * @param T           Temperature
-     * @param gaussian_move Use Gaussian moves (true) or uniform random (false)
-     * @param sigma       Width of Gaussian moves
-     * @return            Acceptance rate
+     * Metropolis sweep visiting the lattice unit cell by unit cell (the
+     * cell's SU(2) sites, then its SU(3) sites), so that with mixed
+     * couplings each species responds to the other's updates within the
+     * same sweep.
      */
     double metropolis_interleaved(double T, bool gaussian_move = false, double sigma = 60.0) {
         if (T <= 0) return 0.0;
-        
-        size_t accepted = 0;
-        const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
-        const double inv_T = 1.0 / T;  // Precompute inverse temperature
-        
-        // Determine whether to use caching (beneficial when mixed interactions exist)
-        const bool has_mixed = (num_bi_SU2_SU3 > 0 || num_tri_SU2_SU3 > 0);
-        if (has_mixed && use_field_caching) {
-            // Initialize all cached fields
-            init_field_cache();
-        }
-        
-        // Batch size for random number pre-generation
-        constexpr size_t BATCH_SIZE = 64;
-        vector<size_t> random_sublattice(BATCH_SIZE);  // Which sublattice to update
-        vector<size_t> random_sites(BATCH_SIZE);        // Site within sublattice
-        vector<double> random_uniforms(BATCH_SIZE);     // For acceptance
-        
-        for (size_t batch_start = 0; batch_start < total_sites; batch_start += BATCH_SIZE) {
-            const size_t batch_end = std::min(batch_start + BATCH_SIZE, total_sites);
-            const size_t current_batch_size = batch_end - batch_start;
-            
-            // Pre-generate random numbers for this batch
-            for (size_t j = 0; j < current_batch_size; ++j) {
-                random_sublattice[j] = random_int_lehman(total_sites);
-                random_uniforms[j] = random_double_lehman(0, 1);
-            }
-            
-            // Process batch
-            for (size_t j = 0; j < current_batch_size; ++j) {
-                // Probabilistically choose which sublattice to update
-                const bool update_SU2 = (random_sublattice[j] < lattice_size_SU2);
-                const double rand_uniform = random_uniforms[j];
-                
-                if (update_SU2) {
-                    const size_t i = random_int_lehman(lattice_size_SU2);
-                    
-                    SpinVector new_spin;
-                    if (gaussian_move) {
-                        new_spin = spins_SU2[i] + gen_random_spin(sigma, spin_dim_SU2);
-                        double norm = new_spin.norm();
-                        if (norm > 1e-12) new_spin *= spin_length_SU2 / norm;
-                        else new_spin = gen_random_spin(spin_length_SU2, spin_dim_SU2);
-                    } else {
-                        new_spin = gen_random_spin(spin_length_SU2, spin_dim_SU2);
-                    }
-                    
-                    const double dE = site_energy_SU2_diff(new_spin, spins_SU2[i], i);
+        const double beta = 1.0 / T;
+        return acceptance_ratio(sweep_sites(true,
+            [&](size_t i) { return metropolis_site_SU2(i, beta, gaussian_move, sigma); },
+            [&](size_t j) { return metropolis_site_SU3(j, beta, gaussian_move, sigma); }));
+    }
 
-                    // Acceptance: logical OR (was bitwise).
-                    const bool accept = (dE <= 0) || (rand_uniform < exp(-dE * inv_T));
-                    if (accept) {
-                        spins_SU2[i] = new_spin;
-                        accepted++;
-
-                        // Invalidate cached fields for affected sites
-                        if (has_mixed && use_field_caching) {
-                            invalidate_fields_from_SU2_update(i);
-                        }
-                    }
-                } else {
-                    const size_t i = random_int_lehman(lattice_size_SU3);
-                    
-                    SpinVector new_spin;
-                    if (gaussian_move) {
-                        new_spin = spins_SU3[i] + gen_random_spin(sigma, spin_dim_SU3);
-                        double norm = new_spin.norm();
-                        if (norm > 1e-12) new_spin *= spin_length_SU3 / norm;
-                        else new_spin = gen_random_spin(spin_length_SU3, spin_dim_SU3);
-                    } else {
-                        new_spin = gen_random_spin(spin_length_SU3, spin_dim_SU3);
-                    }
-                    
-                    const double dE = site_energy_SU3_diff(new_spin, spins_SU3[i], i);
-
-                    // Acceptance: logical OR (was bitwise).
-                    const bool accept = (dE <= 0) || (rand_uniform < exp(-dE * inv_T));
-                    if (accept) {
-                        spins_SU3[i] = new_spin;
-                        accepted++;
-
-                        // Invalidate cached fields for affected sites
-                        if (has_mixed && use_field_caching) {
-                            invalidate_fields_from_SU3_update(i);
-                        }
-                    }
-                }
-            }
-        }
-        
-        return double(accepted) / double(total_sites);
+    /// Coloured OpenMP Metropolis sweep (serial metropolis() with one thread or no colouring).
+    double metropolis_parallel(double T, bool gaussian_move = false, double sigma = 60.0) {
+        if (!can_run_coloured()) return metropolis(T, gaussian_move, sigma);
+        if (T <= 0) return 0.0;
+        const double beta = 1.0 / T;
+        return acceptance_ratio(sweep_sites_coloured(
+            [&](size_t i) { return metropolis_site_SU2(i, beta, gaussian_move, sigma); },
+            [&](size_t j) { return metropolis_site_SU3(j, beta, gaussian_move, sigma); }));
     }
 
     /**
-     * Over-relaxation sweep (microcanonical, zero acceptance rate)
-     * Reflects spins across their local field direction
+     * Heat-bath sweep: heat bath for SU(2) sites and, on CP^2, for SU(3)
+     * sites (exact for the linear part of the local energy, Metropolis-
+     * corrected self energy). SU(3) sites on the legacy sphere get a
+     * Metropolis update instead (uniform proposals, or Gaussian of width
+     * sigma when gaussian_move). Returns the acceptance ratio (1 unless self
+     * energies reject draws).
      */
-    void overrelaxation() {
-        // Over-relaxation for SU(2) spins
-        for (size_t count = 0; count < lattice_size_SU2; ++count) {
-            size_t i = random_int_lehman(lattice_size_SU2);
-            SpinVector local_field = get_local_field_SU2(i);
-            double norm = local_field.squaredNorm();
-            
-            if (norm > 1e-12) {
-                double proj = 2.0 * spins_SU2[i].dot(local_field) / norm;
-                spins_SU2[i] = local_field * proj - spins_SU2[i];
-            }
-        }
-        
-        // Over-relaxation for SU(3) spins
-        for (size_t count = 0; count < lattice_size_SU3; ++count) {
-            size_t i = random_int_lehman(lattice_size_SU3);
-            SpinVector local_field = get_local_field_SU3(i);
-            double norm = local_field.squaredNorm();
-            
-            if (norm > 1e-12) {
-                double proj = 2.0 * spins_SU3[i].dot(local_field) / norm;
-                spins_SU3[i] = local_field * proj - spins_SU3[i];
-            }
-        }
+    double heat_bath(double T, bool interleaved = false, bool gaussian_move = false, double sigma = 60.0) {
+        if (T <= 0) return 0.0;
+        const double beta = 1.0 / T;
+        return acceptance_ratio(sweep_sites(interleaved,
+            [&](size_t i) { return heat_bath_site_SU2(i, beta); },
+            [&](size_t j) {
+                return su3_on_cp2() ? heat_bath_site_SU3(j, beta)
+                                    : metropolis_site_SU3(j, beta, gaussian_move, sigma);
+            }));
+    }
+
+    /// Coloured OpenMP heat-bath sweep (see heat_bath).
+    double heat_bath_parallel(double T, bool gaussian_move = false, double sigma = 60.0) {
+        if (!can_run_coloured()) return heat_bath(T, false, gaussian_move, sigma);
+        if (T <= 0) return 0.0;
+        const double beta = 1.0 / T;
+        return acceptance_ratio(sweep_sites_coloured(
+            [&](size_t i) { return heat_bath_site_SU2(i, beta); },
+            [&](size_t j) {
+                return su3_on_cp2() ? heat_bath_site_SU3(j, beta)
+                                    : metropolis_site_SU3(j, beta, gaussian_move, sigma);
+            }));
     }
 
     /**
-     * Interleaved over-relaxation sweep (microcanonical)
-     * 
-     * Alternates between SU(2) and SU(3) updates, ensuring that changes
-     * in one sublattice are immediately reflected in the local field
-     * computation of the other sublattice during the same sweep.
-     * 
-     * Uses local field caching with lazy invalidation for efficiency
-     * when mixed interactions are present.
+     * Overrelaxation sweep in natural order (see overrelax_site_SU2 /
+     * overrelax_site_SU3): microcanonical where the local energy is linear
+     * in the site's own spin; sites with a non-constant self energy get a
+     * Metropolis-corrected move at temperature T > 0 and are left untouched
+     * at the default T = 0.
      */
-    void overrelaxation_interleaved() {
-        const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
-        const bool has_mixed = (num_bi_SU2_SU3 > 0 || num_tri_SU2_SU3 > 0);
-        
-        // Initialize field cache if using caching mode
-        if (has_mixed && use_field_caching) {
-            init_field_cache();
-        }
-        
-        for (size_t n = 0; n < total_sites; ++n) {
-            // Probabilistically choose which sublattice to update
-            bool update_SU2 = (random_int_lehman(total_sites) < lattice_size_SU2);
-            
-            if (update_SU2) {
-                size_t i = random_int_lehman(lattice_size_SU2);
-                SpinVector local_field = (has_mixed && use_field_caching) ? 
-                    get_cached_local_field_SU2(i) : get_local_field_SU2(i);
-                double norm = local_field.squaredNorm();
-                
-                if (norm > 1e-12) {
-                    double proj = 2.0 * spins_SU2[i].dot(local_field) / norm;
-                    spins_SU2[i] = local_field * proj - spins_SU2[i];
-                    
-                    // Invalidate affected fields
-                    if (has_mixed && use_field_caching) {
-                        invalidate_fields_from_SU2_update(i);
-                    }
-                }
-            } else {
-                size_t i = random_int_lehman(lattice_size_SU3);
-                SpinVector local_field = (has_mixed && use_field_caching) ?
-                    get_cached_local_field_SU3(i) : get_local_field_SU3(i);
-                double norm = local_field.squaredNorm();
-                
-                if (norm > 1e-12) {
-                    double proj = 2.0 * spins_SU3[i].dot(local_field) / norm;
-                    spins_SU3[i] = local_field * proj - spins_SU3[i];
-                    
-                    // Invalidate affected fields
-                    if (has_mixed && use_field_caching) {
-                        invalidate_fields_from_SU3_update(i);
-                    }
-                }
-            }
-        }
+    void overrelaxation(double T = 0.0) {
+        sweep_sites(false, [&](size_t i) { return overrelax_site_SU2(i, T); },
+                           [&](size_t j) { return overrelax_site_SU3(j, T); });
+    }
+
+    /// Overrelaxation sweep unit cell by unit cell (see metropolis_interleaved).
+    void overrelaxation_interleaved(double T = 0.0) {
+        sweep_sites(true, [&](size_t i) { return overrelax_site_SU2(i, T); },
+                          [&](size_t j) { return overrelax_site_SU3(j, T); });
+    }
+
+    /// Coloured OpenMP overrelaxation sweep (serial with one thread or no colouring).
+    void overrelaxation_parallel(double T = 0.0) {
+        if (!can_run_coloured()) { overrelaxation(T); return; }
+        sweep_sites_coloured([&](size_t i) { return overrelax_site_SU2(i, T); },
+                             [&](size_t j) { return overrelax_site_SU3(j, T); });
     }
 
     /**
-     * Interleaved deterministic sweep with caching
-     * 
-     * Zero-temperature relaxation that alternates between sublattices
-     * and uses local field caching for efficiency.
+     * One local-update sweep at temperature T with the configured policy
+     * (local_update; the legacy `gaussian_move` flag selects Gaussian
+     * proposals of width sigma under Metropolis). Coloured OpenMP kernels for
+     * lattices of at least parallel_sweep_min_sites sites when more than one
+     * thread is available; otherwise natural or cell-interleaved order.
+     * Returns the acceptance ratio.
      */
-    void deterministic_sweep_interleaved() {
-        const size_t total_sites = lattice_size_SU2 + lattice_size_SU3;
-        const bool has_mixed = (num_bi_SU2_SU3 > 0 || num_tri_SU2_SU3 > 0);
-        
-        // Initialize field cache if using caching mode
-        if (has_mixed && use_field_caching) {
-            init_field_cache();
-        }
-        
-        for (size_t n = 0; n < total_sites; ++n) {
-            // Probabilistically choose which sublattice to update
-            bool update_SU2 = (random_int_lehman(total_sites) < lattice_size_SU2);
-            
-            if (update_SU2) {
-                size_t i = random_int_lehman(lattice_size_SU2);
-                SpinVector local_field = (has_mixed && use_field_caching) ? 
-                    get_cached_local_field_SU2(i) : get_local_field_SU2(i);
-                double norm = local_field.norm();
-                
-                if (norm > 1e-12) {
-                    spins_SU2[i] = -local_field / norm * spin_length_SU2;
-                    
-                    // Invalidate affected fields
-                    if (has_mixed && use_field_caching) {
-                        invalidate_fields_from_SU2_update(i);
-                    }
-                }
-            } else {
-                size_t i = random_int_lehman(lattice_size_SU3);
-                SpinVector local_field = (has_mixed && use_field_caching) ?
-                    get_cached_local_field_SU3(i) : get_local_field_SU3(i);
-                double norm = local_field.norm();
-                
-                if (norm > 1e-12) {
-                    spins_SU3[i] = -local_field / norm * spin_length_SU3;
-                    
-                    // Invalidate affected fields
-                    if (has_mixed && use_field_caching) {
-                        invalidate_fields_from_SU3_update(i);
-                    }
-                }
-            }
-        }
+    double local_sweep(double T, bool gaussian_move, double sigma, bool interleaved = false) {
+        const bool par = use_parallel_sweeps();
+        const bool gauss = gaussian_move || local_update == LocalUpdate::Gaussian;
+        if (local_update == LocalUpdate::HeatBath)
+            return par ? heat_bath_parallel(T) : heat_bath(T, interleaved);
+        if (par) return metropolis_parallel(T, gauss, sigma);
+        return interleaved ? metropolis_interleaved(T, gauss, sigma) : metropolis(T, gauss, sigma);
+    }
+
+    /// Overrelaxation sweep through the same serial / interleaved / coloured selection.
+    void overrelaxation_sweep(double T, bool interleaved = false) {
+        if (use_parallel_sweeps()) overrelaxation_parallel(T);
+        else if (interleaved) overrelaxation_interleaved(T);
+        else overrelaxation(T);
+    }
+
+    /// Whether local_sweep() uses Gaussian proposals whose width `sigma` the drivers should adapt.
+    bool uses_adaptive_step(bool gaussian_move) const {
+        if (local_update == LocalUpdate::HeatBath) return false;
+        return gaussian_move || local_update == LocalUpdate::Gaussian;
     }
 
     /**
-     * Deterministic sweep: align each spin antiparallel to its local field
-     * This is a zero-temperature relaxation step that randomly selects sites
+     * T = 0 block-coordinate descent: every site in natural order is set to
+     * its exact single-site minimiser (deterministic_site_SU2 / _SU3), so the
+     * energy never increases. Returns the largest site change |ΔS| of the
+     * last of `num_sweeps` sweeps. (Formerly each spin was aligned with
+     * its full local field at randomly drawn sites: wrong with anisotropy,
+     * and off the qutrit state space for SU(3).)
      */
-    void deterministic_sweep() {
-        // Deterministic update for SU(2) spins
-        for (size_t count = 0; count < lattice_size_SU2; ++count) {
-            size_t i = random_int_lehman(lattice_size_SU2);
-            SpinVector local_field = get_local_field_SU2(i);
-            double norm = local_field.norm();
-            
-            if (norm > 1e-12) {
-                spins_SU2[i] = -local_field / norm * spin_length_SU2;
-            }
-        }
-        
-        // Deterministic update for SU(3) spins
-        for (size_t count = 0; count < lattice_size_SU3; ++count) {
-            size_t i = random_int_lehman(lattice_size_SU3);
-            SpinVector local_field = get_local_field_SU3(i);
-            double norm = local_field.norm();
-            
-            if (norm > 1e-12) {
-                spins_SU3[i] = -local_field / norm * spin_length_SU3;
-            }
-        }
-    }
+    double deterministic_sweep(size_t num_sweeps = 1);
+
+    /// T = 0 descent visiting the lattice unit cell by unit cell; returns the largest change.
+    double deterministic_sweep_interleaved();
 
     // -------------------------------------------------------------------
     // SU(3) coherent-state utilities (qutrit-only, spin_dim_SU3 == 8).
     //
-    // These project the stored 8-vector Bloch parameterization onto the
-    // physical CP^2 manifold of qutrit pure states, following the SU(N)
-    // coherent-state formulation of Zhang & Batista, PRB 104, 104409
-    // (2021) and the geometric-integrator picture of Dahlbom et al., PRB
-    // 106, 054423 (2022). They are opt-in: no existing code path calls
-    // them automatically. See diag_tmfeo3_su3_coherent_state for the
-    // standalone validation.
-    //
-    // Storage convention. The stored `spins_SU3[i](a)` are interpreted as
-    // the raw Gell-Mann expectation values n^a = <psi|lambda^a|psi>. The
-    // qutrit density matrix is
+    // Storage convention. The stored `spins_SU3[i](a)` are the Gell-Mann
+    // expectation values n^a = <psi|lambda^a|psi>. The qutrit density
+    // matrix is
     //   rho = (1/3) I + (1/2) sum_a n^a lambda^a,
     // whose trace is identically 1 regardless of |n|. Every pure state has
     // Tr rho^2 = 1/3 + |n|^2/2 = 1, i.e. |n|^2 = 2(N-1)/N = 4/3 and
     // |n| = 2/sqrt(3) (e.g. |E1>: n_3 = 1, n_8 = 1/sqrt(3)), and the cubic
     // Casimir d_abc n^a n^b n^c = 8/9 (su3::casimir2 / su3::casimir3).
-    //
-    // The `spin_length_SU3` constructor argument does NOT enter these
-    // routines: for SU(N>2) it is not a free normalisation knob (no
-    // continuous family of states has the same Casimir spectrum), it is
-    // only used by the legacy antiparallel-alignment SA, which the new
-    // `deterministic_sweep_SU3_exact_diag` below replaces.
+    // With su3_mc_manifold = CP2 (default) every Monte Carlo update and the
+    // T = 0 descent stay on this manifold; `spin_length_SU3` is then not
+    // used (for SU(N > 2) it is not a free normalisation: no continuous
+    // family of states has the same Casimir spectrum). It sets the radius
+    // of the legacy S^7 manifold only.
     // -------------------------------------------------------------------
 
     /**
@@ -2571,8 +2393,8 @@ public:
      *   3. Overwrite n^a by <psi|lambda^a|psi>.
      * Returns the minimum top-eigenvalue (purity) encountered across
      * sites. Values below 1 indicate that the original stored state was
-     * not a physical qutrit pure state (e.g. produced by the legacy
-     * antiparallel-alignment SA).
+     * not a physical qutrit pure state (e.g. produced by the legacy S^7
+     * sampling).
      */
     double physicalize_SU3_state() {
         if (spin_dim_SU3 != 8) return 1.0;
@@ -2587,6 +2409,38 @@ public:
             if (purity < min_purity) min_purity = purity;
         }
         return min_purity;
+    }
+
+    /**
+     * Put the SU(3) states on the Monte Carlo manifold where they are not
+     * (CP^2: closest pure state, as physicalize_SU3_state, for every site
+     * whose Casimirs deviate from 4/3, 8/9 by more than `tol`; sphere:
+     * rescale to |n| = spin_length_SU3). Called by the SA, quench and PT
+     * drivers, so a loaded or legacy configuration is sampled on the right
+     * state space. Returns the number of sites changed.
+     */
+    size_t project_SU3_to_manifold(double tol = 1e-9) {
+        size_t changed = 0;
+        for (size_t j = 0; j < lattice_size_SU3; ++j) {
+            double* n = spins_SU3[j].data();
+            if (su3_on_cp2()) {
+                const double c2 = classical_spin::su3::casimir2(n), c3 = classical_spin::su3::casimir3(n);
+                if (std::abs(c2 - 4.0 / 3.0) <= tol && std::abs(c3 - 8.0 / 9.0) <= tol) continue;
+                classical_spin::su3::Vector8r v;
+                for (int a = 0; a < 8; ++a) v(a) = n[a];
+                const auto psi = classical_spin::su3::psi_from_expectations(v);
+                std::complex<double> p[3] = {psi(0), psi(1), psi(2)};
+                classical_spin::su3::pure_expectations(p, n);
+            } else {
+                const double L = double(spin_length_SU3);
+                const double norm = std::sqrt(classical_spin::su3::casimir2(n));
+                if (std::abs(norm - L) <= tol * std::max(1.0, L)) continue;
+                if (norm > 0.0) for (int a = 0; a < 8; ++a) n[a] *= L / norm;
+                else random_SU3_state(n);
+            }
+            ++changed;
+        }
+        return changed;
     }
 
     /**
@@ -2609,65 +2463,33 @@ public:
     }
 
     /**
-     * Deterministic SU(3) sweep via exact local diagonalization.
-     *
-     * Replaces the antiparallel-alignment rule used in the standard
-     * `deterministic_sweep`, which can place the stored Bloch vector
-     * outside the qutrit positive cone (and which uses a meaningless
-     * `spin_length_SU3` rescaling for N > 2). For each randomly selected
-     * SU(3) site this:
-     *   1. computes the local Gell-Mann field h^a,
-     *   2. builds the 3x3 mean-field Hamiltonian
-     *        H_loc = (1/2) sum_a h^a lambda^a,
-     *      with sign convention matching `cross_prod_SU3_flat`,
-     *   3. finds its ground-state eigenvector psi,
-     *   4. writes back the physical Bloch vector n^a = <psi|lambda^a|psi>.
-     *
-     * SU(2) sites are updated by the usual antiparallel rule.
+     * T = 0 descent sweep with the SU(3) sites set to the ground state of
+     * their local Hamiltonian H = h.lambda (local exact diagonalisation,
+     * Zhang & Batista) whatever su3_mc_manifold is; SU(2) sites as in
+     * deterministic_sweep. On CP^2 this is deterministic_sweep().
      */
-    void deterministic_sweep_SU3_exact_diag() {
-        // SU(2) sites: standard antiparallel alignment.
-        for (size_t count = 0; count < lattice_size_SU2; ++count) {
-            size_t i = random_int_lehman(lattice_size_SU2);
-            SpinVector local_field = get_local_field_SU2(i);
-            double norm = local_field.norm();
-            if (norm > 1e-12) {
-                spins_SU2[i] = -local_field / norm * spin_length_SU2;
-            }
-        }
-        if (spin_dim_SU3 != 8) {
-            // Fall back to antiparallel alignment for non-qutrit dims.
-            for (size_t count = 0; count < lattice_size_SU3; ++count) {
-                size_t i = random_int_lehman(lattice_size_SU3);
-                SpinVector local_field = get_local_field_SU3(i);
-                double norm = local_field.norm();
-                if (norm > 1e-12) {
-                    spins_SU3[i] = -local_field / norm * spin_length_SU3;
-                }
-            }
-            return;
-        }
-        for (size_t count = 0; count < lattice_size_SU3; ++count) {
-            size_t i = random_int_lehman(lattice_size_SU3);
-            SpinVector local_field = get_local_field_SU3(i);
-            if (local_field.norm() < 1e-15) continue;
-            classical_spin::su3::Vector8r h;
-            for (int a = 0; a < 8; ++a) h(a) = local_field(a);
-            auto H_loc = classical_spin::su3::local_hamiltonian_from_field(h);
-            auto psi   = classical_spin::su3::ground_state(H_loc);
-            auto n_phys = classical_spin::su3::expectations_from_psi(psi);
-            for (int a = 0; a < 8; ++a) spins_SU3[i](a) = n_phys(a);
-        }
-    }
+    double deterministic_sweep_SU3_exact_diag();
 
     /**
-     * Zero-temperature greedy quench with convergence check
+     * Zero-temperature quench to a local minimum: deterministic_sweep()
+     * until the energy change per sweep is below rel_tol |E| and no site
+     * moves by more than sqrt(rel_tol) (in units of its length). Projects
+     * the SU(3) states onto the Monte Carlo manifold first.
      */
     void greedy_quench(double rel_tol = 1e-12, size_t max_sweeps = 10000);
 
     /**
-     * Main simulated annealing routine
-     * Matches structure and features from Lattice::simulated_annealing
+     * Simulated annealing on the schedule mc::annealing_schedule(T_start,
+     * T_end, cooling_rate) (validated, ends exactly at T_end) with n_anneal
+     * sweeps per temperature of local_sweep() (policy `local_update`,
+     * cell-interleaved order when mixed couplings exist). With Gaussian
+     * proposals the width is adapted (mc::StepSizeController, Robbins-Monro
+     * toward 45 % acceptance) during the first half of the sweeps at each
+     * temperature and frozen for the second half. SU(3) sites are projected
+     * onto su3_mc_manifold first. The optional T = 0 stage runs
+     * deterministic_sweep() (exact block-coordinate descent) until converged
+     * or n_deterministics sweeps. twist_sweep_count is accepted for interface
+     * compatibility (MixedLattice has no twisted boundaries).
      */
     void simulated_annealing(double T_start, double T_end, size_t n_anneal,
                             bool gaussian_move = false,
@@ -2808,9 +2630,9 @@ public:
 
     MixedMeasurement measure_all_observables() const {
         MixedMeasurement m;
-        m.energy = total_energy();
         m.energy_SU2 = total_energy_SU2();
         m.energy_SU3 = total_energy_SU3();
+        m.energy = m.energy_SU2 + m.energy_SU3;   // = total_energy(), one pass
         m.sublattice_mags_SU2 = magnetization_sublattice_SU2();
         m.sublattice_mags_SU3 = magnetization_sublattice_SU3();
         return m;
@@ -3443,135 +3265,21 @@ private:
     }
 
     /**
-     * Helper: Perform MC sweeps with optional overrelaxation
-     * Returns sum of acceptance rates from metropolis calls
-     * 
-     * @param n_sweeps Number of sweeps to perform
+     * Helper: n_sweeps MC steps at temperature T. One step is one
+     * overrelaxation sweep (when overrelaxation_rate = k > 0) plus a
+     * local_sweep() every k-th step (every step when k = 0), the convention
+     * of the PT engine. Returns the mean acceptance of the local sweeps.
+     *
+     * @param n_sweeps Number of steps to perform
      * @param T Temperature
      * @param gaussian_move Use Gaussian moves
      * @param sigma Gaussian move width
-     * @param overrelaxation_rate Perform overrelaxation every N sweeps (0 = disabled)
-     * @param interleaved Use interleaved sweeps (better for mixed interactions)
+     * @param overrelaxation_rate Local sweep every k-th step, overrelaxation every step (0 = no OR)
+     * @param interleaved Cell-interleaved site order when mixed couplings exist
      */
     double perform_mc_sweeps(size_t n_sweeps, double T, bool gaussian_move, 
                             double& sigma, size_t overrelaxation_rate = 0,
                             bool interleaved = true);
-
-    /**
-     * Get local field for SU(2) from temporary state
-     */
-    SpinVector get_local_field_SU2_state(size_t site_index, 
-                                         const SpinConfigSU2& curr_spins2,
-                                         const SpinConfigSU3& curr_spins3) const {
-        SpinVector H = -field_SU2[site_index];
-        
-        // Onsite
-        H += 2.0 * onsite_interaction_SU2[site_index] * curr_spins2[site_index];
-        
-        // Bilinear
-        for (size_t i = 0; i < bilinear_partners_SU2[site_index].size(); ++i) {
-            H += bilinear_interaction_SU2[site_index][i] * curr_spins2[bilinear_partners_SU2[site_index][i]];
-        }
-        
-        // Mixed bilinear
-        for (size_t i = 0; i < mixed_bilinear_partners_SU2[site_index].size(); ++i) {
-            H += mixed_bilinear_interaction_SU2[site_index][i] * curr_spins3[mixed_bilinear_partners_SU2[site_index][i]];
-        }
-        
-        // Trilinear SU(2)-SU(2)-SU(2) contributions
-        for (size_t i = 0; i < trilinear_partners_SU2[site_index].size(); ++i) {
-            const size_t p1_idx = trilinear_partners_SU2[site_index][i][0];
-            const size_t p2_idx = trilinear_partners_SU2[site_index][i][1];
-            const auto& T = trilinear_interaction_SU2[site_index][i];
-            
-            for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                        temp += T[a](b, c) * curr_spins2[p1_idx](b) * curr_spins2[p2_idx](c);
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        // Mixed trilinear contributions
-        for (size_t i = 0; i < mixed_trilinear_partners_SU2[site_index].size(); ++i) {
-            const size_t p1_idx = mixed_trilinear_partners_SU2[site_index][i][0];
-            const size_t p2_idx = mixed_trilinear_partners_SU2[site_index][i][1];
-            const auto& T = mixed_trilinear_interaction_SU2[site_index][i];
-            
-            for (size_t a = 0; a < spin_dim_SU2; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                        temp += T[a](b, c) * curr_spins2[p1_idx](b) * curr_spins3[p2_idx](c);
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        return H;
-    }
-
-    /**
-     * Get local field for SU(3) from temporary state
-     */
-    SpinVector get_local_field_SU3_state(size_t site_index,
-                                         const SpinConfigSU2& curr_spins2,
-                                         const SpinConfigSU3& curr_spins3) const {
-        SpinVector H = -field_SU3[site_index];
-        
-        // Onsite
-        H += 2.0 * onsite_interaction_SU3[site_index] * curr_spins3[site_index];
-        
-        // Bilinear
-        for (size_t i = 0; i < bilinear_partners_SU3[site_index].size(); ++i) {
-            H += bilinear_interaction_SU3[site_index][i] * curr_spins3[bilinear_partners_SU3[site_index][i]];
-        }
-        
-        // Mixed bilinear
-        for (size_t i = 0; i < mixed_bilinear_partners_SU3[site_index].size(); ++i) {
-            H += mixed_bilinear_interaction_SU3[site_index][i] * curr_spins2[mixed_bilinear_partners_SU3[site_index][i]];
-        }
-        
-        // Trilinear SU(3)-SU(3)-SU(3) contributions
-        for (size_t i = 0; i < trilinear_partners_SU3[site_index].size(); ++i) {
-            const size_t p1_idx = trilinear_partners_SU3[site_index][i][0];
-            const size_t p2_idx = trilinear_partners_SU3[site_index][i][1];
-            const auto& T = trilinear_interaction_SU3[site_index][i];
-            
-            for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU3; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU3; ++c) {
-                        temp += T[a](b, c) * curr_spins3[p1_idx](b) * curr_spins3[p2_idx](c);
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        // Mixed trilinear contributions
-        for (size_t i = 0; i < mixed_trilinear_partners_SU3[site_index].size(); ++i) {
-            const size_t p1_idx = mixed_trilinear_partners_SU3[site_index][i][0];
-            const size_t p2_idx = mixed_trilinear_partners_SU3[site_index][i][1];
-            const auto& T = mixed_trilinear_interaction_SU3[site_index][i];
-            
-            for (size_t a = 0; a < spin_dim_SU3; ++a) {
-                double temp = 0.0;
-                for (size_t b = 0; b < spin_dim_SU2; ++b) {
-                    for (size_t c = 0; c < spin_dim_SU2; ++c) {
-                        temp += T[a](b, c) * curr_spins2[p1_idx](b) * curr_spins2[p2_idx](c);
-                    }
-                }
-                H(a) += temp;
-            }
-        }
-        
-        return H;
-    }
 
 public:
 
@@ -3883,12 +3591,24 @@ public:
     }
 
     /**
-     * Initialize with ferromagnetic state
+     * Initialize with a uniform state: SU(2) spins along direction_SU2; SU(3)
+     * states along direction_SU3, which on CP^2 is replaced by the closest
+     * pure state (top eigenvector of rho = 1/3 + direction.lambda / (2|direction|);
+     * e.g. lambda_3 gives |1>, n = (0,0,1,0,0,0,0,1/sqrt3)) and on the sphere
+     * scaled to spin_length_SU3.
      */
     void init_ferromagnetic(const SpinVector& direction_SU2, const SpinVector& direction_SU3) {
         const SpinVector dir_SU2 = direction_SU2.normalized() * spin_length_SU2;
-        const SpinVector dir_SU3 = direction_SU3.normalized() * spin_length_SU3;
-        
+        SpinVector dir_SU3 = direction_SU3.normalized() * spin_length_SU3;
+        if (su3_on_cp2()) {
+            const SpinVector unit = direction_SU3.normalized();
+            classical_spin::su3::Vector8r v;
+            for (int a = 0; a < 8; ++a) v(a) = unit(a);
+            const auto psi = classical_spin::su3::psi_from_expectations(v);
+            std::complex<double> p[3] = {psi(0), psi(1), psi(2)};
+            classical_spin::su3::pure_expectations(p, dir_SU3.data());
+        }
+
         for (size_t i = 0; i < lattice_size_SU2; ++i) {
             spins_SU2[i] = dir_SU2;
         }
@@ -3898,14 +3618,17 @@ public:
     }
 
     /**
-     * Initialize with random state
+     * Initialize with an uncorrelated random state: SU(2) spins uniform on
+     * the sphere, SU(3) states uniform on su3_mc_manifold (Haar on CP^2).
      */
     void init_random() {
         for (size_t i = 0; i < lattice_size_SU2; ++i) {
-            spins_SU2[i] = gen_random_spin(spin_length_SU2, spin_dim_SU2);
+            spins_SU2[i].resize(spin_dim_SU2);
+            random_point_on_sphere(spins_SU2[i].data(), spin_dim_SU2, double(spin_length_SU2));
         }
-        for (size_t i = 0; i < lattice_size_SU3; ++i) {
-            spins_SU3[i] = gen_random_spin(spin_length_SU3, spin_dim_SU3);
+        for (size_t j = 0; j < lattice_size_SU3; ++j) {
+            spins_SU3[j].resize(spin_dim_SU3);
+            random_SU3_state(spins_SU3[j].data());
         }
     }
 

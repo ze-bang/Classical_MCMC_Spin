@@ -616,6 +616,8 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_md_drivers
     test_sa_ground_state
     test_mixed_md
+    test_mixed_mc_exact
+    test_mixed_mc_kernels
     test_mixed_pump_probe
     test_phonon_dynamics
     test_pt_ladder
