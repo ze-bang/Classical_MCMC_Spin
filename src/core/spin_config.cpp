@@ -930,11 +930,35 @@ vector<string> SpinConfig::validation_errors() const {
              system_type_to_string(system) + "'" +
              (system == SystemType::NCTO ? " (NCTO supports simulated_annealing, molecular_dynamics, pump_probe, 2dcs)"
                                          : ""));
-    if (sweep) {
+    if (sweep && run != SimulationType::PARAMETER_SWEEP) {
+        // Every point must be a valid run of the base simulation (a sweep that
+        // reaches T_end = 0 or md_timestep = 0 is rejected before anything runs).
         try {
-            for (const SweepAxis& a : sweep_axes()) {
-                SpinConfig probe = *this;
-                probe.set_value(a.name, a.values.front());   // must be a numeric key
+            const vector<SweepAxis> axes = sweep_axes();
+            vector<size_t> k(axes.size(), 0);
+            size_t n_bad = 0;
+            for (bool more = true; more && n_bad < 5;) {
+                SpinConfig point = *this;
+                point.simulation = run;
+                string where = "sweep point";
+                for (size_t p = 0; p < axes.size(); ++p) {
+                    point.set_value(axes[p].name, axes[p].values[k[p]]);   // throws for a non-numeric key
+                    where += (p ? ", " : " ") + axes[p].name + " = " + fmt_real(axes[p].values[k[p]]);
+                }
+                const vector<string> e = point.validation_errors();
+                if (!e.empty()) {
+                    ++n_bad;
+                    for (const string& m : e) fail(where + ": " + m);
+                }
+                // next index (odometer)
+                more = false;
+                for (size_t p = axes.size(); p-- > 0;) {
+                    if (++k[p] < axes[p].values.size()) {
+                        more = true;
+                        break;
+                    }
+                    k[p] = 0;
+                }
             }
         } catch (const exception& e) {
             fail(e.what());

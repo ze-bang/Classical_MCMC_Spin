@@ -609,7 +609,8 @@ family; NCTO checks its effective default scan), lattice sizes of 0,
 without 3 components, system/mode combinations the driver does not implement
 (NCTO + parallel tempering, `kinetic_barrier`/`gneb`, `custom`), and parameter
 sweeps without parameters, with inconsistent list lengths, unknown or
-non-numeric swept keys, or invalid grids. `SA` with `annealing_steps = 0` (an
+non-numeric swept keys, invalid grids, or any point that is not a valid run
+of the base simulation (checked point by point). `SA` with `annealing_steps = 0` (an
 energy evaluation) skips the schedule checks.
 
 **Why.** `T_end = 0` (two shipped examples) and `cooling_rate >= 1` never

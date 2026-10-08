@@ -277,7 +277,7 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
         int device_count;
         cudaGetDeviceCount(&device_count);
         if (device_count > 0) {
-            int device_id = rank % device_count;
+            int device_id = job_rank() % device_count;
             cudaSetDevice(device_id);
             // Log GPU assignment for all ranks (synchronized output)
             for (int r = 0; r < size; ++r) {
@@ -395,7 +395,7 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_C
         int device_count;
         cudaGetDeviceCount(&device_count);
         if (device_count > 0) {
-            int device_id = rank % device_count;
+            int device_id = job_rank() % device_count;
             cudaSetDevice(device_id);
             // Log GPU assignment for all ranks (synchronized output)
             for (int r = 0; r < size; ++r) {
@@ -432,7 +432,9 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_C
     // Validate pump direction count: must be 1 (broadcast to all) or match N_atoms_SU2
     if (pump_dirs_norm.size() != 1 && pump_dirs_norm.size() != lattice.N_atoms_SU2) {
         ostringstream msg;
-        msg << "pump_direction must have either 1 direction (broadcast to all SU2 sublattices) " << "or exactly " << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). " << "Got " << pump_dirs_norm.size() << " directions.";
+        msg << "pump_direction must have either 1 direction (broadcast to all SU2 sublattices) or exactly "
+            << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). Got " << pump_dirs_norm.size()
+            << " directions.";
         throw invalid_argument(msg.str());
     }
     
@@ -440,7 +442,8 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_C
     for (const auto& dir : pump_dirs_norm) {
         if (dir.size() != lattice.spin_dim_SU2) {
             ostringstream msg;
-            msg << "pump_direction dimension (" << dir.size()  << ") does not match lattice spin_dim_SU2 (" << lattice.spin_dim_SU2 << ")";
+            msg << "pump_direction dimension (" << dir.size() << ") does not match lattice spin_dim_SU2 ("
+                << lattice.spin_dim_SU2 << ")";
             throw invalid_argument(msg.str());
         }
     }
@@ -529,7 +532,9 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_C
     // Validate SU3 pump direction count: must be 1 (broadcast to all) or match N_atoms_SU3
     if (pump_dirs_su3_norm.size() != 1 && pump_dirs_su3_norm.size() != lattice.N_atoms_SU3) {
         ostringstream msg;
-        msg << "pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) " << "or exactly " << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). " << "Got " << pump_dirs_su3_norm.size() << " directions.";
+        msg << "pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) or exactly "
+            << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). Got "
+            << pump_dirs_su3_norm.size() << " directions.";
         throw invalid_argument(msg.str());
     }
     
@@ -537,7 +542,8 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_C
     for (const auto& dir : pump_dirs_su3_norm) {
         if (dir.size() != lattice.spin_dim_SU3) {
             ostringstream msg;
-            msg << "pump_direction_su3 dimension (" << dir.size()  << ") does not match lattice spin_dim_SU3 (" << lattice.spin_dim_SU3 << ")";
+            msg << "pump_direction_su3 dimension (" << dir.size() << ") does not match lattice spin_dim_SU3 ("
+                << lattice.spin_dim_SU3 << ")";
             throw invalid_argument(msg.str());
         }
     }
@@ -784,7 +790,7 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         int device_count;
         cudaGetDeviceCount(&device_count);
         if (device_count > 0) {
-            int device_id = rank % device_count;
+            int device_id = job_rank() % device_count;
             cudaSetDevice(device_id);
             // Log GPU assignment for all ranks (synchronized output)
             for (int r = 0; r < size; ++r) {
@@ -842,7 +848,9 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
     // Validate pump direction count: must be 1 (broadcast to all) or match N_atoms_SU2
     if (pump_dirs_norm.size() != 1 && pump_dirs_norm.size() != lattice.N_atoms_SU2) {
         ostringstream msg;
-        msg << "pump_direction must have either 1 direction (broadcast to all SU2 sublattices) " << "or exactly " << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). " << "Got " << pump_dirs_norm.size() << " directions.";
+        msg << "pump_direction must have either 1 direction (broadcast to all SU2 sublattices) or exactly "
+            << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). Got " << pump_dirs_norm.size()
+            << " directions.";
         throw invalid_argument(msg.str());
     }
     
@@ -850,7 +858,8 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
     for (const auto& dir : pump_dirs_norm) {
         if (dir.size() != lattice.spin_dim_SU2) {
             ostringstream msg;
-            msg << "pump_direction dimension (" << dir.size()  << ") does not match lattice spin_dim_SU2 (" << lattice.spin_dim_SU2 << ")";
+            msg << "pump_direction dimension (" << dir.size() << ") does not match lattice spin_dim_SU2 ("
+                << lattice.spin_dim_SU2 << ")";
             throw invalid_argument(msg.str());
         }
     }
@@ -936,7 +945,9 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
     // Validate SU3 pump direction count: must be 1 (broadcast to all) or match N_atoms_SU3
     if (pump_dirs_su3_norm.size() != 1 && pump_dirs_su3_norm.size() != lattice.N_atoms_SU3) {
         ostringstream msg;
-        msg << "pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) " << "or exactly " << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). " << "Got " << pump_dirs_su3_norm.size() << " directions.";
+        msg << "pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) or exactly "
+            << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). Got "
+            << pump_dirs_su3_norm.size() << " directions.";
         throw invalid_argument(msg.str());
     }
     
@@ -944,7 +955,8 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
     for (const auto& dir : pump_dirs_su3_norm) {
         if (dir.size() != lattice.spin_dim_SU3) {
             ostringstream msg;
-            msg << "pump_direction_su3 dimension (" << dir.size()  << ") does not match lattice spin_dim_SU3 (" << lattice.spin_dim_SU3 << ")";
+            msg << "pump_direction_su3 dimension (" << dir.size() << ") does not match lattice spin_dim_SU3 ("
+                << lattice.spin_dim_SU3 << ")";
             throw invalid_argument(msg.str());
         }
     }

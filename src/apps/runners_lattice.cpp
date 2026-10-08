@@ -227,8 +227,9 @@ bool select_gpu(const SpinConfig& config, int rank) {
         if (rank == 0) cout << "Warning: no usable GPU; running on the CPU" << endl;
         return false;
     }
-    cudaSetDevice(rank % device_count);
-    cout << "[Rank " << rank << "] GPU " << (rank % device_count) << " of " << device_count << endl;
+    const int device_id = job_rank() % device_count;
+    cudaSetDevice(device_id);
+    cout << "[Rank " << rank << "] GPU " << device_id << " of " << device_count << endl;
     return true;
 #else
     if (rank == 0) cout << "GPU requested but not compiled in (CUDA_ENABLED); running on the CPU" << endl;

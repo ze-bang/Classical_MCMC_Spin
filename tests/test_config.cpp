@@ -183,6 +183,13 @@ void test_validation() {
                          "sweep_end = 1\nsweep_step = 0"),
                     "non-zero"),
           "sweep with step 0 rejected");
+    check(has_error(with("simulation_mode = parameter_sweep\nsweep_parameter = T_end\nsweep_start = 0.1\n"
+                         "sweep_end = 0\nsweep_step = -0.05"),
+                    "sweep point T_end = 0: T_end must be > 0"),
+          "every sweep point is validated (a point with T_end = 0 is rejected up front)");
+    check(with("simulation_mode = parameter_sweep\nsweep_parameter = T_end\nsweep_start = 0.1\n"
+               "sweep_end = 0.05\nsweep_step = -0.05").validation_errors().empty(),
+          "...a sweep whose points are all valid passes");
     check(has_error(with("field_direction = 0,1"), "field_direction"), "2-component field_direction rejected");
     check(has_error(with("num_trials = 0"), "num_trials"), "num_trials = 0 rejected");
     check(has_error(with("simulation_mode = MD\nmd_integrator = rk45"), "md_integrator"),

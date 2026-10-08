@@ -119,3 +119,6 @@ inline int comm_size(MPI_Comm comm) {
     MPI_Comm_size(comm, &s);
     return s;
 }
+/// Rank in the whole job, for GPU binding: a sweep point runs on MPI_COMM_SELF
+/// (rank 0 there), and binding by that rank put every point on device 0.
+inline int job_rank() { return comm_rank(MPI_COMM_WORLD); }

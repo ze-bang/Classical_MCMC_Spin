@@ -27,6 +27,8 @@
 #include <H5Cpp.h>
 #include <mpi.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
