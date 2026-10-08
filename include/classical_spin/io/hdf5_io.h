@@ -14,6 +14,17 @@
 #include "classical_spin/dynamics/time_grid.h"
 
 /**
+ * Number of delays of a 2DCS scan tau_start, tau_start + tau_step, ... up to
+ * tau_end: the round-off tolerant count of dynamics::delay_grid (0 -> 0.3 in
+ * steps of 0.1 is four delays; truncating the ratio gave three).
+ */
+inline int hdf5_delay_count(double tau_start, double tau_end, double tau_step) {
+    const double span = std::abs(tau_end - tau_start);
+    if (span == 0.0) return 1;
+    return static_cast<int>(classical_spin::dynamics::whole_steps(span, std::abs(tau_step))) + 1;
+}
+
+/**
  * Helper function to create HDF5 file with proper serial access properties.
  * This is critical for compatibility with parallel HDF5 libraries (hdf5-mpi).
  * 
@@ -775,7 +786,7 @@ public:
         
         // Compute and store tau values (round-off tolerant count: 0 -> 0.3 in
         // steps of 0.1 is four delays; matches dynamics::delay_grid).
-        int n_tau = n_delays(tau_start, tau_end, tau_step);
+        int n_tau = hdf5_delay_count(tau_start, tau_end, tau_step);
         std::vector<double> tau_vals(n_tau);
         for (int i = 0; i < n_tau; ++i) {
             tau_vals[i] = tau_start + i * tau_step;
@@ -861,11 +872,6 @@ public:
     }
     
 private:
-    static int n_delays(double tau_start, double tau_end, double tau_step) {
-        const double r = std::abs((tau_end - tau_start) / tau_step);
-        return static_cast<int>(std::floor(r + 1e-9 + 8.0 * std::numeric_limits<double>::epsilon() * r)) + 1;
-    }
-
     void write_metadata(size_t lattice_size, size_t spin_dim, size_t n_atoms,
                        size_t dim1, size_t dim2, size_t dim3, float spin_length,
                        double pulse_amp, double pulse_width, double pulse_freq,
@@ -912,7 +918,7 @@ private:
         write_double_attr(metadata_group_, "tau_start", tau_start);
         write_double_attr(metadata_group_, "tau_end", tau_end);
         write_double_attr(metadata_group_, "tau_step", tau_step);
-        write_int_attr(metadata_group_, "tau_steps", n_delays(tau_start, tau_end, tau_step));
+        write_int_attr(metadata_group_, "tau_steps", hdf5_delay_count(tau_start, tau_end, tau_step));
         
         // Ground state
         write_double_attr(metadata_group_, "ground_state_energy", ground_state_energy);
@@ -1244,8 +1250,7 @@ private:
         write_double_attr(metadata_group_, "tau_start", tau_start);
         write_double_attr(metadata_group_, "tau_end", tau_end);
         write_double_attr(metadata_group_, "tau_step", tau_step);
-        int n_tau = static_cast<int>(std::abs((tau_end - tau_start) / tau_step)) + 1;
-        write_int_attr(metadata_group_, "tau_steps", n_tau);
+        write_int_attr(metadata_group_, "tau_steps", hdf5_delay_count(tau_start, tau_end, tau_step));
         
         // Ground state
         write_double_attr(metadata_group_, "ground_state_energy", ground_state_energy);

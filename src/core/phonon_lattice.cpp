@@ -20,6 +20,7 @@
 
 #include "classical_spin/lattice/phonon_lattice.h"
 #include "classical_spin/lattice/pulse_chunking.h"
+#include "classical_spin/io/spin_table.h"
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -3239,61 +3240,31 @@ void PhononLattice::load_state_hdf5(const string& filename) {
 #endif
 
 void PhononLattice::save_spin_config(const string& filename) const {
-    std::ofstream file(filename);
-    if (!file) throw std::runtime_error("save_spin_config: cannot open " + filename + " for writing");
-    file << std::scientific << std::setprecision(12);
-
-    for (size_t i = 0; i < lattice_size; ++i) {
-        file << spins[i](0) << " " << spins[i](1) << " " << spins[i](2) << "\n";
-    }
-    file.close();
-    if (!file) throw std::runtime_error("save_spin_config: write to " + filename + " failed");
+    classical_spin::io::write_table(filename, lattice_size, 3, [&](size_t i, size_t j) { return spins[i](j); });
 }
 
 vector<Eigen::Vector3d> PhononLattice::read_vec3_file(const string& filename, size_t n) {
-    std::ifstream in(filename);
-    if (!in) throw std::runtime_error("Cannot open file: " + filename);
+    const classical_spin::io::Table t = classical_spin::io::read_table(filename, n, 3);
     vector<Eigen::Vector3d> out;
     out.reserve(n);
-    string line;
-    size_t line_no = 0;
-    while (std::getline(in, line)) {
-        ++line_no;
-        const size_t hash = line.find('#');
-        if (hash != string::npos) line.resize(hash);
-        std::istringstream iss(line);
-        double v[3];
-        size_t k = 0;
-        string tok;
-        while (iss >> tok) {
-            if (k == 3)
-                throw std::runtime_error(filename + ":" + std::to_string(line_no) + ": more than 3 values on a line");
-            char* end = nullptr;
-            v[k] = std::strtod(tok.c_str(), &end);
-            if (end == tok.c_str() || *end != '\0' || !std::isfinite(v[k]))
-                throw std::runtime_error(filename + ":" + std::to_string(line_no) + ": not a finite number: '" + tok + "'");
-            ++k;
-        }
-        if (k == 0) continue;                                   // blank / comment line
-        if (k != 3)
-            throw std::runtime_error(filename + ":" + std::to_string(line_no) + ": expected 3 values, got " +
-                                     std::to_string(k));
-        if (out.size() == n)
-            throw std::runtime_error(filename + ": more than " + std::to_string(n) + " vectors (wrong lattice size?)");
-        out.emplace_back(v[0], v[1], v[2]);
-    }
-    if (out.size() != n)
-        throw std::runtime_error(filename + ": " + std::to_string(out.size()) + " vectors, expected " +
-                                 std::to_string(n) + " (wrong lattice size or truncated file)");
+    for (size_t i = 0; i < n; ++i) out.emplace_back(t.row(i)[0], t.row(i)[1], t.row(i)[2]);
     return out;
 }
 
 void PhononLattice::load_spin_config(const string& filename) {
-    const vector<Eigen::Vector3d> v = read_vec3_file(filename, lattice_size);
-    for (size_t i = 0; i < lattice_size; ++i)
+    const classical_spin::io::Table t = classical_spin::io::read_table(filename, lattice_size, 3);
+    vector<Eigen::Vector3d> v(lattice_size);
+    for (size_t i = 0; i < lattice_size; ++i) {
+        v[i] = Eigen::Vector3d(t.row(i)[0], t.row(i)[1], t.row(i)[2]);
         if (!(v[i].norm() > 1e-12))
-            throw std::runtime_error(filename + ": zero spin vector at site " + std::to_string(i));
-    for (size_t i = 0; i < lattice_size; ++i) spins[i] = v[i].normalized() * spin_length;
+            throw std::runtime_error(filename + ":" + std::to_string(t.lines[i]) + ": zero spin vector");
+    }
+    // Rescale to spin_length; a spin already of that length to round-off is kept bitwise.
+    const double L = spin_length;
+    for (size_t i = 0; i < lattice_size; ++i) {
+        const double n = v[i].norm();
+        spins[i] = (std::abs(n - L) <= 4.0 * std::numeric_limits<double>::epsilon() * L) ? v[i] : Eigen::Vector3d(v[i] * (L / n));
+    }
 }
 
 void PhononLattice::save_positions(const string& filename) const {

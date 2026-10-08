@@ -624,3 +624,37 @@ it describes (a parameter sweep over `field_strength`, 0 → 5 step 0.1, with
 `chii` (a legacy key the current TmFeO3 builder never read);
 `Pyrochlore/pt_non_kramer_field_sweep.param` ends at 2.9 (the same eight
 points it ran before; 1.5 → 3.0 is not a whole number of 0.2 steps).
+
+## Spin-configuration files: strict loading, full-precision saving
+
+**What changed.** `Lattice`, `MixedLattice` and `PhononLattice::load_spin_config`
+share one reader (`classical_spin/io/spin_table.h`): exactly one spin per line
+with exactly `spin_dim` finite numbers, `#` comments and blank lines allowed.
+A missing file, a short file, a wrong column count, a non-finite value, extra
+rows or a zero vector throw `std::runtime_error` naming the file and line, and
+the current state is left unchanged (the file is parsed into a buffer first;
+`MixedLattice` parses both `_SU2.txt` and `_SU3.txt` before storing either).
+Every loaded spin is rescaled to its length: `spin_length` (Lattice,
+PhononLattice), `spin_length_su3`/`spin_length` (MixedLattice), except that an
+SU(3) vector within 1e-3 of the pure-qutrit length 2/√3 is set to exactly 2/√3
+(states from `physicalize_SU3_state` stay physical); a spin already of its
+length to round-off is kept bitwise, and a rescale by more than 1e-3 prints a
+warning. All savers (`save_spin_config`, `save_spin_config_to_dir`) write
+`max_digits10` significant digits and throw if the file cannot be written
+(Lattice printed an error and continued; MixedLattice wrote 6 digits and
+ignored failures; PhononLattice wrote 12 digits), so save → load is bitwise.
+
+**Why.** The Lattice and MixedLattice loaders printed to stderr and returned
+on a missing or short file, leaving random or half-overwritten spins, while
+the runners skipped equilibration because a configuration had been "loaded";
+extra columns or rows were silently ignored; 6-digit MixedLattice files
+reloaded with |S| errors of ~1e-6 (non-stationary "ground states").
+
+**Recover the old behaviour.** Not supported (fix the file).
+
+## HDF5 2DCS files: delay count
+
+**What changed.** The `tau_steps` attribute of the mixed-lattice pump-probe
+file uses the round-off tolerant delay count of `dynamics::delay_grid` (shared
+helper `hdf5_delay_count`); it truncated `|tau_end - tau_start| / tau_step`,
+so 0 → 0.3 in steps of 0.1 recorded 3 delays while 4 were written.

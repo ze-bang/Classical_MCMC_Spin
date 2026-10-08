@@ -616,6 +616,7 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_pt_ladder
     test_unitcell_geometry
     test_config
+    test_config_spin_io
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
