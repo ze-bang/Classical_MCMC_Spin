@@ -535,3 +535,56 @@ extent, e.g. the honeycomb J3 offset (1,−2,0) on a lattice one cell wide. A
 lattice narrower than 2|offset| + 1 along a bonded direction prints a warning:
 periodic images of distinct bonds then land on the same pair and their
 couplings add.
+
+## Correlation accumulator: FFT cross spectra, global frame, error bars
+
+**What changed.** `RealSpaceCorrelationAccumulator` (now in
+`lattice/correlation_accumulator.h`) accumulates, per sample, the FFT of every
+sublattice/component field over the cell grid and the cross spectra
+X_ss'^ab(k) = F_sa(k) F_s'b(k)^*, instead of real-space sums over all cell
+pairs. Consequences:
+
+- Cost O(N log N) per sample and no N_c x N_c table (L = 12 pyrochlore with
+  dimers: 5 ms per sample instead of ~2 s; 1.5 GB table at L = 24 gone).
+- Spins are rotated to the global frame with `sublattice_frames`, so
+  `structure_factor(q)` is the physical (neutron) S^ab(q); all sublattice pairs
+  and all (a, b) components are kept complex, so the antisymmetric (chiral)
+  part survives. `compute_Sq` returns its real part, as a 3x3 matrix.
+- q must be commensurate (q.a_i L_i / 2π integer): anything else throws
+  `std::invalid_argument` (the old code silently returned wrong values off the
+  grid). `grid_wavevector(m1, m2, m3)` builds grid points in any zone.
+- Error bars: samples go into `Options::n_bins` (default 16) contiguous bins
+  that are merged pairwise when full; `structure_factor_estimate` and
+  `compute_Sq_with_error` return delete-one-bin jackknife errors (the old error
+  was always zero).
+- Dimers: bond types are now geometrically distinct bond classes of the unit
+  cell (`bond_classes_from_unit_cell`, nearest coupled shell by default) with
+  the bond-centre phase; the old type = sublattice pair lumped up/down
+  tetrahedron bonds together, used two different (i, j) -> type orderings in
+  Lattice and the accumulator, and the wrong centre for inter-cell bonds.
+  Dimer operators use global-frame spins and have their own sample count.
+- `merge` merges every mean (it dropped two thirds of the dimer means), copies
+  into an uninitialised accumulator and throws on any geometry mismatch;
+  `mpi_reduce` is one `MPI_Reduce` on doubles after a collective geometry check.
+- `save_hdf5` writes a new schema (cross spectra, per-bin means, S(q) on the
+  first-zone grid with errors, bond-class table, convention attributes) and
+  throws `std::runtime_error` on HDF5 failure. The old flat `spin_corr_sum` /
+  `dimer_corr_sum` datasets are gone; `real_space_correlation(s, s', a, b)`
+  returns C(d) by inverse FFT.
+- The `n_bond_types` argument of `create_correlation_accumulator` /
+  `parallel_tempering` (config key `pt_n_bond_types`) is ignored.
+
+**Recover the old behaviour.** Not supported (the old output had wrong phases,
+frames and normalisation). Local-frame correlations: initialise with empty
+`Geometry::frames`.
+
+## Lattice::structure_factor / structure_factor_tensor: global frame, all components
+
+**What changed.** `Lattice::structure_factor(q)` returned |Σ_i S_i^x e^{iq·r_i}|²/N
+of the first LOCAL component only; it is now Tr S(q) over all components in the
+global frame. `structure_factor_tensor(q)` uses global-frame spins (was local)
+and `structure_factor_matrix(q)` returns the full complex tensor. Both stay
+normalised per site (1/N); the accumulator is per unit cell.
+
+**Recover the old behaviour.** Compute |Σ_i S_i^x e^{iq·r_i}|²/N directly from
+`spins` if needed.

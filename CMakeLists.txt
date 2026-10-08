@@ -615,6 +615,7 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_phonon_dynamics
     test_pt_ladder
     test_unitcell_geometry
+    test_observables
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
@@ -684,6 +685,14 @@ if(BUILD_TESTING)
     set_tests_properties(hdf5_pt_writer_smoke PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     )
+    # Correlation accumulator MPI reduction on 3 ranks (bin-wise sums, collective
+    # geometry check).
+    add_optimized_executable(test_observables_mpi tests/test_observables_mpi.cpp)
+    add_test(NAME physics_test_observables_mpi
+             COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 3 --oversubscribe --allow-run-as-root
+                     $<TARGET_FILE:test_observables_mpi>)
+    set_tests_properties(physics_test_observables_mpi PROPERTIES TIMEOUT 120 LABELS "physics;mpi"
+                         ENVIRONMENT "OMP_NUM_THREADS=1")
 
 endif()
 
