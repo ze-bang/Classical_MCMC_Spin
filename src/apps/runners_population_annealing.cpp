@@ -26,7 +26,8 @@
 
 using namespace std;
 
-void run_population_annealing(Lattice& lattice, const SpinConfig& config, int rank, int size, MPI_Comm comm) {
+void run_population_annealing(Lattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     mc::PAOptions o;
     o.population = config.pa_population;
     o.T_start = config.T_start;

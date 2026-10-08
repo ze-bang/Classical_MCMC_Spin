@@ -10,6 +10,7 @@
 #include "classical_spin/dynamics/spin_integrators.h"  // geometric / Langevin spin integrators
 #include "classical_spin/dynamics/drive.h"             // DriveSchedule, Pulse
 #include "classical_spin/dynamics/time_grid.h"         // TimeGrid, delay_grid
+#include "classical_spin/io/spin_table.h"               // spin configuration text files
 #include <vector>
 #include <functional>
 #include <random>
@@ -4270,60 +4271,41 @@ public:
     // ============================================================
 
     /**
-     * Save spin configuration to file
+     * Save the spin configuration: lattice_size lines of spin_dim values at
+     * full precision (reloads bitwise). Throws std::runtime_error if the file
+     * cannot be written.
      */
     void save_spin_config(const string& filename) const {
-        ofstream file(filename);
-        if (!file) {
-            std::cerr << "Error: Cannot open file " << filename << endl;
-            return;
-        }
-        
-        file << std::scientific << std::setprecision(16);
-        
-        for (size_t i = 0; i < lattice_size; ++i) {
-            for (int j = 0; j < spins[i].size(); ++j) {
-                file << spins[i](j);
-                if (j < spins[i].size() - 1) file << " ";
-            }
-            file << "\n";
-        }
-        
-        file.close();
+        classical_spin::io::write_table(filename, lattice_size, spin_dim,
+                                        [&](size_t i, size_t j) { return spins[i](j); });
     }
 
     /**
-     * Load spin configuration from file
+     * Load a spin configuration written by save_spin_config: exactly
+     * lattice_size lines of spin_dim finite numbers ('#' comments allowed).
+     * Every spin is rescaled to spin_length. Throws std::runtime_error naming
+     * the file and line on a missing file, a short file, a wrong number of
+     * columns, a non-finite value, extra rows or a zero vector; the current
+     * spins are left unchanged on error.
      */
     void load_spin_config(const string& filename) {
-        ifstream file(filename);
-        if (!file) {
-            std::cerr << "Error: Cannot open file " << filename << endl;
-            return;
+        const classical_spin::io::Table t = classical_spin::io::read_table(filename, lattice_size, spin_dim);
+        SpinConfig loaded(lattice_size);
+        double max_dev = 0.0;
+        for (size_t i = 0; i < lattice_size; ++i) {
+            const SpinVector s = Eigen::Map<const Eigen::VectorXd>(t.row(i), Eigen::Index(spin_dim));
+            const double n = s.norm();
+            if (!(n > 0.0))
+                throw std::runtime_error(filename + ":" + std::to_string(t.lines[i]) + ": zero spin vector");
+            max_dev = std::max(max_dev, std::abs(n - spin_length) / spin_length);
+            // A spin already of length spin_length to round-off is kept bitwise.
+            loaded[i] = (std::abs(n - spin_length) <= 4.0 * std::numeric_limits<double>::epsilon() * spin_length)
+                            ? s : SpinVector(s * (spin_length / n));
         }
-        
-        size_t idx = 0;
-        string line;
-        
-        while (std::getline(file, line) && idx < lattice_size) {
-            std::istringstream iss(line);
-            for (int j = 0; j < spin_dim; ++j) {
-                double val;
-                if (!(iss >> val)) {
-                    std::cerr << "Error: Incomplete spin data at line " << idx << endl;
-                    file.close();
-                    return;
-                }
-                spins[idx](j) = val;
-            }
-            ++idx;
-        }
-        
-        file.close();
-        
-        if (idx != lattice_size) {
-            std::cerr << "Warning: File contained " << idx << " spins, expected " << lattice_size << endl;
-        }
+        spins = std::move(loaded);
+        if (max_dev > 1e-3)
+            std::cerr << "Warning: " << filename << ": spins rescaled to spin_length = " << spin_length
+                      << " (largest relative change " << max_dev << ")" << std::endl;
     }
 
     /**

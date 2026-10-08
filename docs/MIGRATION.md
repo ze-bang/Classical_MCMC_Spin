@@ -535,3 +535,248 @@ extent, e.g. the honeycomb J3 offset (1,−2,0) on a lattice one cell wide. A
 lattice narrower than 2|offset| + 1 along a bonded direction prints a warning:
 periodic images of distinct bonds then land on the same pair and their
 couplings add.
+
+## Config files: unknown keys are errors
+
+**What changed.** A key that is neither a typed `SpinConfig` field (or one of
+its aliases, e.g. `dt`, `h`, `tbc`, `temperature_start`) nor a registered
+Hamiltonian / model parameter is an error naming file, line and the nearest
+known key (`anealing_steps` → "did you mean 'annealing_steps'?"). Hamiltonian
+keys are registered in `src/core/spin_config.cpp` (literal names plus key
+families such as `mode<i>_omega`, `Kminus<orbit>_<λ><axis>`, `h_tm_<a>`);
+`tests/test_config.cpp` scans `src/` and `include/` and fails if a literal key
+read through `get_param`/`has_param`/`was_set` is missing, so the registry
+cannot fall behind the builders. A line without `=` or `:` is also an error
+(it was skipped). A key given twice prints a warning (the last value wins, as
+before).
+
+**Why.** Unknown keys were stored as Hamiltonian parameters and never read, so a
+typo (`anealing_steps`, `Gama`) silently ran the default and a whole example
+(`Pyrochlore/field_scan.param`, keys `field_scan_*`) ran something else than it
+said.
+
+**Recover the old behaviour.** `allow_unknown_keys = true` keeps unknown numeric
+keys as Hamiltonian parameters with a warning (anywhere in the file).
+
+## Config files: strict numbers and booleans
+
+**What changed.** Integer keys accept `1e5` or `100000.0` when the value is
+integral and in range, and reject fractional (`2.7`), negative (for counts) and
+overflowing values; doubles must be finite and consume the whole value
+(`1.5abc` is an error); `seed` is parsed exactly to 64 bits. Booleans are
+`true/false`, `yes/no`, `on/off`, `1/0` in any case; anything else is an error
+(`ture` used to mean false, and `auto_su3_pump`/`fix_strain` only knew
+`true`/`1`). `lattice_size` needs exactly three values. Errors name the key and
+the line.
+
+**Why.** `std::stoull("1e5")` is 1 and `stoull("-1")` is 2^64 − 1, so
+`annealing_steps = 1e5` ran one sweep and `lattice_size = -8` asked for 10^19
+sites.
+
+**Recover the old behaviour.** Not supported (write the value in range).
+
+## Config: one key/value entry point (`SpinConfig::set`), lossless `to_file`
+
+**What changed.** `SpinConfig::set(key, value)` is the single entry point for a
+key: `from_file`/`from_string` call it for every line and parameter sweeps
+apply their values through it (`set_value`, printed with `%.17g`). It returns
+false for an unknown key. `to_file` writes every typed key and Hamiltonian
+parameter at full precision under the name the parser expects
+(`simulation_mode`, not `simulation`; the old name is accepted as an alias), so
+`from_file(to_file(c))` reproduces `c` (tested for every key). The legacy
+single-axis sweep keys `sweep_parameter/start/end/step` set element 0 of the
+N-dimensional lists and are written in that form. `explicit_keys`/`was_set`
+store canonical names (an alias marks its canonical key). `field_direction` is
+still normalised on input; a vector that is already unit length is kept
+bitwise.
+
+**Why.** Sweeps only wrote the Hamiltonian map, so sweeping a typed field
+(`pump_amplitude`, `probe_time`, `T_start`, `md_*`, `tau_*`, ...) ran N identical
+simulations; `to_file` output did not parse.
+
+## Config validation
+
+**What changed.** `SpinConfig::validation_errors()` (used by `validate()` and by
+`spin_solver` before anything is built) rejects:
+`cooling_rate` outside (0, 1), `T_end <= 0` or `T_start < T_end` whenever a run
+anneals (SA, and the ground-state preparation of MD / pump-probe / 2DCS without
+`initial_spin_config`; the TmFeO3 2DCS runner always anneals) or runs parallel
+tempering, `probe_rate = 0` or `pt_exchange_frequency = 0` (PT),
+`md_timestep <= 0`, `md_save_interval = 0` or `md_time_end < md_time_start`
+(every dynamics mode and family), a zero or wrong-sign `tau_step` (2DCS, every
+family; NCTO checks its effective default scan), lattice sizes of 0,
+`num_trials < 1`, non-positive spin lengths, a `field_direction` or `g_factor`
+without 3 components, system/mode combinations the driver does not implement
+(NCTO + parallel tempering, `kinetic_barrier`/`gneb`, `custom`), and parameter
+sweeps without parameters, with inconsistent list lengths, unknown or
+non-numeric swept keys, invalid grids, or any point that is not a valid run
+of the base simulation (checked point by point). `SA` with `annealing_steps = 0` (an
+energy evaluation) skips the schedule checks.
+
+**Why.** `T_end = 0` (two shipped examples) and `cooling_rate >= 1` never
+terminated, `probe_rate = 0` divided by zero, unsupported modes printed an error
+and exited 0.
+
+**Example configs fixed.** `Pyrochlore/field_scan.param` is now the field scan
+it describes (a parameter sweep over `field_strength`, 0 → 5 step 0.1, with
+`T_end = 0.001`, `T_zero = true`); `Pyrochlore/md_pyrochlore.param` uses
+`T_end = 0.001`, `T_zero = true`; `param_sweeps/2dcs_chii_sweep.param` and
+`2dcs_sweep_example.param` use the Fe–Tm coupling `Kminus_2y` instead of
+`chii` (a legacy key the current TmFeO3 builder never read);
+`Pyrochlore/pt_non_kramer_field_sweep.param` ends at 2.9 (the same eight
+points it ran before; 1.5 → 3.0 is not a whole number of 0.2 steps).
+
+## Spin-configuration files: strict loading, full-precision saving
+
+**What changed.** `Lattice`, `MixedLattice` and `PhononLattice::load_spin_config`
+share one reader (`classical_spin/io/spin_table.h`): exactly one spin per line
+with exactly `spin_dim` finite numbers, `#` comments and blank lines allowed.
+A missing file, a short file, a wrong column count, a non-finite value, extra
+rows or a zero vector throw `std::runtime_error` naming the file and line, and
+the current state is left unchanged (the file is parsed into a buffer first;
+`MixedLattice` parses both `_SU2.txt` and `_SU3.txt` before storing either).
+Every loaded spin is rescaled to its length: `spin_length` (Lattice,
+PhononLattice), `spin_length_su3`/`spin_length` (MixedLattice), except that an
+SU(3) vector within 1e-3 of the pure-qutrit length 2/√3 is set to exactly 2/√3
+(states from `physicalize_SU3_state` stay physical); a spin already of its
+length to round-off is kept bitwise, and a rescale by more than 1e-3 prints a
+warning. All savers (`save_spin_config`, `save_spin_config_to_dir`) write
+`max_digits10` significant digits and throw if the file cannot be written
+(Lattice printed an error and continued; MixedLattice wrote 6 digits and
+ignored failures; PhononLattice wrote 12 digits), so save → load is bitwise.
+
+**Why.** The Lattice and MixedLattice loaders printed to stderr and returned
+on a missing or short file, leaving random or half-overwritten spins, while
+the runners skipped equilibration because a configuration had been "loaded";
+extra columns or rows were silently ignored; 6-digit MixedLattice files
+reloaded with |S| errors of ~1e-6 (non-stationary "ground states").
+
+**Recover the old behaviour.** Not supported (fix the file).
+
+## HDF5 2DCS files: delay count
+
+**What changed.** The `tau_steps` attribute of the mixed-lattice pump-probe
+file uses the round-off tolerant delay count of `dynamics::delay_grid` (shared
+helper `hdf5_delay_count`); it truncated `|tau_end - tau_start| / tau_step`,
+so 0 → 0.3 in steps of 0.1 recorded 3 delays while 4 were written.
+
+## Parameter sweeps: typed keys, validated points, one construction path
+
+**What changed.** Each sweep point is the base configuration with the swept
+values applied through `SpinConfig::set` (printed with `%.17g`), so typed keys
+(`pump_amplitude`, `probe_time`, `T_start`, `md_*`, `tau_*`, `annealing_steps`,
+...) are swept like Hamiltonian keys. Every point is validated before anything
+runs (e.g. a sweep that reaches `T_end = 0` is rejected up front), writes its
+own `run_info.txt`, and is built and run by `run_simulation()` — the same
+factory (`make_unit_cell`, `make_lattice`, `make_mixed_lattice`,
+`make_ncto_lattice`) and mode dispatch as a direct run, so a one-point sweep
+reproduces the direct run bitwise (smoke-tested). Point directories keep their
+names (`<key>_<value in %e>`).
+
+**Why.** Sweeps only wrote the Hamiltonian map (5 of the 11 shipped sweep
+examples ran N identical simulations) and carried their own copies of the
+unit-cell switch and initial-state logic, which had drifted from `main`.
+
+## Parameter sweeps: grids built by index
+
+**What changed.** A sweep axis has `n = llround((end - start) / step) + 1`
+points `start + k * step`, so the endpoint is kept and no round-off
+accumulates. `step = 0`, a step pointing away from `end`, and a range that is
+not a whole number of steps (to 1e-6 steps) are errors. `start == end` is one
+point.
+
+**Why.** Repeated addition dropped the endpoint (0 → 2 step 0.1 gave 20
+points ending at 1.9000000000000006), `step = 0` looped until memory ran out,
+and a wrong-sign step silently gave no points.
+
+**Recover the old behaviour.** For a range that is not a whole number of
+steps, set `sweep_end` to the last point you want.
+
+## MPI: runners take a communicator; sweeps never deadlock
+
+**What changed.** Every runner takes the `MPI_Comm` it runs on (instead of
+rank/size integers) and uses no other communicator. Non-PT sweep points run
+on `MPI_COMM_SELF`, one rank per point; the only collective on the job
+communicator is the final barrier, reached once by every rank. PT sweep points
+run on equal-sized groups of `pt_ranks_per_point` ranks (auto: ranks / points,
+at least 2); ranks left over idle with a warning instead of joining the last
+group (unequal ladders), and fewer than 3 replicas per point prints a warning.
+The TmFeO3 delay-parallel 2DCS (whose library routine runs on
+`MPI_COMM_WORLD`) is used only when the communicator spans the job; on a
+sub-communicator the trials run serially. Mixed-runner input errors throw
+(reported with the rank) instead of calling `MPI_Abort` from rank 0's checks.
+`spin_solver` initialises MPI with `MPI_THREAD_FUNNELED`.
+
+**Why.** Single-rank sweep points still ended in `MPI_Barrier(MPI_COMM_WORLD)`
+(MD, pump-probe, 2DCS, NCTO and TmFeO3 runners), so whenever the point count
+was not a multiple of the rank count some ranks waited forever.
+
+## spin_solver: error reporting and exit status
+
+**What changed.** Rank 0 reads the configuration and broadcasts its text, so
+every rank parses identical input; parse and validation errors are reported
+once and exit with status 1. During the run, an exception on any rank prints
+`[rank r] error: ...` and calls `MPI_Abort(MPI_COMM_WORLD, 1)` (it used to call
+`MPI_Finalize` on that rank while others waited in a collective, and only
+rank 0's message was printed). `H5::Exception` (not derived from
+`std::exception`) is caught and its function and detail message printed;
+HDF5's own error-stack dump is switched off. Unsupported system/mode
+combinations (NCTO + parallel tempering, `kinetic_barrier`, `custom`) are
+configuration errors (they printed to stderr and exited 0).
+"Simulation completed successfully" is printed only when everything ran.
+
+## Every trial starts from the configured initial state
+
+**What changed.** With `initial_spin_config` (or `use_ferromagnetic_init`)
+every trial of simulated annealing (Lattice, MixedLattice) and every parallel-
+tempering trial after the first start from that state; without one every trial
+starts from fresh random spins. MixedLattice MD/pump-probe/2DCS trials restore
+a ferromagnetic start too. `annealing_steps = 0` evaluates the starting state
+for every family (MixedLattice and PhononLattice used to run the cooling loop
+with zero sweeps).
+
+**Why.** Trials after the first (and, under MPI, the first trial of every rank
+but 0) silently started from random spins, MixedLattice SA never used the
+loaded configuration after trial 0, and PT trials > 0 discarded it.
+
+## Outputs: every rank writes its trials; trial_summary.txt; run_info.txt
+
+**What changed.**
+- Every rank writes the results of the trials it ran: `final_energy.txt`
+  (17 digits) and `spins_final*.txt` for simulated annealing (Lattice,
+  MixedLattice, PhononLattice); pump-probe trajectories (MixedLattice now at
+  17 digits). Rank 0 gathers one line per trial into
+  `output_dir/trial_summary.txt` (trial, owning rank, energy per site — final
+  for SA, of the initial state for the dynamics modes — and the result file,
+  plus mean/std/min).
+- Rank 0 writes `output_dir/run_info.txt`: comment lines with date, host,
+  seed, MPI size, OpenMP threads, `git describe` (generated at build time;
+  "unknown" outside a git checkout), compiler, build type and flags, followed
+  by the full resolved configuration — the file itself reruns the job
+  (`spin_solver output_dir/run_info.txt` reproduces the trial energies
+  bitwise; smoke-tested). Each sweep point writes its own. `seed.txt` is still
+  written.
+- MixedLattice MD writes `initial_spins_SU2.txt`/`_SU3.txt` (it wrote
+  `initial_spins.txt_SU2.txt`).
+
+**Why.** SA final energies and pump-probe trajectories of trials on ranks ≠ 0
+were computed and discarded (rank-0-only writes at 6 digits), and no run
+recorded the configuration, seed or code version that produced it.
+
+## Config keys that have no effect warn
+
+**What changed.** `equilibration_steps` (use `pt_equilibration_steps`),
+`num_replicas` (PT uses one replica per rank), `initial_step_size`,
+`deterministic`, `pt_target_acceptance` and `use_mpi` are accepted as before
+but print a warning: no simulation reads them.
+
+## Smoke tests in CTest
+
+**What changed.** `tests/smoke/run_smoke.sh` is registered as
+`smoke_spin_solver` (label `smoke`, timeout 900 s) and covers, besides every
+simulation mode: uneven MPI sweeps of a typed key, PT sweep groups, a TmFeO3
+MD sweep, sweep point == direct run (Lattice and NCTO), loaded configurations
+in every trial (Lattice and TmFeO3), the `run_info.txt` rerun, and clean
+non-zero exits for a misspelt key, an unsupported mode, a missing seed file
+(under MPI) and a non-terminating schedule. Two MPI CTests run `spin_solver`
+directly (`mpi_sweep_uneven`, `mpi_runtime_error_aborts`).

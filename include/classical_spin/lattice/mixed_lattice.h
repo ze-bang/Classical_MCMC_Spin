@@ -10,6 +10,7 @@
 #include "classical_spin/mc/parallel_tempering.h"  // replica-exchange engine + ladder tuning
 #include "classical_spin/lattice/pulse_chunking.h"  // default pump-probe tolerances
 #include "classical_spin/dynamics/grid_integrate.h"   // exact-grid ODE integration
+#include "classical_spin/io/spin_table.h"              // spin configuration text files
 #include <vector>
 #include <functional>
 #include <random>
@@ -3713,58 +3714,23 @@ public:
     // ============================================================
 
     /**
-     * Save spin configuration
+     * Save the spin configuration to <filename>_SU2.txt and <filename>_SU3.txt
+     * (one site per line, full precision: reloads bitwise). Throws
+     * std::runtime_error if a file cannot be written.
      */
     void save_spin_config(const string& filename) const {
-        // SU(2) spins
-        {
-            ofstream file(filename + "_SU2.txt");
-            for (size_t i = 0; i < lattice_size_SU2; ++i) {
-                for (size_t j = 0; j < spin_dim_SU2; ++j) {
-                    file << spins_SU2[i](j) << " ";
-                }
-                file << "\n";
-            }
-        }
-        
-        // SU(3) spins
-        {
-            ofstream file(filename + "_SU3.txt");
-            for (size_t i = 0; i < lattice_size_SU3; ++i) {
-                for (size_t j = 0; j < spin_dim_SU3; ++j) {
-                    file << spins_SU3[i](j) << " ";
-                }
-                file << "\n";
-            }
-        }
+        classical_spin::io::write_table(filename + "_SU2.txt", lattice_size_SU2, spin_dim_SU2,
+                                        [&](size_t i, size_t j) { return spins_SU2[i](j); });
+        classical_spin::io::write_table(filename + "_SU3.txt", lattice_size_SU3, spin_dim_SU3,
+                                        [&](size_t i, size_t j) { return spins_SU3[i](j); });
     }
 
     /**
      * Save spin configuration to a directory with clean naming
-     * Creates: spins_SU2.txt and spins_SU3.txt in the directory
+     * Creates: <prefix>_SU2.txt and <prefix>_SU3.txt in the directory
      */
     void save_spin_config_to_dir(const string& dir, const string& prefix = "spins") const {
-        // SU(2) spins
-        {
-            ofstream file(dir + "/" + prefix + "_SU2.txt");
-            for (size_t i = 0; i < lattice_size_SU2; ++i) {
-                for (size_t j = 0; j < spin_dim_SU2; ++j) {
-                    file << spins_SU2[i](j) << " ";
-                }
-                file << "\n";
-            }
-        }
-        
-        // SU(3) spins
-        {
-            ofstream file(dir + "/" + prefix + "_SU3.txt");
-            for (size_t i = 0; i < lattice_size_SU3; ++i) {
-                for (size_t j = 0; j < spin_dim_SU3; ++j) {
-                    file << spins_SU3[i](j) << " ";
-                }
-                file << "\n";
-            }
-        }
+        save_spin_config(dir + "/" + prefix);
     }
 
     /**
@@ -3797,38 +3763,47 @@ public:
     }
 
     /**
-     * Load spin configuration
+     * Load a configuration written by save_spin_config from <filename>_SU2.txt
+     * and <filename>_SU3.txt: exactly lattice_size_SU2 (SU3) lines of
+     * spin_dim_SU2 (SU3) finite numbers each. Throws std::runtime_error naming
+     * file and line on a missing file, a short file, a wrong number of
+     * columns, a non-finite value, extra rows or a zero vector; both species
+     * are parsed before anything is stored, so the state is unchanged on error.
+     *
+     * Every spin is rescaled to its length: SU(2) spins to spin_length_SU2;
+     * SU(3) vectors within 1e-3 of the pure-qutrit length 2/sqrt(3) (states
+     * from physicalize_SU3_state / deterministic_sweep_SU3_exact_diag) to
+     * exactly 2/sqrt(3), all others to spin_length_SU3. This removes the
+     * round-off of saved files without changing which manifold a state is on.
      */
     void load_spin_config(const string& filename) {
-        // Load SU(2) spins
-        {
-            ifstream file(filename + "_SU2.txt");
-            if (!file) {
-                cerr << "Error: Cannot open " << filename << "_SU2.txt" << endl;
-                return;
-            }
-            
-            for (size_t i = 0; i < lattice_size_SU2; ++i) {
-                for (size_t j = 0; j < spin_dim_SU2; ++j) {
-                    file >> spins_SU2[i](j);
-                }
-            }
-        }
-        
-        // Load SU(3) spins
-        {
-            ifstream file(filename + "_SU3.txt");
-            if (!file) {
-                cerr << "Error: Cannot open " << filename << "_SU3.txt" << endl;
-                return;
-            }
-            
-            for (size_t i = 0; i < lattice_size_SU3; ++i) {
-                for (size_t j = 0; j < spin_dim_SU3; ++j) {
-                    file >> spins_SU3[i](j);
-                }
-            }
-        }
+        using classical_spin::io::Table;
+        const Table t2 = classical_spin::io::read_table(filename + "_SU2.txt", lattice_size_SU2, spin_dim_SU2);
+        const Table t3 = classical_spin::io::read_table(filename + "_SU3.txt", lattice_size_SU3, spin_dim_SU3);
+        double max_dev = 0.0;
+        auto normalised = [&](const Table& t, size_t i, size_t dim, double length, bool su3,
+                              const string& file) -> SpinVector {
+            SpinVector s = Eigen::Map<const Eigen::VectorXd>(t.row(i), Eigen::Index(dim));
+            const double n = s.norm();
+            if (!(n > 0.0)) throw std::runtime_error(file + ":" + std::to_string(t.lines[i]) + ": zero spin vector");
+            const double pure = 2.0 / std::sqrt(3.0);
+            const double target = (su3 && dim == 8 && std::abs(n - pure) <= 1e-3 * pure) ? pure : length;
+            max_dev = std::max(max_dev, std::abs(n - target) / target);
+            // A spin already of the target length to round-off is kept bitwise.
+            if (std::abs(n - target) <= 4.0 * std::numeric_limits<double>::epsilon() * target) return s;
+            return s * (target / n);
+        };
+        SpinConfigSU2 s2(lattice_size_SU2);
+        SpinConfigSU3 s3(lattice_size_SU3);
+        for (size_t i = 0; i < lattice_size_SU2; ++i)
+            s2[i] = normalised(t2, i, spin_dim_SU2, spin_length_SU2, false, filename + "_SU2.txt");
+        for (size_t i = 0; i < lattice_size_SU3; ++i)
+            s3[i] = normalised(t3, i, spin_dim_SU3, spin_length_SU3, true, filename + "_SU3.txt");
+        spins_SU2 = std::move(s2);
+        spins_SU3 = std::move(s3);
+        if (max_dev > 1e-3)
+            std::cerr << "Warning: " << filename << "_SU{2,3}.txt: spins rescaled to their lengths (largest "
+                      << "relative change " << max_dev << ")" << std::endl;
     }
 
     /**

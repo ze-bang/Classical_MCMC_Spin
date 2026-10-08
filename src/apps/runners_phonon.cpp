@@ -109,8 +109,8 @@ void run_langevin_trial(PhononLattice& lattice, const SpinConfig& config, int tr
 /**
  * Run simulated annealing on PhononLattice (spin subsystem only).
  */
-void run_simulated_annealing_phonon(PhononLattice& lattice, const SpinConfig& config, int rank, int size,
-                                    MPI_Comm comm) {
+void run_simulated_annealing_phonon(PhononLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running simulated annealing on PhononLattice (spin subsystem)..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
@@ -118,6 +118,7 @@ void run_simulated_annealing_phonon(PhononLattice& lattice, const SpinConfig& co
     }
 
     // Distribute trials across MPI ranks
+    vector<TrialResult> results;
     for (int trial = rank; trial < config.num_trials; trial += size) {
         string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
@@ -126,27 +127,41 @@ void run_simulated_annealing_phonon(PhononLattice& lattice, const SpinConfig& co
         }
 
         prepare_trial(lattice, config, /*anneal=*/false, rank == 0);
-        lattice.simulated_annealing(
-            config.T_start,
-            config.T_end,
-            config.annealing_steps,
-            config.overrelaxation_rate,
-            config.cooling_rate,
-            trial_dir,
-            config.save_observables,
-            config.T_zero,
-            config.n_deterministics,
-            config.adiabatic_phonons,
-            gaussian_proposals(config),
-            config.get_param("preserve_initial_phonons", 0.0) > 0.5
-        );
+        // annealing_steps == 0: a plain energy evaluation of the start (as for Lattice)
+        if (config.annealing_steps > 0) {
+            lattice.simulated_annealing(
+                config.T_start,
+                config.T_end,
+                config.annealing_steps,
+                config.overrelaxation_rate,
+                config.cooling_rate,
+                trial_dir,
+                config.save_observables,
+                config.T_zero,
+                config.n_deterministics,
+                config.adiabatic_phonons,
+                gaussian_proposals(config),
+                config.get_param("preserve_initial_phonons", 0.0) > 0.5
+            );
+        } else if (rank == 0) {
+            cout << "annealing_steps == 0: skipping SA, just evaluating energy." << endl;
+        }
 
         lattice.save_positions(trial_dir + "/positions.txt");
         lattice.print_state();
+        lattice.save_spin_config(trial_dir + "/spins_final.txt");
+        const double e = lattice.energy_density();
+        {
+            const string path = trial_dir + "/final_energy.txt";
+            ofstream energy_file(path);
+            energy_file << setprecision(17) << "Energy Density: " << e << "\n";
+            energy_file.close();
+            if (!energy_file) throw runtime_error("cannot write " + path);
+        }
+        results.push_back({trial, e, trial_dir + "/spins_final.txt"});
         cout << "[Rank " << rank << "] Trial " << trial << " completed." << endl;
     }
-
-    MPI_Barrier(comm);
+    write_trial_summary(config, "PhononLattice simulated annealing", results, comm);
 
     if (rank == 0) {
         cout << "PhononLattice simulated annealing completed (" << config.num_trials << " trials)." << endl;
@@ -157,8 +172,8 @@ void run_simulated_annealing_phonon(PhononLattice& lattice, const SpinConfig& co
  * Run molecular dynamics for PhononLattice (full spin-phonon dynamics).
  * langevin_temperature > 0 selects the thermostatted (Langevin) integrator.
  */
-void run_molecular_dynamics_phonon(PhononLattice& lattice, const SpinConfig& config, int rank, int size,
-                                   MPI_Comm comm) {
+void run_molecular_dynamics_phonon(PhononLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running spin-phonon molecular dynamics on PhononLattice..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
@@ -219,8 +234,8 @@ void run_molecular_dynamics_phonon(PhononLattice& lattice, const SpinConfig& con
 /**
  * Run pump-probe for PhononLattice (THz driving IR phonon)
  */
-void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int rank, int size,
-                           MPI_Comm comm) {
+void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running THz pump-probe on PhononLattice..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
@@ -292,7 +307,8 @@ void run_pump_probe_phonon(PhononLattice& lattice, const SpinConfig& config, int
  * each rank runs the serial driver (a collective inside a rank-strided loop would deadlock
  * or mix ground states of different trials).
  */
-void run_2dcs_phonon(PhononLattice& lattice, const SpinConfig& config, int rank, int size, MPI_Comm comm) {
+void run_2dcs_phonon(PhononLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     // Pulse shape: the same resolution as the MD/pump-probe drive (explicit key, else the
     // measured NCTO pulse).
     SpinPhononCouplingParams sp; PhononParams ph; DriveParams dr; TimeDependentSpinPhononParams td;

@@ -492,12 +492,34 @@ endfunction()
 # (split out of spin_solver.cpp for parallel compilation and readability).
 add_optimized_executable(spin_solver
     src/apps/spin_solver.cpp
+    src/apps/system_factory.cpp
     src/apps/runners_lattice.cpp
     src/apps/runners_phonon.cpp
     src/apps/runners_population_annealing.cpp
     src/apps/runners_mixed.cpp
     src/apps/runners_parameter_sweep.cpp
 )
+
+# Provenance for spin_solver's run_info.txt: git describe ("unknown" outside a
+# git checkout), compiler, build type and flags. Regenerated at every build;
+# the header only changes (and spin_solver only recompiles) when they do.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _classical_spin_bt)
+string(JOIN " " _classical_spin_flags ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_classical_spin_bt}}
+       ${CXX_OPTIMIZATION_FLAGS})
+add_custom_target(classical_spin_build_info
+    COMMAND ${CMAKE_COMMAND}
+            -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+            -DTEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/src/apps/build_info.h.in
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generated/classical_spin_build_info.h
+            "-DCLASSICAL_SPIN_CXX_COMPILER=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+            "-DCLASSICAL_SPIN_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+            "-DCLASSICAL_SPIN_CXX_FLAGS=${_classical_spin_flags}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/src/apps/build_info.cmake
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/classical_spin_build_info.h
+    COMMENT "Recording git describe / build flags for run_info.txt"
+    VERBATIM)
+add_dependencies(spin_solver classical_spin_build_info)
+target_include_directories(spin_solver PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # Symmetry + finite-difference regression tests for the NCTO E1
 # magnetoelastic Hamiltonian (PhononLattice). Verifies the form-factor
@@ -617,10 +639,15 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_pt_ladder
     test_unitcell_geometry
     test_population_annealing
+    test_config
+    test_config_spin_io
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
 endforeach()
+# test_config parses every example configuration and scans the sources for
+# get_param keys (the Hamiltonian-key registry must cover them).
+target_compile_definitions(test_config PRIVATE CLASSICAL_SPIN_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
 add_optimized_executable(test_md_mpi_scan tests/test_md_mpi_scan.cpp)
 
 if(BUILD_TESTING)
@@ -688,7 +715,32 @@ if(BUILD_TESTING)
                              PASS_REGULAR_EXPRESSION "PhononLattice 2DCS completed"
                              ENVIRONMENT "OMP_NUM_THREADS=1"
                              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        # Parameter sweep with 3 points on 2 ranks (deadlocked on COMM_WORLD
+        # barriers inside the runners) over a typed key.
+        add_test(NAME mpi_sweep_uneven
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 --oversubscribe --allow-run-as-root
+                         $<TARGET_FILE:spin_solver> ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/sweep_uneven_mpi.param)
+        set_tests_properties(mpi_sweep_uneven PROPERTIES TIMEOUT 180 LABELS mpi
+                             PASS_REGULAR_EXPRESSION "Parameter sweep completed \\(3 points\\)"
+                             ENVIRONMENT "OMP_NUM_THREADS=1"
+                             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        # A failing run reports "[rank r] error: ..." and aborts every rank
+        # (instead of hanging, or continuing from random spins).
+        add_test(NAME mpi_runtime_error_aborts
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 --oversubscribe --allow-run-as-root
+                         $<TARGET_FILE:spin_solver> ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/missing_seed_mpi.param)
+        set_tests_properties(mpi_runtime_error_aborts PROPERTIES TIMEOUT 120 LABELS mpi
+                             PASS_REGULAR_EXPRESSION "\\[rank [0-9]+\\] error: .*no_such_seed_file"
+                             FAIL_REGULAR_EXPRESSION "completed successfully"
+                             ENVIRONMENT "OMP_NUM_THREADS=1"
+                             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     endif()
+    # End-to-end smoke tests of every simulation mode, sweeps (uneven MPI
+    # splits, typed keys, PT groups), provenance and error exits.
+    add_test(NAME smoke_spin_solver
+             COMMAND bash ${CMAKE_SOURCE_DIR}/tests/smoke/run_smoke.sh $<TARGET_FILE:spin_solver>)
+    set_tests_properties(smoke_spin_solver PROPERTIES TIMEOUT 900 LABELS smoke
+                         ENVIRONMENT "OMP_NUM_THREADS=1")
     add_test(NAME hdf5_pt_writer_smoke COMMAND test_hdf5_pt)
     set_tests_properties(hdf5_pt_writer_smoke PROPERTIES
         WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}

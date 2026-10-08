@@ -45,4 +45,3 @@ g_factor = 1.0, 1.0, 1.0
 # General settings
 use_twist_boundary = false
 gaussian_move = false
-deterministic = false

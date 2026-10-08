@@ -30,16 +30,25 @@ using namespace std;
 // ============================================================================
 
 /**
- * Run simulated annealing
+ * Run simulated annealing: trials round-robin over the ranks of comm. Every
+ * trial starts from the configured initial state (initial_spin_config or the
+ * ferromagnetic start, else fresh random spins), so trial k does not depend
+ * on which rank ran it or what ran before. Every rank writes its trials'
+ * sample_<k>/final_energy.txt; rank 0 writes the summary over all trials.
  */
-void run_simulated_annealing(Lattice& lattice, const SpinConfig& config, int rank, int size) {
+void run_simulated_annealing(Lattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running simulated annealing..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
         cout << "MPI ranks: " << size << endl;
     }
-    
-    // Distribute trials across MPI ranks
+    const bool fixed_start = !config.initial_spin_config.empty() || config.use_ferromagnetic_init;
+    const Lattice::SpinConfig start = lattice.spins;
+    if (rank == 0 && !config.initial_spin_config.empty())
+        cout << "Every trial starts from " << config.initial_spin_config << endl;
+
+    vector<TrialResult> results;
     for (int trial = rank; trial < config.num_trials; trial += size) {
         string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
@@ -48,21 +57,11 @@ void run_simulated_annealing(Lattice& lattice, const SpinConfig& config, int ran
             cout << "[Rank " << rank << "] Trial " << trial << " / " << config.num_trials << endl;
         }
         
-        // Re-initialize spins for each trial (except first)
-        if (trial > 0) {
-            lattice.init_random();
-        }
+        if (fixed_start) lattice.spins = start;
+        else lattice.init_random();
 
-        // Optionally load an initial spin configuration; with annealing_steps == 0
-        // this collapses to a plain energy evaluation of the loaded state.
-        if (!config.initial_spin_config.empty()) {
-            if (rank == 0) {
-                cout << "Loading initial spin configuration from "
-                     << config.initial_spin_config << endl;
-            }
-            lattice.load_spin_config(config.initial_spin_config);
-        }
-
+        // With annealing_steps == 0 this collapses to a plain energy
+        // evaluation of the starting configuration.
         if (config.annealing_steps == 0) {
             if (rank == 0) {
                 cout << "annealing_steps == 0: skipping SA, just evaluating energy."
@@ -85,18 +84,22 @@ void run_simulated_annealing(Lattice& lattice, const SpinConfig& config, int ran
             );
         }
         
-        // Save final configuration
+        // Save final configuration and energy (every rank, for its own trials)
         lattice.save_positions(trial_dir + "/positions.txt");
-        // lattice.save_spin_config(trial_dir + "/spins.txt");
-        
-        if (rank == 0) {
-            ofstream energy_file(trial_dir + "/final_energy.txt");
-            energy_file << "Energy Density: " << lattice.energy_density() << "\n";
+        lattice.save_spin_config(trial_dir + "/spins_final.txt");
+        const double e = lattice.energy_density();
+        {
+            const string path = trial_dir + "/final_energy.txt";
+            ofstream energy_file(path);
+            energy_file << setprecision(17) << "Energy Density: " << e << "\n";
             energy_file.close();
-            
-            cout << "Trial " << trial << " completed. Final energy: " << lattice.energy_density() << endl;
+            if (!energy_file) throw runtime_error("cannot write " + path);
         }
+        results.push_back({trial, e, trial_dir + "/spins_final.txt"});
+        cout << "[Rank " << rank << "] Trial " << trial << " completed. Final energy: " << setprecision(12) << e
+             << endl;
     }
+    write_trial_summary(config, "simulated annealing", results, comm);
     
     if (rank == 0) {
         cout << "Simulated annealing completed (" << config.num_trials << " trials)." << endl;
@@ -104,16 +107,18 @@ void run_simulated_annealing(Lattice& lattice, const SpinConfig& config, int ran
 }
 
 /**
- * Run parallel tempering
- * @param comm MPI communicator to use (default: MPI_COMM_WORLD)
+ * Run parallel tempering on the ranks of comm (one replica per rank). Every
+ * trial after the first restarts from the configured initial state (a loaded
+ * configuration is no longer replaced by random spins).
  */
-void run_parallel_tempering(Lattice& lattice, const SpinConfig& config, int rank, int size, MPI_Comm comm) {
+void run_parallel_tempering(Lattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running parallel tempering with " << size << " replicas..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
     }
-
-    comm = pt_runner::replica_comm(comm, size);
+    const bool fixed_start = !config.initial_spin_config.empty() || config.use_ferromagnetic_init;
+    const Lattice::SpinConfig start = lattice.spins;
 
     // Ladder: geometric, or tuned with the replica chain itself (nrpt by
     // default). The tuned replicas are kept: each rank's configuration is
@@ -136,7 +141,8 @@ void run_parallel_tempering(Lattice& lattice, const SpinConfig& config, int rank
         
         // Re-initialize spins for each trial (except first)
         if (trial > 0) {
-            lattice.init_random();
+            if (fixed_start) lattice.spins = start;
+            else lattice.init_random();
         }
         
         lattice.parallel_tempering(
@@ -167,6 +173,7 @@ void run_parallel_tempering(Lattice& lattice, const SpinConfig& config, int rank
             }
             cout << "Deterministic sweeps completed. Final energy: " << lattice.energy_density() << endl;
             // Save the T=0 quenched configuration
+            filesystem::create_directories(trial_dir + "/rank_0");
             lattice.save_spin_config(trial_dir + "/rank_0/spins_T0_quench.txt");
         }
         MPI_Barrier(comm);
@@ -220,8 +227,9 @@ bool select_gpu(const SpinConfig& config, int rank) {
         if (rank == 0) cout << "Warning: no usable GPU; running on the CPU" << endl;
         return false;
     }
-    cudaSetDevice(rank % device_count);
-    cout << "[Rank " << rank << "] GPU " << (rank % device_count) << " of " << device_count << endl;
+    const int device_id = job_rank() % device_count;
+    cudaSetDevice(device_id);
+    cout << "[Rank " << rank << "] GPU " << device_id << " of " << device_count << endl;
     return true;
 #else
     if (rank == 0) cout << "GPU requested but not compiled in (CUDA_ENABLED); running on the CPU" << endl;
@@ -287,7 +295,7 @@ void prepare_trial_state(Lattice& lattice, const SpinConfig& config, const Latti
 }
 
 /// Run fn(trial) for this rank's trials; a failing trial is reported with its
-/// rank (main only prints rank 0's errors) and turns into an error at the end.
+/// rank and turns into an error at the end (main then aborts the job).
 template<class Fn>
 void for_each_trial(const SpinConfig& config, int rank, int size, Fn&& fn) {
     string first_error;
@@ -314,7 +322,8 @@ void write_trajectory_columns(ofstream& out, const Lattice::PumpProbeTrajectory&
  * annealed or ferromagnetic) and integrate it, writing
  * output_dir/sample_<trial>/trajectory.h5 on the rank that owns the trial.
  */
-void run_molecular_dynamics(Lattice& lattice, const SpinConfig& config, int rank, int size) {
+void run_molecular_dynamics(Lattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     apply_dynamics_config(lattice, config);
     if (rank == 0) {
         cout << "Running molecular dynamics: " << config.num_trials << " trial(s) on " << size << " rank(s)" << endl;
@@ -342,22 +351,27 @@ void run_molecular_dynamics(Lattice& lattice, const SpinConfig& config, int rank
             cout << "DSSF: " << dssf.q_points.size() << " q points, " << dssf.n_samples << " samples at T = "
                  << dssf.temperature << ", t_max = " << dssf.t_max << endl;
     }
+    vector<TrialResult> results;
     for_each_trial(config, rank, size, [&](int trial) {
         const string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
         prepare_trial_state(lattice, config, start, trial, rank, /*polish_seed=*/false);
         lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+        const double e0 = lattice.energy_density();
         if (config.dssf_samples > 0) {
             const Lattice::DSSFResult r = lattice.dynamical_structure_factor(dssf);
             Lattice::write_dssf(r, trial_dir + "/dssf.h5");
             cout << "[Rank " << rank << "] trial " << trial << " -> " << trial_dir << "/dssf.h5" << endl;
+            results.push_back({trial, e0, trial_dir + "/dssf.h5"});
             return;
         }
         lattice.molecular_dynamics(config.md_time_start, config.md_time_end, config.md_timestep,
                                    trial_dir, config.md_save_interval, config.md_integrator,
                                    gpu, config.md_abs_tol, config.md_rel_tol);
         cout << "[Rank " << rank << "] trial " << trial << " -> " << trial_dir << "/trajectory.h5" << endl;
+        results.push_back({trial, e0, trial_dir + "/trajectory.h5"});
     });
+    write_trial_summary(config, "molecular dynamics (energy = initial state)", results, comm);
     if (rank == 0) cout << "Molecular dynamics completed (" << config.num_trials << " trials)." << endl;
 }
 
@@ -371,7 +385,8 @@ void run_molecular_dynamics(Lattice& lattice, const SpinConfig& config, int rank
  * deterministic dynamics with a probe, of the pump-only and probe-only runs
  * (M_NL = M_pump_probe - M_pump - M_probe).
  */
-void run_pump_probe(Lattice& lattice, const SpinConfig& config, int rank, int size) {
+void run_pump_probe(Lattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     using classical_spin::dynamics::Pulse;
     using classical_spin::dynamics::TimeGrid;
     apply_dynamics_config(lattice, config);
@@ -399,11 +414,13 @@ void run_pump_probe(Lattice& lattice, const SpinConfig& config, int rank, int si
     const Lattice::DynamicsSettings settings{config.md_integrator, config.md_timestep,
                                              config.pump_probe_abs_tol, config.pump_probe_rel_tol, 0.0};
     const Lattice::SpinConfig start = lattice.spins;
+    vector<TrialResult> results;
     for_each_trial(config, rank, size, [&](int trial) {
         const string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
         prepare_trial_state(lattice, config, start, trial, rank, /*polish_seed=*/true);
         lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+        const double e0 = lattice.energy_density();
 
         Lattice::DriveSchedule both = lattice.make_drive();
         lattice.add_pulse(both, pump_dirs, pump);
@@ -441,8 +458,12 @@ void run_pump_probe(Lattice& lattice, const SpinConfig& config, int rank, int si
             }
             out << '\n';
         }
+        out.close();
+        if (!out) throw runtime_error("writing " + path + " failed");
         cout << "[Rank " << rank << "] trial " << trial << " -> " << path << endl;
+        results.push_back({trial, e0, path});
     });
+    write_trial_summary(config, "pump-probe (energy = initial state)", results, comm);
     if (rank == 0) cout << "Pump-probe completed (" << config.num_trials << " trials)." << endl;
 }
 
@@ -453,7 +474,8 @@ void run_pump_probe(Lattice& lattice, const SpinConfig& config, int rank, int si
  * several trials each rank runs whole scans for its trials. The ground state
  * is prepared identically in both modes (prepare_trial_state).
  */
-void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, int rank, int size) {
+void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     apply_dynamics_config(lattice, config);
     const vector<SpinVector> field_dirs = pulse_directions(config.pump_directions, lattice, "pump_direction");
     // GPU batched path: with use_gpu one launch handles every delay, so route
@@ -461,9 +483,6 @@ void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, int rank,
     // every rank takes the same branch.
     const bool use_tau_parallel = (config.num_trials == 1) && config.parallel_tau &&
                                   ((size > 1) || config.use_gpu);
-    // A runner called with size == 1 (e.g. one point of a parameter sweep)
-    // must not touch the other ranks.
-    MPI_Comm comm = (size > 1) ? MPI_COMM_WORLD : MPI_COMM_SELF;
     if (rank == 0) {
         cout << "Running 2D coherent spectroscopy: " << config.num_trials << " trial(s) on " << size
              << " rank(s), delays " << config.tau_start << " .. " << config.tau_end << " step "
@@ -513,18 +532,26 @@ void run_2dcs_spectroscopy(Lattice& lattice, const SpinConfig& config, int rank,
         int failed = error.empty() ? 0 : 1;
         MPI_Bcast(&failed, 1, MPI_INT, 0, comm);
         if (failed) throw runtime_error(rank == 0 ? error : "ground-state preparation failed on rank 0");
+        const double e0 = lattice.energy_density();
         scan(trial_dir, true);
         if (rank == 0) cout << "Results: " << trial_dir << "/pump_probe_spectroscopy.h5" << endl;
+        vector<TrialResult> mine;
+        if (rank == 0) mine.push_back({0, e0, trial_dir + "/pump_probe_spectroscopy.h5"});
+        write_trial_summary(config, "2DCS, delay-parallel (energy = ground state)", mine, comm);
     } else {
+        vector<TrialResult> results;
         for_each_trial(config, rank, size, [&](int trial) {
             const string trial_dir = config.output_dir + "/sample_" + to_string(trial);
             filesystem::create_directories(trial_dir);
             prepare_trial_state(lattice, config, start, trial, rank, /*polish_seed=*/true);
             lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+            const double e0 = lattice.energy_density();
             scan(trial_dir, false);
             cout << "[Rank " << rank << "] trial " << trial << " -> " << trial_dir
                  << "/pump_probe_spectroscopy.h5" << endl;
+            results.push_back({trial, e0, trial_dir + "/pump_probe_spectroscopy.h5"});
         });
+        write_trial_summary(config, "2DCS (energy = ground state)", results, comm);
     }
     if (rank == 0) {
         cout << "\n2DCS spectroscopy completed. Non-linear signal: M_NL(t, tau) = M01 - M0 - M1 "

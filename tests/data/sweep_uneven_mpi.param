@@ -1,0 +1,30 @@
+# Parameter sweep with more points than ranks and an uneven split (3 points on
+# 2 ranks), sweeping a typed key (pump_amplitude) of a pump-probe run.
+# Regression: runners called with rank = 0, size = 1 still ended with
+# MPI_Barrier(MPI_COMM_WORLD), so ranks with fewer points finished while the
+# others waited forever; and sweeping a typed key changed nothing.
+system = honeycomb_kitaev
+lattice_size = 2,2,1
+K = -1.0
+Gamma = 0.25
+seed = 21
+output_dir = mpi_sweep_uneven_out
+simulation_mode = parameter_sweep
+sweep_base_simulation = pump_probe
+sweep_parameter = pump_amplitude
+sweep_start = 0.1
+sweep_end = 0.3
+sweep_step = 0.1
+T_start = 1.0
+T_end = 0.05
+cooling_rate = 0.6
+annealing_steps = 10
+T_zero = true
+n_deterministics = 20
+pump_direction = 0,0,1
+pump_width = 0.5
+probe_amplitude = 0
+md_time_start = -1.0
+md_time_end = 2.0
+md_timestep = 0.05
+md_integrator = rk4

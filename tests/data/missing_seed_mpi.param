@@ -1,0 +1,11 @@
+# A run whose initial_spin_config does not exist must stop every rank with
+# "[rank r] error: ..." and a non-zero exit status (it used to continue from
+# random spins, skipping equilibration).
+system = honeycomb_kitaev
+lattice_size = 2,2,1
+seed = 5
+output_dir = mpi_missing_seed_out
+simulation_mode = molecular_dynamics
+initial_spin_config = no_such_seed_file.txt
+md_time_end = 1.0
+md_timestep = 0.05

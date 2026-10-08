@@ -73,7 +73,7 @@ The unified simulation covers all BCAO functionality from legacy run_scripts:
 - Fe single-ion anisotropy (Ka, Kc)
 - DM interactions (D1, D2)
 - Tm energy level splitting (e1, e2)
-- Fe-Tm bilinear coupling (chii parameter)
+- Fe-Tm bilinear coupling (Kminus_* parameters)
 - CUDA-accelerated 2DCS option
 
 ### Parameter Sweeps (N-Dimensional)
@@ -86,7 +86,7 @@ The `param_sweeps/` directory contains examples for systematic parameter space e
 | `field_sweep_example.param` | 1D | field_strength | Molecular dynamics |
 | `2d_parameter_sweep_example.param` | 2D | J1xy × field | Simulated annealing |
 | `3d_parameter_sweep_example.param` | 3D | K × Γ × field | Simulated annealing |
-| `2dcs_chii_sweep.param` | 1D | chii | 2DCS spectroscopy |
+| `2dcs_chii_sweep.param` | 1D | Kminus_2y | 2DCS spectroscopy |
 | `pump_amplitude_sweep.param` | 1D | pump_amplitude | Pump-probe |
 | `2d_pump_probe_sweep_example.param` | 2D | pump × probe | Pump-probe |
 
@@ -278,7 +278,7 @@ g_factor = 4.8,4.85,2.5  # gx, gy, gz
 ```ini
 # SU(2) spins (Fe)
 J1ab = 4.92
-chii = 0.05
+Kminus_2y = 0.05
 
 # SU(3) spins (Tm)
 e1 = 0.97

@@ -25,9 +25,13 @@
 using namespace std;
 
 /**
- * Run simulated annealing on MixedLattice (SU(2)+SU(3)).
+ * Run simulated annealing on MixedLattice (SU(2)+SU(3)): trials round-robin
+ * over the ranks of comm, each from the configured initial state (loaded or
+ * ferromagnetic; else fresh random spins). Every rank writes its trials'
+ * final_energy.txt; rank 0 writes the summary over all trials.
  */
-void run_simulated_annealing_mixed(MixedLattice& lattice, const SpinConfig& config, int rank, int size) {
+void run_simulated_annealing_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running simulated annealing on mixed lattice..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
@@ -35,6 +39,10 @@ void run_simulated_annealing_mixed(MixedLattice& lattice, const SpinConfig& conf
     }
     
     // Distribute trials across MPI ranks
+    const bool fixed_start = !config.initial_spin_config.empty() || config.use_ferromagnetic_init;
+    const MixedLattice::SpinConfigSU2 start_SU2 = lattice.spins_SU2;
+    const MixedLattice::SpinConfigSU3 start_SU3 = lattice.spins_SU3;
+    vector<TrialResult> results;
     for (int trial = rank; trial < config.num_trials; trial += size) {
         string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
@@ -43,33 +51,48 @@ void run_simulated_annealing_mixed(MixedLattice& lattice, const SpinConfig& conf
             cout << "[Rank " << rank << "] Trial " << trial << " / " << config.num_trials << endl;
         }
         
-        // Re-initialize spins for each trial (except first)
-        if (trial > 0) {
+        // Every trial starts from the configured state (the loaded seed used
+        // to be wiped by random spins from the second trial on).
+        if (fixed_start) {
+            lattice.spins_SU2 = start_SU2;
+            lattice.spins_SU3 = start_SU3;
+        } else {
             lattice.init_random();
         }
         
-        lattice.simulated_annealing(
-            config.T_start,
-            config.T_end,
-            config.annealing_steps,
-            config.gaussian_move,
-            config.cooling_rate,
-            trial_dir,
-            config.save_observables,
-            config.T_zero,
-            config.n_deterministics,
-        config.twist_sweep_count
-        );
-        
-
-        if (rank == 0) {
-            ofstream energy_file(trial_dir + "/final_energy.txt");
-            energy_file << "Energy Density: " << lattice.energy_density() << "\n";
-            energy_file.close();
-            
-            cout << "Trial " << trial << " completed. Final energy: " << lattice.energy_density() << endl;
+        // annealing_steps == 0: a plain energy evaluation of the start (as for Lattice)
+        if (config.annealing_steps > 0) {
+            lattice.simulated_annealing(
+                config.T_start,
+                config.T_end,
+                config.annealing_steps,
+                config.gaussian_move,
+                config.cooling_rate,
+                trial_dir,
+                config.save_observables,
+                config.T_zero,
+                config.n_deterministics,
+                config.twist_sweep_count
+            );
+        } else if (rank == 0) {
+            cout << "annealing_steps == 0: skipping SA, just evaluating energy." << endl;
         }
+        
+        // Final energy and state of this trial (every rank, for its own trials)
+        lattice.save_spin_config_to_dir(trial_dir, "spins_final");
+        const double e = lattice.energy_density();
+        {
+            const string path = trial_dir + "/final_energy.txt";
+            ofstream energy_file(path);
+            energy_file << setprecision(17) << "Energy Density: " << e << "\n";
+            energy_file.close();
+            if (!energy_file) throw runtime_error("cannot write " + path);
+        }
+        results.push_back({trial, e, trial_dir + "/spins_final_SU2.txt"});
+        cout << "[Rank " << rank << "] Trial " << trial << " completed. Final energy: " << setprecision(12) << e
+             << endl;
     }
+    write_trial_summary(config, "mixed-lattice simulated annealing", results, comm);
     
     if (rank == 0) {
         cout << "Simulated annealing completed (" << config.num_trials << " trials)." << endl;
@@ -77,16 +100,18 @@ void run_simulated_annealing_mixed(MixedLattice& lattice, const SpinConfig& conf
 }
 
 /**
- * Run parallel tempering for mixed lattice
- * @param comm MPI communicator to use (default: MPI_COMM_WORLD)
+ * Run parallel tempering for mixed lattice on the ranks of comm (one replica
+ * per rank); trials after the first restart from the configured state.
  */
-void run_parallel_tempering_mixed(MixedLattice& lattice, const SpinConfig& config, int rank, int size, MPI_Comm comm) {
+void run_parallel_tempering_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running parallel tempering on mixed lattice with " << size << " replicas..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
     }
-
-    comm = pt_runner::replica_comm(comm, size);
+    const bool fixed_start = !config.initial_spin_config.empty() || config.use_ferromagnetic_init;
+    const MixedLattice::SpinConfigSU2 start_SU2 = lattice.spins_SU2;
+    const MixedLattice::SpinConfigSU3 start_SU3 = lattice.spins_SU3;
 
     // Ladder: geometric, or tuned with the replica chain itself (nrpt by
     // default); the tuned replicas are kept for the production run.
@@ -109,7 +134,12 @@ void run_parallel_tempering_mixed(MixedLattice& lattice, const SpinConfig& confi
         
         // Re-initialize spins for each trial (except first)
         if (trial > 0) {
-            lattice.init_random();
+            if (fixed_start) {
+                lattice.spins_SU2 = start_SU2;
+                lattice.spins_SU3 = start_SU3;
+            } else {
+                lattice.init_random();
+            }
         }
         
         lattice.parallel_tempering(
@@ -140,6 +170,7 @@ void run_parallel_tempering_mixed(MixedLattice& lattice, const SpinConfig& confi
             }
             cout << "Deterministic sweeps completed. Final energy: " << lattice.total_energy() / total_sites << endl;
             // Save the T=0 quenched configuration
+            filesystem::create_directories(trial_dir + "/rank_0");
             lattice.save_spin_config_to_dir(trial_dir + "/rank_0", "spins_T0_quench");
         }
         MPI_Barrier(comm);
@@ -165,11 +196,12 @@ static bool apply_trilinear_reference(MixedLattice& lattice, const SpinConfig& c
 
 namespace {
 
-// Copy rank 0's spins to every rank.
-void broadcast_spins(MixedLattice& lattice, int rank) {
+// Copy rank 0's spins to every rank of comm.
+void broadcast_spins(MixedLattice& lattice, MPI_Comm comm) {
+    const int rank = comm_rank(comm);
     vector<double> buf = lattice.spins_to_state();
     buf.resize(lattice.spin_state_size());
-    MPI_Bcast(buf.data(), static_cast<int>(buf.size()), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(buf.data(), static_cast<int>(buf.size()), MPI_DOUBLE, 0, comm);
     if (rank != 0) {
         MixedLattice::SpinConfigSU2 s2;
         MixedLattice::SpinConfigSU3 s3;
@@ -179,39 +211,50 @@ void broadcast_spins(MixedLattice& lattice, int rank) {
     }
 }
 
-// Initial configuration of a trial. With a loaded configuration every trial
-// starts from it (previously only the first trial on each rank did; the
-// others silently ran from random spins without annealing); otherwise every
-// trial after the first on a rank starts from fresh random spins. Any SU(3)
-// reference subtraction of a previous trial is removed before annealing.
+// Initial configuration of a trial. With a loaded (or ferromagnetic) start
+// every trial starts from it (previously only the first trial on each rank
+// did; the others silently ran from random spins without annealing);
+// otherwise every trial starts from fresh random spins. Any SU(3) reference
+// subtraction of a previous trial is removed before annealing.
 struct TrialStart {
     MixedLattice::SpinConfigSU2 spins_SU2;
     MixedLattice::SpinConfigSU3 spins_SU3;
-    bool loaded = false;
+    bool fixed = false;
 
     TrialStart(const MixedLattice& lattice, const SpinConfig& config)
         : spins_SU2(lattice.spins_SU2), spins_SU3(lattice.spins_SU3),
-          loaded(!config.initial_spin_config.empty()) {}
+          fixed(!config.initial_spin_config.empty() || config.use_ferromagnetic_init) {}
 
-    void apply(MixedLattice& lattice, int trial, int rank) const {
+    void apply(MixedLattice& lattice) const {
         if (!lattice.mixed_trilinear_reference_SU3().empty()) {
             lattice.set_mixed_trilinear_reference_SU3({});
         }
-        if (loaded) {
+        if (fixed) {
             lattice.spins_SU2 = spins_SU2;
             lattice.spins_SU3 = spins_SU3;
-        } else if (trial != rank) {
+        } else {
             lattice.init_random();
         }
     }
 };
+
+// TmFeO3 2DCS with one trial over several ranks distributes the delays with
+// MixedLattice::pump_probe_spectroscopy_mpi, which runs on MPI_COMM_WORLD; it
+// is only used when comm spans the whole job (a sub-communicator, e.g. a
+// sweep point, runs the trials itself).
+bool spans_world(MPI_Comm comm) {
+    int result = MPI_UNEQUAL;
+    MPI_Comm_compare(comm, MPI_COMM_WORLD, &result);
+    return result == MPI_IDENT || result == MPI_CONGRUENT;
+}
 
 }  // namespace
 
 /**
  * Run molecular dynamics for mixed lattice
  */
-void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& config, int rank, int size) {
+void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running molecular dynamics on mixed lattice..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
@@ -234,7 +277,7 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
         int device_count;
         cudaGetDeviceCount(&device_count);
         if (device_count > 0) {
-            int device_id = rank % device_count;
+            int device_id = job_rank() % device_count;
             cudaSetDevice(device_id);
             // Log GPU assignment for all ranks (synchronized output)
             for (int r = 0; r < size; ++r) {
@@ -242,7 +285,7 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
                     cout << "[Rank " << rank << "] Assigned to GPU " << device_id 
                          << " (" << device_count << " GPU(s) available)" << endl;
                 }
-                MPI_Barrier(MPI_COMM_WORLD);
+                MPI_Barrier(comm);
             }
         } else {
             if (rank == 0) {
@@ -254,6 +297,7 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
     
     // Distribute trials across MPI ranks
     const TrialStart start(lattice, config);
+    vector<TrialResult> results;
     for (int trial = rank; trial < config.num_trials; trial += size) {
         string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
@@ -262,7 +306,7 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
             cout << "[Rank " << rank << "] Trial " << trial << " / " << config.num_trials << endl;
         }
         
-        start.apply(lattice, trial, rank);
+        start.apply(lattice);
         
         // Equilibrate (skip if spins loaded from file)
         if (config.initial_spin_config.empty()) {
@@ -288,7 +332,8 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
         apply_trilinear_reference(lattice, config, rank, /*requench=*/true);
         configure_dynamics(lattice, config, rank);
         // Save the initial spin configuration of the time evolution
-        lattice.save_spin_config(trial_dir + "/initial_spins.txt");
+        lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
+        const double e0 = lattice.energy_density();
         
         // Run MD
         if (rank == 0) {
@@ -313,10 +358,9 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
         
         cout << "[Rank " << rank << "] Trial " << trial << " completed." << endl;
         cout << "[Rank " << rank << "] Results saved to: " << trial_dir << "/trajectory.h5" << endl;
+        results.push_back({trial, e0, trial_dir + "/trajectory.h5"});
     }
-    
-    // Synchronize all ranks
-    MPI_Barrier(MPI_COMM_WORLD);
+    write_trial_summary(config, "mixed-lattice molecular dynamics (energy = initial state)", results, comm);
     
     if (rank == 0) {
         cout << "Molecular dynamics completed (" << config.num_trials << " trials)." << endl;
@@ -327,7 +371,8 @@ void run_molecular_dynamics_mixed(MixedLattice& lattice, const SpinConfig& confi
  * Run pump-probe experiment for mixed lattice
  */
 
-void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int rank, int size) {
+void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
     if (rank == 0) {
         cout << "Running pump-probe simulation on mixed lattice..." << endl;
         cout << "Number of trials: " << config.num_trials << endl;
@@ -350,7 +395,7 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
         int device_count;
         cudaGetDeviceCount(&device_count);
         if (device_count > 0) {
-            int device_id = rank % device_count;
+            int device_id = job_rank() % device_count;
             cudaSetDevice(device_id);
             // Log GPU assignment for all ranks (synchronized output)
             for (int r = 0; r < size; ++r) {
@@ -358,7 +403,7 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
                     cout << "[Rank " << rank << "] Assigned to GPU " << device_id 
                          << " (" << device_count << " GPU(s) available)" << endl;
                 }
-                MPI_Barrier(MPI_COMM_WORLD);
+                MPI_Barrier(comm);
             }
         } else {
             if (rank == 0) {
@@ -386,24 +431,20 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
     
     // Validate pump direction count: must be 1 (broadcast to all) or match N_atoms_SU2
     if (pump_dirs_norm.size() != 1 && pump_dirs_norm.size() != lattice.N_atoms_SU2) {
-        if (rank == 0) {
-            cerr << "Error: pump_direction must have either 1 direction (broadcast to all SU2 sublattices) "
-                 << "or exactly " << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). "
-                 << "Got " << pump_dirs_norm.size() << " directions." << endl;
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
+        ostringstream msg;
+        msg << "pump_direction must have either 1 direction (broadcast to all SU2 sublattices) or exactly "
+            << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). Got " << pump_dirs_norm.size()
+            << " directions.";
+        throw invalid_argument(msg.str());
     }
     
     // Validate pump direction dimension matches lattice spin_dim_SU2
     for (const auto& dir : pump_dirs_norm) {
         if (dir.size() != lattice.spin_dim_SU2) {
-            if (rank == 0) {
-                cerr << "Error: pump_direction dimension (" << dir.size() 
-                     << ") does not match lattice spin_dim_SU2 (" << lattice.spin_dim_SU2 << ")" << endl;
-            }
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return;
+            ostringstream msg;
+            msg << "pump_direction dimension (" << dir.size() << ") does not match lattice spin_dim_SU2 ("
+                << lattice.spin_dim_SU2 << ")";
+            throw invalid_argument(msg.str());
         }
     }
     
@@ -490,29 +531,26 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
     
     // Validate SU3 pump direction count: must be 1 (broadcast to all) or match N_atoms_SU3
     if (pump_dirs_su3_norm.size() != 1 && pump_dirs_su3_norm.size() != lattice.N_atoms_SU3) {
-        if (rank == 0) {
-            cerr << "Error: pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) "
-                 << "or exactly " << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). "
-                 << "Got " << pump_dirs_su3_norm.size() << " directions." << endl;
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
+        ostringstream msg;
+        msg << "pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) or exactly "
+            << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). Got "
+            << pump_dirs_su3_norm.size() << " directions.";
+        throw invalid_argument(msg.str());
     }
     
     // Validate SU3 pump direction dimension matches lattice spin_dim_SU3
     for (const auto& dir : pump_dirs_su3_norm) {
         if (dir.size() != lattice.spin_dim_SU3) {
-            if (rank == 0) {
-                cerr << "Error: pump_direction_su3 dimension (" << dir.size() 
-                     << ") does not match lattice spin_dim_SU3 (" << lattice.spin_dim_SU3 << ")" << endl;
-            }
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return;
+            ostringstream msg;
+            msg << "pump_direction_su3 dimension (" << dir.size() << ") does not match lattice spin_dim_SU3 ("
+                << lattice.spin_dim_SU3 << ")";
+            throw invalid_argument(msg.str());
         }
     }
     
     // Distribute trials across MPI ranks
     const TrialStart start(lattice, config);
+    vector<TrialResult> results;
     for (int trial = rank; trial < config.num_trials; trial += size) {
         string trial_dir = config.output_dir + "/sample_" + to_string(trial);
         filesystem::create_directories(trial_dir);
@@ -521,7 +559,7 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
             cout << "[Rank " << rank << "] Trial " << trial << " / " << config.num_trials << endl;
         }
         
-        start.apply(lattice, trial, rank);
+        start.apply(lattice);
         
         // Equilibrate (skip if spins loaded from file)
         if (config.initial_spin_config.empty()) {
@@ -548,6 +586,7 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
         configure_dynamics(lattice, config, rank);
         // Save the initial spin configuration of the time evolution
         lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
+        const double e0 = lattice.energy_density();
         
         // Setup pump field directions
         if (rank == 0) {
@@ -595,8 +634,9 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
         // Save the trajectory of this trial (each rank owns its trials; this
         // used to be written by rank 0 only, discarding the other ranks' work).
         {
-            ofstream traj_file(trial_dir + "/pump_probe_trajectory.txt");
-            traj_file << std::setprecision(12);
+            const string path = trial_dir + "/pump_probe_trajectory.txt";
+            ofstream traj_file(path);
+            traj_file << std::setprecision(17);
             for (const auto& [t, mag_data] : trajectory) {
                 traj_file << t << " "
                          << mag_data.first[0].transpose() << " "  // SU2 mag antiferro
@@ -607,12 +647,12 @@ void run_pump_probe_mixed(MixedLattice& lattice, const SpinConfig& config, int r
                          << mag_data.second[2].transpose() << "\n"; // SU3 mag global
             }
             traj_file.close();
+            if (!traj_file) throw runtime_error("writing " + path + " failed");
             cout << "[Rank " << rank << "] Trial " << trial << " completed." << endl;
+            results.push_back({trial, e0, path});
         }
     }
-    
-    // Synchronize all ranks
-    MPI_Barrier(MPI_COMM_WORLD);
+    write_trial_summary(config, "mixed-lattice pump-probe (energy = initial state)", results, comm);
     
     if (rank == 0) {
         cout << "Pump-probe simulation completed (" << config.num_trials << " trials)." << endl;
@@ -714,9 +754,10 @@ static void configure_dynamics(MixedLattice& lattice, const SpinConfig& config, 
 /**
  * Run 2D coherent spectroscopy (2DCS) for mixed lattice
  */
-void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config, int rank, int size) {
-    // Determine parallelization strategy
-    bool use_tau_parallel = (config.num_trials == 1) && config.parallel_tau && (size > 1);
+void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config, MPI_Comm comm) {
+    const int rank = comm_rank(comm), size = comm_size(comm);
+    // Determine parallelization strategy (see spans_world)
+    bool use_tau_parallel = (config.num_trials == 1) && config.parallel_tau && (size > 1) && spans_world(comm);
     
     if (rank == 0) {
         cout << "Running 2D coherent spectroscopy (2DCS) on mixed lattice..." << endl;
@@ -749,7 +790,7 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         int device_count;
         cudaGetDeviceCount(&device_count);
         if (device_count > 0) {
-            int device_id = rank % device_count;
+            int device_id = job_rank() % device_count;
             cudaSetDevice(device_id);
             // Log GPU assignment for all ranks (synchronized output)
             for (int r = 0; r < size; ++r) {
@@ -757,7 +798,7 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
                     cout << "[Rank " << rank << "] Assigned to GPU " << device_id 
                          << " (" << device_count << " GPU(s) available)" << endl;
                 }
-                MPI_Barrier(MPI_COMM_WORLD);
+                MPI_Barrier(comm);
             }
         } else {
             if (rank == 0) {
@@ -800,34 +841,26 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
     }
     if (use_distinct_pulse2_dir &&
         pump_dirs2_norm.size() != 1 && pump_dirs2_norm.size() != lattice.N_atoms_SU2) {
-        if (rank == 0) {
-            cerr << "Error: pump_direction_2 must have either 1 direction (broadcast to all SU2 sublattices) "
-                 << "or N_atoms_SU2 directions. Got " << pump_dirs2_norm.size() << " directions." << endl;
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
+        throw invalid_argument("pump_direction_2 must have either 1 direction (broadcast to all SU2 sublattices) "
+                               "or N_atoms_SU2 directions. Got " + to_string(pump_dirs2_norm.size()) + " directions.");
     }
     
     // Validate pump direction count: must be 1 (broadcast to all) or match N_atoms_SU2
     if (pump_dirs_norm.size() != 1 && pump_dirs_norm.size() != lattice.N_atoms_SU2) {
-        if (rank == 0) {
-            cerr << "Error: pump_direction must have either 1 direction (broadcast to all SU2 sublattices) "
-                 << "or exactly " << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). "
-                 << "Got " << pump_dirs_norm.size() << " directions." << endl;
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
+        ostringstream msg;
+        msg << "pump_direction must have either 1 direction (broadcast to all SU2 sublattices) or exactly "
+            << lattice.N_atoms_SU2 << " directions (one per SU2 sublattice). Got " << pump_dirs_norm.size()
+            << " directions.";
+        throw invalid_argument(msg.str());
     }
     
     // Validate pump direction dimension matches lattice spin_dim_SU2
     for (const auto& dir : pump_dirs_norm) {
         if (dir.size() != lattice.spin_dim_SU2) {
-            if (rank == 0) {
-                cerr << "Error: pump_direction dimension (" << dir.size() 
-                     << ") does not match lattice spin_dim_SU2 (" << lattice.spin_dim_SU2 << ")" << endl;
-            }
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return;
+            ostringstream msg;
+            msg << "pump_direction dimension (" << dir.size() << ") does not match lattice spin_dim_SU2 ("
+                << lattice.spin_dim_SU2 << ")";
+            throw invalid_argument(msg.str());
         }
     }
     
@@ -911,24 +944,20 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
     
     // Validate SU3 pump direction count: must be 1 (broadcast to all) or match N_atoms_SU3
     if (pump_dirs_su3_norm.size() != 1 && pump_dirs_su3_norm.size() != lattice.N_atoms_SU3) {
-        if (rank == 0) {
-            cerr << "Error: pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) "
-                 << "or exactly " << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). "
-                 << "Got " << pump_dirs_su3_norm.size() << " directions." << endl;
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
+        ostringstream msg;
+        msg << "pump_direction_su3 must have either 1 direction (broadcast to all SU3 sublattices) or exactly "
+            << lattice.N_atoms_SU3 << " directions (one per SU3 sublattice). Got "
+            << pump_dirs_su3_norm.size() << " directions.";
+        throw invalid_argument(msg.str());
     }
     
     // Validate SU3 pump direction dimension matches lattice spin_dim_SU3
     for (const auto& dir : pump_dirs_su3_norm) {
         if (dir.size() != lattice.spin_dim_SU3) {
-            if (rank == 0) {
-                cerr << "Error: pump_direction_su3 dimension (" << dir.size() 
-                     << ") does not match lattice spin_dim_SU3 (" << lattice.spin_dim_SU3 << ")" << endl;
-            }
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return;
+            ostringstream msg;
+            msg << "pump_direction_su3 dimension (" << dir.size() << ") does not match lattice spin_dim_SU3 ("
+                << lattice.spin_dim_SU3 << ")";
+            throw invalid_argument(msg.str());
         }
     }
     
@@ -978,12 +1007,9 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
     }
     if (use_distinct_pulse2_dir_su3 &&
         pump_dirs2_su3_norm.size() != 1 && pump_dirs2_su3_norm.size() != lattice.N_atoms_SU3) {
-        if (rank == 0) {
-            cerr << "Error: pump_direction_su3_2 must have either 1 direction or "
-                 << lattice.N_atoms_SU3 << " directions. Got " << pump_dirs2_su3_norm.size() << "." << endl;
-        }
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
+        throw invalid_argument("pump_direction_su3_2 must have either 1 direction or " +
+                               to_string(lattice.N_atoms_SU3) + " directions. Got " +
+                               to_string(pump_dirs2_su3_norm.size()) + ".");
     }
 
     for (size_t i = 0; i < lattice.lattice_size_SU3; ++i) {
@@ -1072,17 +1098,18 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
         }
         
         // Wait for rank 0 to finish annealing
-        MPI_Barrier(MPI_COMM_WORLD);
+        MPI_Barrier(comm);
         
-        broadcast_spins(lattice, rank);
+        broadcast_spins(lattice, comm);
         // Optional trilinear reference: every rank folds the same broadcast
         // state, rank 0 re-minimises and the result is broadcast again.
         if (apply_trilinear_reference(lattice, config, rank, /*requench=*/rank == 0)) {
-            broadcast_spins(lattice, rank);
+            broadcast_spins(lattice, comm);
         }
         // Damping / ablation setup from the synchronized ground state,
         // identically on every rank.
         configure_dynamics(lattice, config, rank);
+        const double e0 = lattice.energy_density();
         if (rank == 0) {
             lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
         }
@@ -1159,11 +1186,17 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
             field_dirs_su3_B,  // probe (2nd pulse) SU3 directions; empty => same as the pump
             reuse_m0_for_m01
         );
+        vector<TrialResult> mine;
+        if (rank == 0) mine.push_back({0, e0, trial_dir + "/pump_probe_spectroscopy.h5"});
+        write_trial_summary(config, "mixed-lattice 2DCS, delay-parallel (energy = ground state)", mine, comm);
         
     } else {
         // Distribute trials across MPI ranks (same physics as the tau-parallel
         // path: probe directions, ablation and damping are honoured here too).
+        if (rank == 0 && size > 1 && config.num_trials == 1 && config.parallel_tau)
+            cout << "One trial on a sub-communicator: delays run serially on its rank 0" << endl;
         const TrialStart start(lattice, config);
+        vector<TrialResult> results;
         for (int trial = rank; trial < config.num_trials; trial += size) {
             string trial_dir = config.output_dir + "/sample_" + to_string(trial);
             filesystem::create_directories(trial_dir);
@@ -1172,7 +1205,7 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
                 cout << "[Rank " << rank << "] Trial " << trial << " / " << config.num_trials << endl;
             }
             
-            start.apply(lattice, trial, rank);
+            start.apply(lattice);
             
             // Always equilibrate for 2DCS (need true ground state even if seed loaded)
             if (rank == 0 || config.num_trials == 1) {
@@ -1199,6 +1232,7 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
             configure_dynamics(lattice, config, rank);
             // Save the initial spin configuration of the time evolution
             lattice.save_spin_config_to_dir(trial_dir, "initial_spins");
+            const double e0 = lattice.energy_density();
 
             if (rank == 0 || config.num_trials == 1) {
                 cout << "\n[2/3] Pulse configuration:" << endl;                cout << "  SU2 Pulse: amplitude=" << config.pump_amplitude 
@@ -1276,11 +1310,13 @@ void run_2dcs_spectroscopy_mixed(MixedLattice& lattice, const SpinConfig& config
             
             cout << "[Rank " << rank << "] Trial " << trial << " 2DCS spectroscopy completed!" << endl;
             cout << "[Rank " << rank << "] Results saved to: " << trial_dir << "/pump_probe_spectroscopy.h5" << endl;
+            results.push_back({trial, e0, trial_dir + "/pump_probe_spectroscopy.h5"});
         }
+        write_trial_summary(config, "mixed-lattice 2DCS (energy = ground state)", results, comm);
     }
     
     // Synchronize all ranks
-    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Barrier(comm);
     
     if (rank == 0) {
         cout << "\n2DCS spectroscopy completed (" << config.num_trials << " trials)!" << endl;
