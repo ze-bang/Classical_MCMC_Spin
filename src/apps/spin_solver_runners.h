@@ -50,6 +50,10 @@ void run_pump_probe            (Lattice& lattice, const SpinConfig& config,
                                 int rank, int size);
 void run_2dcs_spectroscopy     (Lattice& lattice, const SpinConfig& config,
                                 int rank, int size);
+// Population annealing; the population is spread over every rank of `comm`.
+void run_population_annealing  (Lattice& lattice, const SpinConfig& config,
+                                int rank, int size,
+                                MPI_Comm comm = MPI_COMM_WORLD);
 
 // --- PhononLattice (spin + discrete phonon modes) -------------------------
 

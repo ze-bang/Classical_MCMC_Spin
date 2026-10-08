@@ -38,6 +38,7 @@ enum class SimulationType {
     PUMP_PROBE,
     TWOD_COHERENT_SPECTROSCOPY,  // 2DCS / pump-probe spectroscopy
     PARAMETER_SWEEP,             // Sweep over any Hamiltonian parameter
+    POPULATION_ANNEALING,        // Annealing of a replica population with Boltzmann resampling
     KINETIC_BARRIER_ANALYSIS,    // GNEB-based kinetic barrier evolution during phonon driving
     CUSTOM
 };
@@ -159,6 +160,15 @@ struct SpinConfig {
     bool pt_accumulate_correlations = false;  // Accumulate real-space correlations for S(q)
     size_t pt_n_bond_types = 3;               // Number of bond types for dimer correlations
     
+    // Population annealing (simulation = population_annealing; T_start / T_end
+    // bound the schedule, see mc/population_annealing.h)
+    size_t pa_population = 1000;         // replicas over all ranks
+    size_t pa_sweeps = 10;               // MC steps per replica and temperature
+    size_t pa_temperatures = 100;        // schedule points T_start..T_end (linear_beta / geometric)
+    string pa_schedule = "linear_beta";  // linear_beta | geometric | adaptive
+    double pa_target_ess = 0.9;          // adaptive: effective sample size kept by every step
+    size_t pa_max_temperatures = 100000; // adaptive: cap on the number of steps
+
     // Optimized temperature grid parameters
     bool pt_optimize_temperatures = true;          // Tune the ladder before the production run
     string pt_temperature_optimizer = "nrpt";      // "nrpt" (equal rejection, Syed et al. JRSS-B 2022) or
@@ -400,6 +410,7 @@ inline SimulationType parse_simulation(const string& str) {
     if (s == "pump_probe" || s == "PUMP_PROBE" || s == "pump-probe") return SimulationType::PUMP_PROBE;
     if (s == "2dcs" || s == "2DCS" || s == "spectroscopy" || s == "pump_probe_spectroscopy") return SimulationType::TWOD_COHERENT_SPECTROSCOPY;
     if (s == "parameter_sweep" || s == "PARAMETER_SWEEP" || s == "sweep") return SimulationType::PARAMETER_SWEEP;
+    if (s == "population_annealing" || s == "PA" || s == "pa") return SimulationType::POPULATION_ANNEALING;
     if (s == "kinetic_barrier" || s == "KINETIC_BARRIER" || s == "gneb" || s == "GNEB" || s == "barrier_analysis") return SimulationType::KINETIC_BARRIER_ANALYSIS;
     if (s == "custom" || s == "CUSTOM") return SimulationType::CUSTOM;
     throw runtime_error("Unknown simulation type: " + str);

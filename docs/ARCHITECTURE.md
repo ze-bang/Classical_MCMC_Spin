@@ -130,6 +130,18 @@ lattice coordinates too, and they travel with the spins in replica exchange.
   (Robbins–Monro on log σ toward 45 % acceptance, adapting only while
   equilibrating); a converged T = 0 descent at the end; final measurements in
   whole decorrelation intervals.
+* **Population annealing** (`mc/population_annealing.h`; `simulation_mode =
+  population_annealing`). A population of R replicas is annealed from
+  infinite temperature with Boltzmann resampling at every step (Hukushima &
+  Iba 2003; Machta 2010; Wang, Machta & Katzgraber 2015), so every
+  temperature of the schedule is an equilibrium ensemble and
+  ln Z(β) − ln Z(0) is estimated along the way. Systematic resampling keeps R
+  fixed; errors come from a delete-m_j jackknife over families (replicas
+  sharing an initial ancestor) and ρ_t, the family entropy and the ESS of
+  every step are reported. Schedules: linear in β, geometric in T, or
+  adaptive (the largest step keeping the ESS above a target). The population
+  is split over MPI ranks and OpenMP threads; replica k at step i draws from a
+  stream keyed on (seed, i, k), so results do not depend on the layout.
 * **Parallel tempering** (`mc/parallel_tempering.h`). One replica per MPI
   rank, deterministic even/odd (non-reversible) exchange rounds (Okabe et al.
   2001; Syed et al. 2022) decided identically on both partners from a shared
@@ -188,13 +200,14 @@ independently of the code (label `physics`):
 | `test_mc_exact` | free spins (Langevin function), 1D Heisenberg ring u(T), c(T) (Fisher), 2- and 3-site clusters vs quadrature, S⁷ Bessel ratio, twisted BCs, cluster moves, heat bath, overrelaxation |
 | `test_md_exact`, `test_md_drivers` | precession, conservation, magnon dispersion, integrator orders, damping, Langevin FDT, exact grids, 2DCS bookkeeping, DSSF sum rule |
 | `test_sa_ground_state` | triangular (−3/2 J) and pyrochlore (−J) ground states |
+| `test_population_annealing` | 1D Heisenberg ring: ln Z, u, c, ⟨m²⟩ at every temperature; bitwise layout independence (threads, 3 ranks vs 1); adaptive schedule |
 | `test_pt_mpi`, `test_pt_ladder` | PT on 4 ranks vs Fisher / Langevin / Bessel results, DEO bookkeeping, round trips, reproducibility, ladder updates |
 | `test_mixed_md`, `test_mixed_pump_probe` | SU(3) convention, exact grids, pump-probe on 1 and 4 ranks |
 | `test_phonon_dynamics`, `test_phonon_mpi` | spin–phonon dynamics, Langevin bath, MPI 2DCS, replica exchange of the lattice sector |
 | `test_unitcell_geometry` | every builder's bonds vs geometric neighbour shells, validation |
 
 `tests/smoke/run_smoke.sh <spin_solver>` runs the end-to-end configurations
-(SA, PT, tuned PT, MD with four integrators, pump-probe, 2DCS, sweeps,
+(SA, population annealing, PT, tuned PT, MD with four integrators, pump-probe, 2DCS, sweeps,
 TmFeO3, NCTO).
 
 ## Extending
@@ -208,10 +221,11 @@ TmFeO3, NCTO).
   in `dynamics/spin_integrators.h` (geometric) or as an odeint stepper, add the
   name to `dynamics/ode_method.h`, and add an order / conservation test to
   `tests/test_md_exact.cpp`.
-* **A new sampler for parallel tempering**: write a type satisfying
-  `mc::ReplicaModel` (`mc_step`, `energy`, `state_size`/`pack_state`/
-  `unpack_state`, `measure`, `uses_step_size`) and call
-  `mc::run_parallel_tempering`.
+* **A new sampler for parallel tempering / population annealing**: write a
+  type satisfying `mc::ReplicaModel` (`mc_step`, `energy`,
+  `state_size`/`pack_state`/`unpack_state`, `measure`, `uses_step_size`) and
+  call `mc::run_parallel_tempering`; add `randomize()` and scalar
+  `observables()` (`mc::PopulationWorker`) for `mc::run_population_annealing`.
 * **A new observable**: compute it from global-frame spins, give it an error
   bar through `mc::gamma_method` / `mc::blocked_jackknife`, and test it on a
   configuration where its value is known.

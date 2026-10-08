@@ -494,6 +494,7 @@ add_optimized_executable(spin_solver
     src/apps/spin_solver.cpp
     src/apps/runners_lattice.cpp
     src/apps/runners_phonon.cpp
+    src/apps/runners_population_annealing.cpp
     src/apps/runners_mixed.cpp
     src/apps/runners_parameter_sweep.cpp
 )
@@ -615,6 +616,7 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_phonon_dynamics
     test_pt_ladder
     test_unitcell_geometry
+    test_population_annealing
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
@@ -650,6 +652,13 @@ if(BUILD_TESTING)
     # oversubscribed ranks from starving each other.
     set_tests_properties(physics_test_pt_mpi PROPERTIES TIMEOUT 600 LABELS "physics;mpi"
                          ENVIRONMENT "OMP_NUM_THREADS=1;OMPI_MCA_mpi_yield_when_idle=1")
+    # Population annealing: the same population split over 3 ranks must give
+    # bitwise the result of one rank (layout-independent random streams).
+    add_test(NAME physics_test_population_annealing_mpi3
+             COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 3 --oversubscribe --allow-run-as-root
+                     $<TARGET_FILE:test_population_annealing>)
+    set_tests_properties(physics_test_population_annealing_mpi3 PROPERTIES TIMEOUT 300 LABELS "physics;mpi"
+                         ENVIRONMENT "OMP_NUM_THREADS=1")
     add_test(NAME e1_phonon_regressions COMMAND test_e1_phonon_regressions)
     add_test(NAME mixed_trilinear_regressions COMMAND test_mixed_trilinear_regressions)
     add_test(NAME global_frame_equivalence COMMAND test_global_frame_equivalence)

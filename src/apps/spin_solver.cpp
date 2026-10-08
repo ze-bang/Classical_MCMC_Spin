@@ -281,6 +281,9 @@ int main(int argc, char** argv) {
                 case SimulationType::PARALLEL_TEMPERING:
                     run_parallel_tempering(lattice, config, rank, size);
                     break;
+                case SimulationType::POPULATION_ANNEALING:
+                    run_population_annealing(lattice, config, rank, size);
+                    break;
                 case SimulationType::MOLECULAR_DYNAMICS:
                     run_molecular_dynamics(lattice, config, rank, size);
                     break;

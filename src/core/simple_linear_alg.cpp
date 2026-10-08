@@ -294,6 +294,10 @@ void seed_lehman_thread(unsigned long long key) {
     set_thread_state(expand_seed(master ^ splitmix64(key + 0xA0761D6478BD642FULL)));
 }
 
+void seed_lehman_stream(unsigned long long stream_seed) {
+    set_thread_state(expand_seed(splitmix64(stream_seed ^ 0x8BB84B93962EACC9ULL)));
+}
+
 unsigned long long lehman_master_seed_value() {
     return lehman_master_seed.load(std::memory_order_relaxed);
 }

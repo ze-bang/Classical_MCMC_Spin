@@ -190,7 +190,9 @@ SpinTensor3 transpose3D(const SpinTensor3& T, size_t N1, size_t N2, size_t N3);
 //   * `seed_lehman_from_rank(key)` mixes `key` (MPI rank, trial index, ...)
 //     into the master: call it from the main thread only.
 //   * `seed_lehman_thread(key)` seeds only the calling thread from
-//     (master, key), for per-replica streams inside parallel regions.
+//     (master, key), for per-replica streams inside parallel regions;
+//     `seed_lehman_stream(seed)` from an explicit seed (layout-independent
+//     streams, e.g. population annealing).
 //   * Seeds are expanded to 128 bits through splitmix64 and the first draws
 //     discarded, so nearby seeds give unrelated streams (the previous
 //     `state = seed << 1 | 1` made the first output exactly zero).
@@ -226,6 +228,11 @@ void seed_lehman_from_rank(unsigned long long key);
 
 // Seed only the calling thread from (master, key); leaves global state alone.
 void seed_lehman_thread(unsigned long long key);
+
+// Seed only the calling thread from an explicit 64-bit stream seed,
+// independent of the (per-rank) master: streams keyed on a seed shared by all
+// ranks and a global index stay the same whatever the MPI/thread layout.
+void seed_lehman_stream(unsigned long long stream_seed);
 
 // Current process master seed (for provenance output).
 unsigned long long lehman_master_seed_value();
