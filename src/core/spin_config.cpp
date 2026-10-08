@@ -176,6 +176,9 @@ SpinConfig SpinConfig::from_file(const string& filename) {
             else if (key == "pt_n_bond_types") {
                 config.pt_n_bond_types = stoull(value);
             }
+            else if (key == "pt_snapshot_rate") {
+                config.pt_snapshot_rate = stoull(value);
+            }
             // Optimized temperature grid parameters (Bittner et al.)
             else if (key == "pt_optimize_temperatures") {
                 config.pt_optimize_temperatures = parse_bool(value);
@@ -507,6 +510,7 @@ void SpinConfig::to_file(const string& filename) const {
         case SystemType::TMFEO3_TM: file << "tmfeo3_tm"; break;
         case SystemType::NCTO: file << "ncto"; break;
         case SystemType::TRIANGULAR_ANISOTROPIC: file << "triangular_anisotropic"; break;
+        case SystemType::KAGOME_BFG: file << "kagome_bfg"; break;
         case SystemType::CUSTOM: file << "custom"; break;
     }
     file << "\n";
@@ -634,6 +638,7 @@ void SpinConfig::print() const {
         case SystemType::TMFEO3_TM: cout << "TmFeO3 (Tm only)"; break;
         case SystemType::NCTO: cout << "NCTO (Na2Co2TeO6) Spin-Phonon"; break;
         case SystemType::TRIANGULAR_ANISOTROPIC: cout << "Triangular (anisotropic)"; break;
+        case SystemType::KAGOME_BFG: cout << "Kagome BFG (XXZ + Ising 2NN/hexagon diagonals)"; break;
         case SystemType::CUSTOM: cout << "Custom"; break;
     }
     cout << "\n";

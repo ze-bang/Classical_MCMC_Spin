@@ -300,6 +300,18 @@ public:
 };
 
 
+// Kagome lattice: THREE sites per triangular Bravais cell, a1=(1,0),
+// a2=(1/2,sqrt3/2); sublattices A=0, B=a1/2, C=a2/2. The up triangle of cell
+// R is {A(R), B(R), C(R)}; NN distance 1/2.
+class Kagome : public UnitCell {
+public:
+    Kagome(size_t spin_dim)
+        : UnitCell(spin_dim, 3,
+                   {Vector3d(0, 0, 0), Vector3d(0.5, 0, 0), Vector3d(0.25, sqrt(3.0)/4, 0)},
+                   {Vector3d(1, 0, 0), Vector3d(0.5, sqrt(3.0)/2, 0), Vector3d(0, 0, 1)}) {}
+};
+
+
 class HoneyComb_alt : public UnitCell {
 public:
     HoneyComb_alt(size_t spin_dim) 

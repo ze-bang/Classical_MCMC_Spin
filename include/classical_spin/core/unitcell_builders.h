@@ -27,6 +27,10 @@ UnitCell build_pyrochlore_non_kramer(const SpinConfig& config);
 // (Jzz, Jpm, Jpmpm, Jzpm with bond phases 0, -2pi/3, +2pi/3)
 UnitCell build_triangular_anisotropic(const SpinConfig& config);
 
+// Build the kagome XXZ model with Ising 2NN + hexagon-diagonal couplings
+// (Balents-Fisher-Girvin plane: Jxy, Delta1, Delta2, optional single-ion D)
+UnitCell build_kagome_bfg(const SpinConfig& config);
+
 // Build TmFeO3 mixed unit cell (SU2 Fe + SU3 Tm)
 MixedUnitCell build_tmfeo3(const SpinConfig& config);
 

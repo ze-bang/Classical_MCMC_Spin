@@ -26,6 +26,7 @@ enum class SystemType {
     TMFEO3_TM,                // TmFeO3 Tm-only (SU3 only, no Fe)
     NCTO,                     // NCTO spin-phonon coupled honeycomb
     TRIANGULAR_ANISOTROPIC,   // NMAO triangular: Jzz, Jpm, Jpmpm, Jzpm (YbMgGaO4-type)
+    KAGOME_BFG,               // kagome XXZ + Ising 2NN/hexagon diagonals (BFG plane: Jxy, Delta1, Delta2, D)
     CUSTOM                    // Custom from JSON
 };
 
@@ -123,6 +124,7 @@ struct SpinConfig {
     int pt_ranks_per_point = 0;  // Number of MPI ranks per sweep point for parallel tempering (0 = auto)
     bool pt_accumulate_correlations = false;  // Accumulate real-space correlations for S(q)
     size_t pt_n_bond_types = 3;               // Number of bond types for dimer correlations
+    size_t pt_snapshot_rate = 0;              // >0: dump raw spin snapshots every N measurement sweeps
     
     // Optimized temperature grid parameters
     bool pt_optimize_temperatures = true;          // Use feedback-optimized temperature grid
@@ -322,6 +324,7 @@ inline SystemType parse_system(const string& str) {
     if (s == "ncto" || s == "NCTO" || s == "Na2Co2TeO6") return SystemType::NCTO;
     if (s == "triangular_anisotropic" || s == "TRIANGULAR_ANISOTROPIC" ||
         s == "triangular" || s == "nmao") return SystemType::TRIANGULAR_ANISOTROPIC;
+    if (s == "kagome_bfg" || s == "KAGOME_BFG" || s == "kagome" || s == "bfg") return SystemType::KAGOME_BFG;
     if (s == "custom" || s == "CUSTOM") return SystemType::CUSTOM;
     throw runtime_error("Unknown system type: " + str);
 }
@@ -340,6 +343,7 @@ inline string system_type_to_string(SystemType sys) {
         case SystemType::TMFEO3_TM: return "tmfeo3_tm";
         case SystemType::NCTO: return "ncto";
         case SystemType::TRIANGULAR_ANISOTROPIC: return "triangular_anisotropic";
+        case SystemType::KAGOME_BFG: return "kagome_bfg";
         case SystemType::CUSTOM: return "custom";
         default: return "unknown";
     }

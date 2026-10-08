@@ -468,6 +468,12 @@ public:
     size_t lattice_size;     // Total number of sites = N_atoms * dim1 * dim2 * dim3
     float spin_length;       // Magnitude of spin vectors
 
+    // Parallel tempering: if > 0, every pt_snapshot_rate measurement sweeps each
+    // written rank appends its full spin configuration (float32) to
+    // rank_<r>/snapshots.bin and the total energy (float64) to
+    // rank_<r>/snapshots_energy.bin, for observables computed offline.
+    size_t pt_snapshot_rate = 0;
+
     // Spin configuration and positions
     SpinConfig spins;                // Current spin configuration
     vector<Eigen::Vector3d> site_positions; // Real-space positions

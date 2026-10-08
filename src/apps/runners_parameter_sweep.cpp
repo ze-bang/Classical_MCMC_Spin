@@ -290,6 +290,9 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                     case SystemType::TRIANGULAR_ANISOTROPIC:
                         uc_ptr = new UnitCell(build_triangular_anisotropic(sweep_config));
                         break;
+                    case SystemType::KAGOME_BFG:
+                        uc_ptr = new UnitCell(build_kagome_bfg(sweep_config));
+                        break;
                     case SystemType::PYROCHLORE_NON_KRAMER:
                         uc_ptr = new UnitCell(build_pyrochlore_non_kramer(sweep_config));
                         break;
@@ -522,6 +525,9 @@ void run_parameter_sweep(const SpinConfig& base_config, int rank, int size) {
                     break;
                 case SystemType::TRIANGULAR_ANISOTROPIC:
                     uc_ptr = new UnitCell(build_triangular_anisotropic(sweep_config));
+                    break;
+                case SystemType::KAGOME_BFG:
+                    uc_ptr = new UnitCell(build_kagome_bfg(sweep_config));
                     break;
                 case SystemType::PYROCHLORE_NON_KRAMER:
                     uc_ptr = new UnitCell(build_pyrochlore_non_kramer(sweep_config));

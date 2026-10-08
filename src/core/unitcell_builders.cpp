@@ -175,6 +175,87 @@ UnitCell build_triangular_anisotropic(const SpinConfig& config) {
     return atoms;
 }
 
+// -----------------------------------------------------------------------------
+// Kagome XXZ model of the Balents-Fisher-Girvin (BFG) plane.
+//
+//   H = Jxy sum_NN (Sx Sx + Sy Sy) + Delta1 Jxy sum_NN Sz Sz
+//     + Delta2 Jxy sum_{2NN + hexagon diagonals} Sz Sz  +  D sum_i (Sz_i)^2
+//
+// Bonds are found geometrically (sublattice positions of class Kagome, NN
+// distance 1/2): NN at 1/2, 2NN at sqrt3/2, and at distance 1 only the pairs
+// ACROSS a hexagon (midpoint = hexagon centre), NOT the straight-chain J3'
+// pairs (midpoint = a kagome site). Per site: 4 NN, 4 2NN, 2 diagonals, so per
+// cell 6 + 6 + 3 declared bonds (each pair once: Lattice adds the reverse with
+// J^T). Every NN, 2NN and diagonal pair lies in exactly one hexagon, so on the
+// line Delta1 = Delta2 = Delta the Ising part equals
+//   (Delta/2) sum_hex (S^z_hex)^2 - Delta sum_i (S^z_i)^2.
+// For quantum S=1/2 the last term is a constant; for classical vectors it is an
+// easy-axis single-ion term. D = +Delta2 removes it on the BFG line ("hexagon
+// form"); the default D = 0 is the plain classical limit of the bond form.
+// -----------------------------------------------------------------------------
+UnitCell build_kagome_bfg(const SpinConfig& config) {
+    const double Jxy    = config.get_param("Jxy",    1.0);
+    const double Delta1 = config.get_param("Delta1", 0.0);
+    const double Delta2 = config.get_param("Delta2", 0.0);
+    const double D      = config.get_param("D",      0.0);
+
+    Kagome atoms(3);
+    const Eigen::Vector3d a1 = atoms.lattice_vectors[0], a2 = atoms.lattice_vectors[1];
+
+    Eigen::Matrix3d J_nn = Eigen::Matrix3d::Zero();
+    J_nn(0, 0) = Jxy; J_nn(1, 1) = Jxy; J_nn(2, 2) = Delta1 * Jxy;
+    Eigen::Matrix3d J_far = Eigen::Matrix3d::Zero();
+    J_far(2, 2) = Delta2 * Jxy;
+
+    // Is point r (modulo the Bravais lattice) a kagome site?
+    auto is_site = [&](const Eigen::Vector3d& r) {
+        for (int s = 0; s < 3; ++s)
+            for (int n1 = -3; n1 <= 3; ++n1)
+                for (int n2 = -3; n2 <= 3; ++n2)
+                    if ((atoms.lattice_pos[s] + n1 * a1 + n2 * a2 - r).norm() < 1e-9) return true;
+        return false;
+    };
+
+    const double tol = 1e-9;
+    int n_nn = 0, n_2nn = 0, n_diag = 0;
+    for (int s = 0; s < 3; ++s) {
+        for (int p = s; p < 3; ++p) {
+            for (int n1 = -2; n1 <= 2; ++n1) {
+                for (int n2 = -2; n2 <= 2; ++n2) {
+                    if (p == s && !(n1 > 0 || (n1 == 0 && n2 > 0))) continue;   // each same-sublattice pair once
+                    const Eigen::Vector3d rs = atoms.lattice_pos[s];
+                    const Eigen::Vector3d rp = atoms.lattice_pos[p] + n1 * a1 + n2 * a2;
+                    const double d = (rp - rs).norm();
+                    const Eigen::Vector3i off(n1, n2, 0);
+                    if (std::abs(d - 0.5) < tol) {
+                        atoms.set_bilinear_interaction(J_nn, s, p, off); ++n_nn;
+                    } else if (std::abs(d - sqrt(3.0) / 2) < tol) {
+                        atoms.set_bilinear_interaction(J_far, s, p, off); ++n_2nn;
+                    } else if (std::abs(d - 1.0) < tol && !is_site(0.5 * (rs + rp))) {
+                        atoms.set_bilinear_interaction(J_far, s, p, off); ++n_diag;   // hexagon diagonal
+                    }
+                }
+            }
+        }
+    }
+    if (n_nn != 6 || n_2nn != 6 || n_diag != 3) {
+        throw std::runtime_error("build_kagome_bfg: bond count per cell is " + std::to_string(n_nn) + "/" +
+                                 std::to_string(n_2nn) + "/" + std::to_string(n_diag) + ", expected 6/6/3");
+    }
+
+    Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
+    A(2, 2) = D;
+    Eigen::Vector3d field;
+    field << config.g_factor[0] * config.field_strength * config.field_direction[0],
+             config.g_factor[1] * config.field_strength * config.field_direction[1],
+             config.g_factor[2] * config.field_strength * config.field_direction[2];
+    for (size_t s = 0; s < 3; ++s) {
+        if (D != 0.0) atoms.set_onsite_interaction(A, s);
+        atoms.set_field(field, s);
+    }
+    return atoms;
+}
+
 UnitCell build_kitaev_honeycomb(const SpinConfig& config) {
     const double K = config.get_param("K", -1.0);
     const double Gamma = config.get_param("Gamma", 0.25);

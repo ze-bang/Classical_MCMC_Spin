@@ -186,6 +186,8 @@ void run_parallel_tempering(Lattice& lattice, const SpinConfig& config, int rank
         MPI_Bcast(temps.data(), size, MPI_DOUBLE, 0, comm);
     }
     
+    lattice.pt_snapshot_rate = config.pt_snapshot_rate;
+
     // Re-initialize spins after temperature optimization (or geometric grid setup)
     // This ensures each rank starts with fresh random spins - the optimization
     // phase leaves spins in a "mixed" state from many replica exchanges

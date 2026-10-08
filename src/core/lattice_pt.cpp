@@ -189,6 +189,30 @@
             }
         }
         
+        // Optional raw spin snapshots (see Lattice::pt_snapshot_rate)
+        std::ofstream snap_file, snap_energy_file;
+        if (pt_snapshot_rate > 0) {
+            bool should_write = (std::find(rank_to_write.begin(), rank_to_write.end(), rank) != rank_to_write.end())
+                               || (std::find(rank_to_write.begin(), rank_to_write.end(), -1) != rank_to_write.end());
+            if (should_write) {
+                string snap_dir = dir_name + "/rank_" + std::to_string(rank);
+                std::filesystem::create_directories(snap_dir);
+                snap_file.open(snap_dir + "/snapshots.bin", std::ios::binary | std::ios::trunc);
+                snap_energy_file.open(snap_dir + "/snapshots_energy.bin", std::ios::binary | std::ios::trunc);
+                std::ofstream meta(snap_dir + "/snapshots_meta.txt");
+                meta << std::setprecision(17)
+                     << "temperature " << curr_Temp << "\n"
+                     << "lattice_size " << lattice_size << "\n"
+                     << "spin_dim " << spin_dim << "\n"
+                     << "dims " << dim1 << " " << dim2 << " " << dim3 << "\n"
+                     << "n_atoms " << N_atoms << "\n"
+                     << "snapshot_rate " << pt_snapshot_rate << "\n"
+                     << "n_measure " << n_measure << "\n"
+                     << "layout float32 [n_snap][lattice_size][spin_dim]; energy float64 total\n";
+            }
+        }
+        std::vector<float> snap_buf(snap_file.is_open() ? lattice_size * spin_dim : 0);
+
         cout << "Rank " << rank << ": Measuring..." << endl;
         for (size_t i = 0; i < n_measure; ++i) {
             if (overrelaxation_rate > 0) {
@@ -227,7 +251,18 @@
                     accumulate_correlations_internal(corr_acc);
                 }
             }
+
+            if (snap_file.is_open() && i % pt_snapshot_rate == 0) {
+                for (size_t s = 0; s < lattice_size; ++s)
+                    for (size_t d = 0; d < spin_dim; ++d)
+                        snap_buf[s * spin_dim + d] = static_cast<float>(spins[s](d));
+                snap_file.write(reinterpret_cast<const char*>(snap_buf.data()),
+                                static_cast<std::streamsize>(snap_buf.size() * sizeof(float)));
+                const double E_tot = total_energy(spins);
+                snap_energy_file.write(reinterpret_cast<const char*>(&E_tot), sizeof(double));
+            }
         }
+        if (snap_file.is_open()) { snap_file.close(); snap_energy_file.close(); }
         
         cout << "Rank " << rank << ": Collected " << energies.size() << " samples" << endl;
         

@@ -282,6 +282,9 @@ int main(int argc, char** argv) {
                 case SystemType::TRIANGULAR_ANISOTROPIC:
                     uc_ptr = new UnitCell(build_triangular_anisotropic(config));
                     break;
+                case SystemType::KAGOME_BFG:
+                    uc_ptr = new UnitCell(build_kagome_bfg(config));
+                    break;
                 case SystemType::PYROCHLORE_NON_KRAMER:
                     uc_ptr = new UnitCell(build_pyrochlore_non_kramer(config));
                     break;
