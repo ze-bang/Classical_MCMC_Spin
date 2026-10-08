@@ -98,6 +98,7 @@
 #define CLASSICAL_SPIN_SU3_COHERENT_STATE_H
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <complex>
@@ -376,6 +377,62 @@ inline Vector3c ground_state(const Matrix3c& H_loc) {
     Vector3c psi = es.eigenvectors().col(0);  // ascending sort -> smallest is col 0
     psi.normalize();
     return psi;
+}
+
+// Eigen-decomposition of a 3x3 Hermitian matrix: eigenvalues ascending in
+// `ev`, orthonormal eigenvectors in the columns of V. Closed form: Smith's
+// trigonometric solution of the characteristic cubic (CACM 4, 168 (1961))
+// and eigenvectors as cross products of two rows of H - e_k (for Hermitian
+// M, M v = 0 holds for v = m_i x m_j, the plain cross product of two rows);
+// several times faster than the iterative SelfAdjointEigenSolver. Falls back
+// to it when two eigenvalues are closer than 1e-5 of the spectral scale,
+// where the cross products lose accuracy.
+inline void eigen_hermitian3(const Matrix3c& H, Eigen::Vector3d& ev, Matrix3c& V) {
+    const double a00 = H(0, 0).real(), a11 = H(1, 1).real(), a22 = H(2, 2).real();
+    const Complex a01 = H(0, 1), a02 = H(0, 2), a12 = H(1, 2);
+    const double q = (a00 + a11 + a22) / 3.0;
+    const double b00 = a00 - q, b11 = a11 - q, b22 = a22 - q;
+    const double n01 = std::norm(a01), n02 = std::norm(a02), n12 = std::norm(a12);
+    const double p2 = (b00 * b00 + b11 * b11 + b22 * b22 + 2.0 * (n01 + n02 + n12)) / 6.0;
+    if (!(p2 > 1e-300)) {   // multiple of the identity
+        ev.setConstant(q);
+        V.setIdentity();
+        return;
+    }
+    const double p = std::sqrt(p2);
+    const double det = b00 * b11 * b22 + 2.0 * (a01 * a12 * std::conj(a02)).real()
+                     - b00 * n12 - b11 * n02 - b22 * n01;
+    const double r = std::clamp(det / (2.0 * p2 * p), -1.0, 1.0);
+    const double phi = std::acos(r) / 3.0;
+    const double e_max = q + 2.0 * p * std::cos(phi);
+    const double e_min = q + 2.0 * p * std::cos(phi + 2.0943951023931954923);   // + 2 pi / 3
+    const double e_mid = 3.0 * q - e_max - e_min;
+    if (std::min(e_mid - e_min, e_max - e_mid) < 1e-5 * p) {
+        Eigen::SelfAdjointEigenSolver<Matrix3c> es(H);
+        ev = es.eigenvalues();
+        V = es.eigenvectors();
+        return;
+    }
+    auto null_vector = [&](double e) {
+        const Vector3c m0(a00 - e, a01, a02);
+        const Vector3c m1(std::conj(a01), a11 - e, a12);
+        const Vector3c m2(std::conj(a02), std::conj(a12), a22 - e);
+        // Eigen's complex cross() returns conj(a x b); the null vector is the plain a x b.
+        Vector3c best = m0.cross(m1);
+        double best_n = best.squaredNorm();
+        const Vector3c c02 = m0.cross(m2), c12 = m1.cross(m2);
+        if (c02.squaredNorm() > best_n) { best = c02; best_n = c02.squaredNorm(); }
+        if (c12.squaredNorm() > best_n) { best = c12; best_n = c12.squaredNorm(); }
+        return Vector3c(best.conjugate() / std::sqrt(best_n));
+    };
+    const Vector3c v0 = null_vector(e_min);
+    Vector3c v2 = null_vector(e_max);
+    v2 -= v0.dot(v2) * v0;   // dot() conjugates its first argument
+    v2.normalize();
+    ev << e_min, e_mid, e_max;
+    V.col(0) = v0;
+    V.col(1) = v0.cross(v2);   // conj(v0 x v2): Hermitian-orthogonal to v0 and v2
+    V.col(2) = v2;
 }
 
 // Smallest eigenvalue (ground-state energy) of H_loc.

@@ -444,7 +444,7 @@ public:
     // build_packed_interaction_buffers()).
     struct SelfQuadTerm {
         size_t partner;      // partner site index
-        size_t offset;       // into selfq_coef_SU{2,3}: d x d x dim, row-major (a, b, c)
+        size_t offset;       // into selfq_coef_SU{2,3}: (a <= b) upper-triangle rows x dim, row-major
         uint8_t partner_su3; // partner species: 0 = SU(2), 1 = SU(3)
         uint8_t dim;         // partner components (3 or 8)
     };
@@ -1340,15 +1340,17 @@ private:
 
             // Self-coupled entries, merged per (species, partner). Each entry
             // with one partner slot equal to i is quadratic in S_i with weight
-            // 1/2; Q[a][b][c] multiplies S_a S_b x_c, symmetrised in (a, b).
+            // 1/2; Q[a][b][c] multiplies S_a S_b x_c, symmetrised in (a, b) and
+            // stored for a <= b only (row upper_index(a, b, d)).
             const size_t first = terms.size();
+            const size_t n_rows = d * (d + 1) / 2;
             auto term_offset = [&](bool partner_su3, size_t partner) -> size_t {
                 for (size_t t = first; t < terms.size(); ++t)
                     if (terms[t].partner == partner && bool(terms[t].partner_su3) == partner_su3)
                         return terms[t].offset;
                 const size_t dim = partner_su3 ? spin_dim_SU3 : spin_dim_SU2;
                 terms.push_back({partner, coef.size(), uint8_t(partner_su3), uint8_t(dim)});
-                coef.resize(coef.size() + d * d * dim, 0.0);
+                coef.resize(coef.size() + n_rows * dim, 0.0);
                 return terms.back().offset;
             };
             for (size_t n = 0; n < tri[i].size(); ++n) {
@@ -1359,11 +1361,11 @@ private:
                 const auto& T = tri[i][n];   // T[a](b, c): slots (i, p1, p2)
                 const size_t q = term_offset(su3, s1 ? p2 : p1);
                 for (size_t a = 0; a < d; ++a)
-                    for (size_t b = 0; b < d; ++b)
+                    for (size_t b = a; b < d; ++b)
                         for (size_t c = 0; c < d; ++c) {
                             const double v_ab = s1 ? T[a](b, c) : T[a](c, b);
                             const double v_ba = s1 ? T[b](a, c) : T[b](c, a);
-                            coef[q + (a * d + b) * d + c] += 0.25 * (v_ab + v_ba);
+                            coef[q + upper_index(a, b, d) * d + c] += 0.25 * (v_ab + v_ba);
                         }
             }
             if (!su3) {
@@ -1373,9 +1375,9 @@ private:
                     const auto& K = mixed_trilinear_interaction_SU2[i][n];   // K[a](b, c), c in SU(3)
                     const size_t q = term_offset(true, mixed_trilinear_partners_SU2[i][n][1]);
                     for (size_t a = 0; a < d; ++a)
-                        for (size_t b = 0; b < d; ++b)
+                        for (size_t b = a; b < d; ++b)
                             for (size_t c = 0; c < spin_dim_SU3; ++c)
-                                coef[q + (a * d + b) * spin_dim_SU3 + c] += 0.25 * (K[a](b, c) + K[b](a, c));
+                                coef[q + upper_index(a, b, d) * spin_dim_SU3 + c] += 0.25 * (K[a](b, c) + K[b](a, c));
                 }
             }
             off[i + 1] = terms.size();
@@ -1385,30 +1387,45 @@ private:
         }
     }
 
-    // h[a] += sum_bc T[(a DB + b) DC + c] x[b] y[c]  (row-major packed trilinear entry)
-    template <int DA, int DB, int DC>
-    static inline void contract_trilinear(const double* __restrict T, const double* __restrict x,
-                                          const double* __restrict y, double* __restrict h) {
-        for (int a = 0; a < DA; ++a) {
-            double acc = 0.0;
-            for (int b = 0; b < DB; ++b) {
-                double row = 0.0;
-                for (int c = 0; c < DC; ++c) row += T[(a * DB + b) * DC + c] * y[c];
-                acc += x[b] * row;
-            }
-            h[a] += acc;
-        }
+    // Row of the pair a <= b in a row-major upper triangle of a d x d matrix.
+    static constexpr size_t upper_index(size_t a, size_t b, size_t d) { return a * (2 * d - a - 1) / 2 + b; }
+
+    // Symmetric D x D matrix from its upper triangle (row-major, a <= b).
+    template <int D>
+    static inline void fill_symmetric(const double* __restrict up, double* __restrict A) {
+        int r = 0;
+        for (int a = 0; a < D; ++a)
+            for (int b = a; b < D; ++b, ++r) A[a * D + b] = A[b * D + a] = up[r];
     }
 
-    // h[a] += sum_b J[a DB + b] x[b]  (row-major packed bilinear entry)
+    // h[a] += sum_b J[a DB + b] x[b]  (row-major packed bilinear entry).
+    // Two partial sums per row halve the dependent add chain (the kernels are
+    // latency bound at these sizes; ~20 % faster than one accumulator).
     template <int DA, int DB>
     static inline void contract_bilinear(const double* __restrict J, const double* __restrict x,
                                          double* __restrict h) {
         for (int a = 0; a < DA; ++a) {
-            double acc = 0.0;
-            for (int b = 0; b < DB; ++b) acc += J[a * DB + b] * x[b];
-            h[a] += acc;
+            const double* row = J + a * DB;
+            double s0 = 0.0, s1 = 0.0;
+            int b = 0;
+            for (; b + 1 < DB; b += 2) {
+                s0 += row[b] * x[b];
+                s1 += row[b + 1] * x[b + 1];
+            }
+            if (b < DB) s0 += row[b] * x[b];
+            h[a] += s0 + s1;
         }
+    }
+
+    // h[a] += sum_bc T[(a DB + b) DC + c] x[b] y[c]  (row-major packed trilinear
+    // entry): the outer product x y^T, then one DA x (DB DC) matrix-vector product.
+    template <int DA, int DB, int DC>
+    static inline void contract_trilinear(const double* __restrict T, const double* __restrict x,
+                                          const double* __restrict y, double* __restrict h) {
+        double xy[DB * DC];
+        for (int b = 0; b < DB; ++b)
+            for (int c = 0; c < DC; ++c) xy[b * DC + c] = x[b] * y[c];
+        contract_bilinear<DA, DB * DC>(T, xy, h);
     }
 
     template <int D>
@@ -1495,23 +1512,27 @@ public:
     /// self-coupled trilinear entries with their partner contracted.
     inline void self_form_SU2(size_t i, double* __restrict A) const {
         const double* O = &onsite_sym_SU2[i * 9];
-        for (int k = 0; k < 9; ++k) A[k] = O[k];
+        double up[6] = {O[0], O[1], O[2], O[4], O[5], O[8]};
         for (size_t t = selfq_off_SU2[i]; t < selfq_off_SU2[i + 1]; ++t) {
             const SelfQuadTerm& q = selfq_SU2[t];
             const double* x = q.partner_su3 ? spins_SU3[q.partner].data() : spins_SU2[q.partner].data();
-            if (q.dim == 8) contract_bilinear<9, 8>(&selfq_coef_SU2[q.offset], x, A);
-            else contract_bilinear<9, 3>(&selfq_coef_SU2[q.offset], x, A);
+            if (q.dim == 8) contract_bilinear<6, 8>(&selfq_coef_SU2[q.offset], x, up);
+            else contract_bilinear<6, 3>(&selfq_coef_SU2[q.offset], x, up);
         }
+        fill_symmetric<3>(up, A);
     }
 
     /// Quadratic self form A_j of SU(3) site j (row-major 8x8, symmetric).
     inline void self_form_SU3(size_t j, double* __restrict A) const {
         const double* O = &onsite_sym_SU3[j * 64];
-        for (int k = 0; k < 64; ++k) A[k] = O[k];
+        double up[36];
+        for (int a = 0, r = 0; a < 8; ++a)
+            for (int b = a; b < 8; ++b, ++r) up[r] = O[a * 8 + b];
         for (size_t t = selfq_off_SU3[j]; t < selfq_off_SU3[j + 1]; ++t) {
             const SelfQuadTerm& q = selfq_SU3[t];
-            contract_bilinear<64, 8>(&selfq_coef_SU3[q.offset], spins_SU3[q.partner].data(), A);
+            contract_bilinear<36, 8>(&selfq_coef_SU3[q.offset], spins_SU3[q.partner].data(), up);
         }
+        fill_symmetric<8>(up, A);
     }
 
     /// Self energy S^T A S of SU(2) site i at S, plus its cubic self entries (weight 1/3 each).
@@ -1966,8 +1987,9 @@ public:
      */
     static void sample_linear_cp2(const double* h, double beta, double* n) {
         using classical_spin::su3::Matrix3c;
-        Eigen::SelfAdjointEigenSolver<Matrix3c> es(classical_spin::su3::gell_mann_sum(h));
-        const Eigen::Vector3d& ev = es.eigenvalues();
+        Eigen::Vector3d ev;
+        Matrix3c V;
+        classical_spin::su3::eigen_hermitian3(classical_spin::su3::gell_mann_sum(h), ev, V);
         const double a = beta * (ev(1) - ev(0)), b = beta * (ev(2) - ev(0));
         double p2 = 0.0;
         for (;;) {
@@ -1986,7 +2008,6 @@ public:
         const double phi2 = random_double_lehman(0.0, 2.0 * M_PI);
         const std::complex<double> c0(std::sqrt(p0), 0.0);
         const std::complex<double> c1 = std::polar(std::sqrt(p1), phi1), c2 = std::polar(std::sqrt(p2), phi2);
-        const Matrix3c& V = es.eigenvectors();
         std::complex<double> psi[3];
         double nrm2 = 0.0;
         for (int k = 0; k < 3; ++k) {
@@ -2109,8 +2130,9 @@ public:
         linear_field_SU3(j, h);
         if (su3_on_cp2()) {
             using classical_spin::su3::Matrix3c;
-            Eigen::SelfAdjointEigenSolver<Matrix3c> es(classical_spin::su3::gell_mann_sum(h));
-            const Matrix3c& V = es.eigenvectors();
+            Eigen::Vector3d ev;
+            Matrix3c V;
+            classical_spin::su3::eigen_hermitian3(classical_spin::su3::gell_mann_sum(h), ev, V);
             std::complex<double> psi[3];
             classical_spin::su3::psi_from_pure_expectations(n, psi);
             std::complex<double> c[3];

@@ -32,6 +32,12 @@ namespace su3 = classical_spin::su3;
 
 namespace {
 
+std::string sci(double x) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.1e", x);
+    return b;
+}
+
 const std::vector<Eigen::Vector3d> kAxes = {Eigen::Vector3d(1, 0, 0), Eigen::Vector3d(0, 1, 0),
                                             Eigen::Vector3d(0, 0, 1)};
 
@@ -143,7 +149,7 @@ void check_tiling(MixedLattice& small, MixedLattice& big, const std::string& wha
         scale = std::max(scale, std::abs(e_big));
     }
     check(err <= 1e-12 * (1.0 + scale), what + ": energy per cell == tiled larger lattice (err " +
-                                            std::to_string(err) + ")");
+                                            sci(err) + ")");
 }
 
 void check_local_dE(MixedLattice& lat, const std::string& what) {
@@ -175,8 +181,8 @@ void check_local_dE(MixedLattice& lat, const std::string& what) {
         lat.spins_SU3[j] = n_old;
     }
     check(err2 <= 1e-11 * scale && err3 <= 1e-11 * scale,
-          what + ": local dE == E(after) - E(before) (SU(2) err " + std::to_string(err2) + ", SU(3) err " +
-              std::to_string(err3) + ")");
+          what + ": local dE == E(after) - E(before) (SU(2) err " + sci(err2) + ", SU(3) err " +
+              sci(err3) + ")");
 }
 
 // The MD field (full gradient) is the gradient of total_energy (central differences).
@@ -204,7 +210,7 @@ void check_gradient(MixedLattice& lat, const std::string& what) {
             err = std::max(err, std::abs((Ep - Em) / (2 * d) - H(a)));
         }
     }
-    check(err < 1e-6, what + ": get_local_field_SU{2,3} == dE/dS (err " + std::to_string(err) + ")");
+    check(err < 1e-6, what + ": get_local_field_SU{2,3} == dE/dS (err " + sci(err) + ")");
 }
 
 void test_self_and_long_bonds() {
@@ -291,7 +297,7 @@ void test_cp2_invariants() {
     auto ck = [&](const std::string& what) {
         const double e = casimir_error(lat);
         check(e <= 1e-12 && lat.min_SU3_density_eigenvalue() >= -1e-12,
-              what + ": max Casimir error " + std::to_string(e));
+              what + ": max Casimir error " + sci(e));
     };
     lat.init_random();
     ck("constructor / init_random");
@@ -361,7 +367,7 @@ void test_descent() {
         E_prev = E;
     }
     check(worst_rise <= 1e-10 * std::abs(E_prev), "descent never raises the energy (anisotropy + W, CP^2)");
-    check(change < 1e-6, "descent converges (last max |dS| = " + std::to_string(change) + ")");
+    check(change < 1e-6, "descent converges (last max |dS| = " + sci(change) + ")");
     // Stationarity: every SU(2) spin minimises its local energy exactly, so
     // one more site update changes nothing.
     check(lat.deterministic_sweep() < 1e-6, "converged state is a fixed point of the exact site minimiser");
@@ -422,6 +428,33 @@ void test_simulated_annealing() {
     check(threw, "simulated_annealing rejects T_end <= 0");
 }
 
+// ------------------------------------------- 8. closed-form 3x3 eigensolver
+void test_eigen_hermitian3() {
+    std::printf("\n== su3::eigen_hermitian3 (closed form, used by the CP^2 heat bath / overrelaxation) ==\n");
+    std::mt19937 rng(17);
+    std::normal_distribution<double> g(0.0, 1.0);
+    double worst_res = 0.0, worst_ev = 0.0, worst_unit = 0.0;
+    for (int t = 0; t < 4000; ++t) {
+        double h[8];
+        for (double& x : h) x = g(rng);
+        if (t % 4 == 1) for (int a = 0; a < 8; ++a) if (a != 2 && a != 7) h[a] = 0.0;   // diagonal
+        if (t % 4 == 2) { for (double& x : h) x = 0.0; h[7] = 1.0; }                      // degenerate pair
+        if (t % 4 == 3) for (int a = 0; a < 8; ++a) h[a] *= (a == 0 ? 1.0 : 1e-7);         // near-degenerate
+        const su3::Matrix3c H = su3::gell_mann_sum(h);
+        Eigen::Vector3d ev;
+        su3::Matrix3c V;
+        su3::eigen_hermitian3(H, ev, V);
+        Eigen::SelfAdjointEigenSolver<su3::Matrix3c> es(H);
+        const double scale = std::max(1.0, H.norm());
+        worst_ev = std::max(worst_ev, (ev - es.eigenvalues()).cwiseAbs().maxCoeff() / scale);
+        worst_res = std::max(worst_res, (H * V - V * ev.asDiagonal()).norm() / scale);
+        worst_unit = std::max(worst_unit, (V.adjoint() * V - su3::Matrix3c::Identity()).norm());
+    }
+    check(worst_ev < 1e-12 && worst_res < 1e-10 && worst_unit < 1e-12,
+          "eigenvalues, residual |HV - V diag(e)| and unitarity (worst " + sci(worst_ev) + ", " +
+              sci(worst_res) + ", " + sci(worst_unit) + ")");
+}
+
 // ------------------------------------------------------ 7. policy parsing
 void test_policy() {
     std::printf("\n== Policy parsing and defaults ==\n");
@@ -461,6 +494,7 @@ int main(int argc, char** argv) {
     test_descent();
     test_simulated_annealing();
     test_policy();
+    test_eigen_hermitian3();
     const int rc = finish("test_mixed_mc_kernels");
     MPI_Finalize();
     return rc;
