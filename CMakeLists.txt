@@ -614,6 +614,7 @@ set(CLASSICAL_SPIN_PHYSICS_TESTS
     test_mixed_pump_probe
     test_phonon_dynamics
     test_pt_ladder
+    test_unitcell_geometry
 )
 foreach(t IN LISTS CLASSICAL_SPIN_PHYSICS_TESTS)
     add_optimized_executable(${t} tests/${t}.cpp)
